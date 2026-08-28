@@ -1,0 +1,29 @@
+# TRPG-PREP Context
+
+## Purpose
+
+TRPG-PREP turns uploaded module source into traceable GM preparation material. The user-facing product is organized around a bookshelf project, source analysis, candidate review, facts, artifact drafts, and runtime scenes.
+
+## Current Priority
+
+Stabilize engineering governance and the supplemental location-card workflow before adding new product features. Every generated artifact must remain traceable to promoted fact IDs and must be incrementally recoverable after failure.
+
+## Domain Terms
+
+- **Workspace**: one GM preparation project and its saved analysis versions.
+- **Source facts**: extracted, reviewed evidence tied to source pages.
+- **Artifact**: a structured prep card derived from promoted facts.
+- **Runtime scene**: an assembled, locked-at-runtime plan that may be deleted and rebuilt before play.
+- **Supplemental card job**: an incremental artifact job scoped to uncovered facts; it may append to an existing artifact set.
+
+## Engineering Rules
+
+1. Do not expose concrete game-rule names in user-facing profile IDs, errors, or copyable keywords.
+2. Full artifact generation and supplemental generation are separate workflows with separate duplicate semantics.
+3. Background jobs must expose durable status, phase, progress, and failure details to the UI.
+4. Mechanical pagination is diagnostic only; source ranges may be discontinuous and cross page boundaries.
+5. Prefer small interfaces with deep implementations; keep storage, domain validation, and LLM adapters behind explicit seams.
+
+## Verification
+
+Run focused Python checks plus `node --check frontend/workbench.js` before pushing. Real upstream experiments must use an isolated database copy.
