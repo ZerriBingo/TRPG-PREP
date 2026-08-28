@@ -3289,9 +3289,13 @@ function bindEvents() {
   $("draft-artifacts").addEventListener("click", draftArtifacts);
   document.addEventListener("click", (event) => {
     if (!event.target.closest("#draft-missing-locations")) return;
+    if (!state.exampleId || state.artifacts.generating) return;
+    state.artifacts.generating = true;
+    state.artifacts.error = "";
+    renderAll();
     fetch(`/api/domain/examples/${encodeURIComponent(state.exampleId)}/cards/draft-missing-locations`, {method: "POST"})
       .then(async (response) => { const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(formatApiError(payload, "补生成地点卡失败")); return payload; })
-      .then(() => { updateWorkStatus("遗漏地点卡已排队生成"); refreshWorkbenchData(); })
+      .then((payload) => { state.artifacts.job = payload.job || null; updateWorkStatus("遗漏地点卡已排队生成"); renderAll(); scheduleArtifactPoll(); })
       .catch((error) => { $("global-error").hidden = false; $("global-error").textContent = String(error); });
   });
   $("open-artifacts").addEventListener("click", () => showView("cards"));
