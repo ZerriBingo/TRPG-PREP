@@ -325,7 +325,9 @@ def execute_artifact_job(
         profile = profiles.get(profile_id)
         if profile is None:
             raise ArtifactGenerationError("当前书架没有可用的备团板块")
-        if any(card.profile_id == profile_id for card in bundle.cards):
+        # Supplemental jobs intentionally append cards to an existing runtime
+        # board; only a full-board generation must be blocked as duplicate.
+        if not (fact_ids or job.fact_ids) and any(card.profile_id == profile_id for card in bundle.cards):
             raise ArtifactGenerationError(
                 "当前板块已经有备团产物；请先完成现有草案的复核，不重复生成一套平行卡片"
             )
@@ -407,7 +409,7 @@ def execute_artifact_job(
             raise ArtifactGenerationError("书架工作区在生成期间被删除")
         bundle = ExampleBundle.model_validate(latest[0])
         validate_bundle(bundle, profiles)
-        if any(card.profile_id == profile_id for card in bundle.cards):
+        if not (fact_ids or job.fact_ids) and any(card.profile_id == profile_id for card in bundle.cards):
             raise ArtifactGenerationError(
                 "生成期间已有同一板块的备团产物，请刷新书架后继续复核"
             )
