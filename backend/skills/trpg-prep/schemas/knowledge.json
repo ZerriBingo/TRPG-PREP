@@ -1,0 +1,201 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "知识库（分析阶段产物）",
+  "type": "object",
+  "required": [
+    "locations",
+    "npcs",
+    "items",
+    "events",
+    "clues",
+    "timeline"
+  ],
+  "properties": {
+    "locations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "page"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "地点名（保留原文）"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "desc": {
+            "type": "string"
+          },
+          "npcs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "intel": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "npcs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "page"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "role": {
+            "type": "string"
+          },
+          "motive": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          },
+          "intel": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "page"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "desc": {
+            "type": "string"
+          },
+          "where": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "page"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "clues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "clue",
+          "page"
+        ],
+        "properties": {
+          "clue": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "unlocks": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "time",
+          "event",
+          "page"
+        ],
+        "properties": {
+          "time": {
+            "type": "string"
+          },
+          "event": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "story": {
+      "type": "string",
+      "description": "本分块对应的剧情梗概（按时间顺序概述关键情节，100-300 字；无则填空字符串）"
+    },
+    "ending": {
+      "type": "array",
+      "description": "官方结局/结局分支（仅当本分块确实包含模组官方结局信息时填写，否则留空数组）",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "page"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "结局名/分支名（保留原文）"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "desc": {
+            "type": "string",
+            "description": "结局内容、触发条件与玩家达成方式"
+          }
+        }
+      }
+    }
+  }
+}

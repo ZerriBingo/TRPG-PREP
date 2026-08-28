@@ -1,0 +1,127 @@
+{
+  "id": "red_signal_fixture",
+  "name": "红信号 · 综合夹具",
+  "description": "离线合成样例，不来自任何受版权保护的模组；用来验证同一事实库能分别承载运行素材和通用整理素材。",
+  "profile_ids": ["cthulhu-dark-2e", "daggerheart", "module-prep"],
+  "facts": [
+    {
+      "id": "fact_red_signal_location",
+      "source": {"file": "fixture://red-signal", "page": 1},
+      "text": "红信号旅馆的大堂被暴雨倒灌，前台、楼梯和地下酒窖入口挤在同一个小空间里。",
+      "kind": "location", "visibility": "explicit", "links": [], "tags": ["fixture", "location"]
+    },
+    {
+      "id": "fact_ledger_missing_pages",
+      "source": {"file": "fixture://red-signal", "page": 2, "locator": "guest ledger"},
+      "text": "旅客账簿缺了三页，纸边有新割痕。",
+      "kind": "clue", "visibility": "hidden", "links": ["fact_red_signal_location"], "tags": ["fixture", "evidence"]
+    },
+    {
+      "id": "fact_front_desk_clerk",
+      "source": {"file": "fixture://red-signal", "page": 2, "locator": "night clerk"},
+      "text": "夜班职员反复擦拭同一块台面，声称停电后没有人进出。",
+      "kind": "npc", "visibility": "explicit", "links": ["fact_red_signal_location", "fact_ledger_missing_pages"], "tags": ["fixture", "npc"]
+    },
+    {
+      "id": "fact_storm_cutoff",
+      "source": {"file": "fixture://red-signal", "page": 1},
+      "text": "山体滑坡切断旅馆后路，电话只在每小时前五分钟可用。",
+      "kind": "event", "visibility": "explicit", "links": ["fact_red_signal_location"], "tags": ["fixture", "pressure"]
+    },
+    {
+      "id": "fact_wet_footprints",
+      "source": {"file": "fixture://red-signal", "page": 3},
+      "text": "一条湿痕从酒窖门延伸到职员椅后，却没有任何返回脚印。",
+      "kind": "threat", "visibility": "hidden", "links": ["fact_front_desk_clerk"], "tags": ["fixture", "anomaly"]
+    },
+    {
+      "id": "fact_reporter_exposure",
+      "source": {"file": "fixture://red-signal", "page": 3},
+      "text": "若记者公开旅馆丑闻，职员会失去唯一收入，并可能销毁账簿。",
+      "kind": "stakes", "visibility": "gm_suggestion", "links": ["fact_front_desk_clerk"], "tags": ["fixture", "risk"]
+    },
+    {
+      "id": "fact_locked_cellar",
+      "source": {"file": "fixture://red-signal", "page": 2},
+      "text": "酒窖门从内侧锁住，锁孔里塞着湿棉絮。",
+      "kind": "obstacle", "visibility": "explicit", "links": ["fact_red_signal_location", "fact_front_desk_clerk"], "tags": ["fixture", "threshold"]
+    },
+    {
+      "id": "fact_boiler_failure",
+      "source": {"file": "fixture://red-signal", "page": 3},
+      "text": "锅炉水位持续下降；若无人处理，旅馆会在两小时后失去暖气和照明。",
+      "kind": "timeline", "visibility": "inferred", "links": ["fact_storm_cutoff", "fact_locked_cellar"], "tags": ["fixture", "clock"]
+    }
+  ],
+  "cards": [
+    {
+      "id": "card_red_signal_scene",
+      "profile_id": "cthulhu-dark-2e", "type": "scene",
+      "title": "红信号旅馆", "subtitle": "停电后的前台与酒窖",
+      "fact_ids": ["fact_red_signal_location", "fact_front_desk_clerk", "fact_storm_cutoff"],
+      "edit_state": "approved",
+      "fields": {
+        "opening_image": "雨水漫过大堂地毯，蜡烛把职员的脸照得忽明忽暗。",
+        "immediate_actions": ["询问停电时的住客", "检查账簿与前台抽屉", "观察酒窖门和地面痕迹"],
+        "direct_clues": ["后路已断", "职员反复擦拭台面", "酒窖门从内侧锁住"],
+        "hidden_clues": ["账簿缺页", "单向湿痕", "锁孔里的湿棉絮"],
+        "gm_moves": ["让蜡烛熄灭一瞬", "让职员重复一句矛盾的话", "让地下传来一次水声"],
+        "risk_if_pressed": "职员会呼救或销毁账簿；酒窖里的东西也会注意到光源。",
+        "exit_conditions": ["拿到账簿缺页", "说服职员合作", "确认酒窖来源后撤到公共房间"]
+      }
+    },
+    {
+      "id": "card_red_signal_environment",
+      "profile_id": "daggerheart", "type": "environment",
+      "title": "被淹的大堂", "subtitle": "狭窄、湿滑、光线不稳",
+      "fact_ids": ["fact_red_signal_location", "fact_storm_cutoff", "fact_locked_cellar"],
+      "fields": {
+        "opening_image": "积水、倒塌的行李架和摇晃烛台把大堂切成三条窄路。",
+        "usable_features": ["柜台可作掩体", "行李架可搭路", "绳索可横跨积水"],
+        "hazards": ["湿滑石板", "裸露电线", "酒窖门后的未知空间"],
+        "positioning": "前台居高，楼梯狭窄，酒窖入口是唯一低位通道。",
+        "environment_changes": "水位每上升一档，移动和听觉都更困难。",
+        "noncombat_exits": ["从厨房侧门撤离", "把战斗引向高台", "用沙袋改道水流"]
+      }
+    },
+    {
+      "id": "card_wet_footprints_enemy",
+      "profile_id": "daggerheart", "type": "enemy",
+      "title": "湿痕行者", "subtitle": "只留下单向痕迹",
+      "fact_ids": ["fact_wet_footprints"],
+      "fields": {
+        "intention": "观察能打开酒窖的人，并在黑暗中拖走落单者。",
+        "signature_actions": ["熄灭最近的光源", "贴墙绕后", "把目标拖向低处"],
+        "danger_signs": "烛焰变蓝，水声停了，湿气贴上后颈。",
+        "damaged_behavior": "受伤后退入积水，用蒸汽和黑暗遮蔽行踪。",
+        "resolutions": ["封死酒窖门", "用盐线限制路线", "逼它进入锅炉房的高热区"]
+      }
+    },
+    {
+      "id": "card_red_signal_investigation",
+      "profile_id": "module-prep", "type": "scene_extract",
+      "title": "红信号旅馆场景整理", "subtitle": "官方事故下的局部异常",
+      "fact_ids": ["fact_red_signal_location", "fact_ledger_missing_pages", "fact_wet_footprints"],
+      "fields": {
+        "situation": "暴雨导致停电、积水与旅客滞留。",
+        "entry_points": ["封控前台", "采样湿痕", "审阅账簿残页"],
+        "discoveries": {"observe": ["缺页账簿", "单向湿痕", "职员的时间线矛盾"], "verify": "比对账簿缺页和锁孔残留物"},
+        "pressure": "酒窖门被打开或湿痕抵达客房区。",
+        "exit_conditions": ["还原职员与酒窖的移动路线", "确认异常后转交目标运行档案"]
+      }
+    },
+    {
+      "id": "card_wet_footprints_anomaly",
+      "profile_id": "module-prep", "type": "threat_logic",
+      "title": "单向湿痕威胁逻辑", "subtitle": "移动记录不完整",
+      "fact_ids": ["fact_wet_footprints", "fact_boiler_failure"],
+      "fields": {
+        "manifestation": "湿痕只显示接近，不显示返回。",
+        "intention": "沿水路接近有光或有人声的区域。",
+        "danger_signs": "湿痕同时出现在两个楼层，或开始响应人声。",
+        "escalation": "异常体进入客房区，或调查员失去连续观察。",
+        "resolutions": ["用连续摄像和吸水纸记录边界变化", "封堵酒窖", "抽干低处积水", "用锅炉房热区干燥通道"]
+      }
+    }
+  ]
+}

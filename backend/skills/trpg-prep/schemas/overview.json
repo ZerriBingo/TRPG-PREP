@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "故事总览",
+  "type": "object",
+  "required": ["title", "acts", "key_information", "possible_directions", "endings", "gm_pitfalls"],
+  "properties": {
+    "title": {"type": "string", "description": "模组名/战役名"},
+    "acts": {
+      "type": "array",
+      "description": "故事脉络：按模组章节/幕组织",
+      "items": {
+        "type": "object",
+        "required": ["name", "page", "summary"],
+        "properties": {
+          "name": {"type": "string"},
+          "page": {"type": "integer"},
+          "summary": {"type": "string"},
+          "key_events": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "key_information": {
+      "type": "array",
+      "description": "关键信息，必须带来源页码",
+      "items": {
+        "type": "object",
+        "required": ["item", "page"],
+        "properties": {
+          "item": {"type": "string"},
+          "page": {"type": "integer"},
+          "why": {"type": "string", "description": "为什么关键"}
+        }
+      }
+    },
+    "possible_directions": {
+      "type": "array",
+      "description": "调查员可能的走向",
+      "items": {"type": "string"}
+    },
+    "endings": {
+      "type": "array",
+      "description": "模组给出的结局 + 开放式建议",
+      "items": {
+        "type": "object",
+        "required": ["name", "description"],
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "type": {"type": "string", "description": "官方结局 / 开放式建议"},
+          "page": {"type": "integer"}
+        }
+      }
+    },
+    "gm_pitfalls": {
+      "type": "array",
+      "description": "坑点提示：GM 容易漏的线索与易翻车的判定",
+      "items": {"type": "string"}
+    }
+  }
+}

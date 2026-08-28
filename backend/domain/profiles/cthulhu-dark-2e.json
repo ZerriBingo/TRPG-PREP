@@ -1,0 +1,51 @@
+{
+  "id": "cthulhu-dark-2e",
+  "name": "Cthulhu Dark 2E",
+  "version": "0.2",
+  "summary": "以调查、压力、洞察和不可逆代价为核心的叙事恐怖规则档案。",
+  "card_definitions": [
+    {
+      "type": "scene",
+      "display_name": "场景卡",
+      "description": "把地点、现场入口、线索和压力组织成一屏可运行场景；入口供 GM 调度，不是念给玩家的行动菜单。",
+      "required_fields": ["opening_image", "immediate_actions", "direct_clues", "hidden_clues", "gm_moves", "risk_if_pressed", "exit_conditions"],
+      "optional_fields": ["npc_hooks", "clock_links"]
+    },
+    {
+      "type": "npc",
+      "display_name": "功能 NPC 卡",
+      "description": "记录人物在调查系统中的功能，而不是性格说明书。",
+      "required_fields": ["role", "wants", "offers", "pressure_point", "refusal_consequence"],
+      "optional_fields": ["first_impression", "secret", "voice_notes"]
+    },
+    {
+      "type": "threat",
+      "display_name": "威胁卡",
+      "description": "描述威胁如何被感知、升级与绕过，不依赖数值挡板。",
+      "required_fields": ["manifestation", "intention", "danger_signs", "escalation", "noncombat_exits"],
+      "optional_fields": ["defensive_limits"]
+    },
+    {
+      "type": "clock",
+      "display_name": "推进钟",
+      "description": "把时间、暴露和仪式后果变成可见的阶段。",
+      "required_fields": ["name", "stages", "advance_condition"],
+      "optional_fields": ["current_stage", "final_consequence"]
+    }
+  ],
+  "risk_axes": ["exposure", "insight", "pursuit", "relationships"],
+  "failure_moves": ["cost_forward", "reveal_pressure", "threat_advance"],
+  "gm_moves": ["ask_a_question", "expose_a_cost", "advance_the_clock", "complicate_the_scene", "make_the_invisible_felt"],
+  "prompts": {
+    "scene_opening": "这里最先让人感到不对的是什么？谁仍假装一切正常？",
+    "complication": "这次调查让谁注意到了他们，代价会先落在何处？",
+    "failure": "失败不是挡板；它揭示压力、消耗关系，或让威胁前进一步。"
+  },
+  "scene_guidance": {
+    "arrival": "把地点作为可回应的现场讲出来：给出可见的人、声音和异常，但不要列出调查动作。",
+    "investigation": "让玩家的关注决定线索顺序；人物按自己的目的回应，失败或代价推进暴露、关系或洞察，不用阻塞式检定。",
+    "pressure": "把时钟表现为现场变化与逼近，不提前宣布阶段；玩家拖延或付出代价时，再推进对应后果。",
+    "confrontation": "先展示威胁意图和可怕前兆，给玩家改变位置、关系或证据的机会；不把威胁改写成数值面板。",
+    "aftermath": "明确留下的证据、代价和新目标，把选择权交回玩家，而不是替他们决定下一站。"
+  }
+}

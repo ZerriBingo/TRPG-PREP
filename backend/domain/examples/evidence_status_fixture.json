@@ -1,0 +1,116 @@
+{
+  "id": "evidence_status_fixture",
+  "name": "Evidence status validation fixture",
+  "description": "Minimal auditable bundle for source, candidate, and GM-authored facts.",
+  "profile_ids": ["cthulhu-dark-2e"],
+  "facts": [
+    {
+      "id": "fact_evidence_source",
+      "source_refs": [
+        {
+          "file": "fixture://evidence-status",
+          "page": 1,
+          "locator": "ledger entry",
+          "excerpt": "The ledger has a torn-out page.",
+          "region": "upper table",
+          "source_version": "fixture-v1"
+        },
+        {
+          "file": "fixture://evidence-status",
+          "page": 2,
+          "locator": "night report",
+          "excerpt": "The clerk heard paper tearing after midnight.",
+          "source_version": "fixture-v1"
+        }
+      ],
+      "evidence_status": "source_fact",
+      "text": "A missing ledger page is supported by the ledger and the night report.",
+      "kind": "clue",
+      "visibility": "explicit",
+      "links": [],
+      "tags": ["fixture", "source"]
+    },
+    {
+      "id": "fact_evidence_candidate",
+      "evidence_status": "model_candidate",
+      "text": "The missing page may identify the person who paid the clerk.",
+      "kind": "clue",
+      "visibility": "inferred",
+      "links": ["fact_evidence_source"],
+      "tags": ["fixture", "candidate"]
+    },
+    {
+      "id": "fact_evidence_gm",
+      "evidence_status": "gm_authored",
+      "text": "The GM may let the clerk trade information for a safe exit.",
+      "kind": "npc",
+      "visibility": "gm_suggestion",
+      "links": ["fact_evidence_source"],
+      "tags": ["fixture", "gm-authored"]
+    }
+  ],
+  "cards": [
+    {
+      "id": "card_evidence_scene",
+      "profile_id": "cthulhu-dark-2e",
+      "type": "scene",
+      "title": "The torn ledger",
+      "fact_ids": ["fact_evidence_source", "fact_evidence_gm"],
+      "edit_state": "approved",
+      "fields": {
+        "opening_image": "A damp ledger lies open beneath a desk lamp.",
+        "immediate_actions": ["Inspect the ledger"],
+        "direct_clues": ["A page is missing"],
+        "hidden_clues": ["Fresh paper fibers remain in the binding"],
+        "gm_moves": ["Let the clerk notice the attention"],
+        "risk_if_pressed": "The clerk may destroy the remaining record.",
+        "exit_conditions": ["The investigators secure a copy or a witness"]
+      }
+    },
+    {
+      "id": "card_evidence_candidate_draft",
+      "profile_id": "cthulhu-dark-2e",
+      "type": "scene",
+      "title": "Candidate-only draft",
+      "fact_ids": ["fact_evidence_candidate"],
+      "edit_state": "generated",
+      "fields": {
+        "opening_image": "A theory is waiting for review, not for play.",
+        "immediate_actions": ["Review the candidate"],
+        "direct_clues": ["No approved clue is available"],
+        "hidden_clues": ["The model proposed a possible link"],
+        "gm_moves": ["Hold the draft for review"],
+        "risk_if_pressed": "An unsupported conclusion could enter play.",
+        "exit_conditions": ["Approve, edit, or reject the candidate"]
+      }
+    }
+  ],
+  "plans": [
+    {
+      "id": "plan_evidence_reviewed",
+      "profile_id": "cthulhu-dark-2e",
+      "title": "Reviewed evidence scene",
+      "source_file": "fixture://evidence-status",
+      "source_pages": [1, 2],
+      "premise": "The group follows a verified lead while the GM keeps authored advice distinct.",
+      "card_ids": ["card_evidence_scene"],
+      "beats": [
+        {
+          "id": "beat_evidence_arrival",
+          "title": "Inspect the ledger",
+          "mode": "arrival",
+          "source_pages": [1, 2],
+          "framing": "Show the ledger before anyone explains it.",
+          "situation": "The clerk can see the investigators studying the missing page.",
+          "card_ids": ["card_evidence_scene"],
+          "reveal_fact_ids": ["fact_evidence_source", "fact_evidence_gm"],
+          "soft_cues": [],
+          "hard_cues": [],
+          "question_prompts": [],
+          "exit_when": ["The group chooses what to do with the record."]
+        }
+      ],
+      "exit_states": ["The evidence changes hands."]
+    }
+  ]
+}

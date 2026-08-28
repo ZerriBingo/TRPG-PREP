@@ -1,0 +1,251 @@
+{
+  "id": "naimen_pilot",
+  "name": "奈面试点：恐怖的咀咀屋",
+  "description": "取《奈亚拉托提普的面具》PDF 159-165 页的单场景运行包；事实保留原文页码，卡片面向 Cthulhu Dark 的压力、揭示与不可逆后果。",
+  "profile_ids": ["cthulhu-dark-2e"],
+  "facts": [
+    {
+      "id": "fact_naimen_juju_location",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "恐怖的咀咀屋"},
+      "text": "咀咀屋是哈莱姆区兰桑姆1号小院中的非洲艺术品商店；院子有两扇门，分别通向商店和一间废弃当铺。",
+      "kind": "location", "visibility": "explicit",
+      "links": [], "tags": ["奈面", "纽约", "地点"]
+    },
+    {
+      "id": "fact_naimen_prior_connections",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "联系"},
+      "text": "恩科万经营此处；莱明会推荐调查员来这里打听非洲邪教；亚当斯夫妇能把这里与哈莱姆区失踪和杀人案联系起来。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "入口"]
+    },
+    {
+      "id": "fact_naimen_moon_timeline",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "守秘人提示"},
+      "text": "1925年1月24日和25日是月朔；调查员未必恰好在仪式时到达。",
+      "kind": "timeline", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "时间"]
+    },
+    {
+      "id": "fact_naimen_courtyard_guards",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "地点描写"},
+      "text": "集会夜里，三名邪教徒在院中假扮酒鬼担任警卫；其他时段也可能有警卫。",
+      "kind": "obstacle", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location", "fact_naimen_moon_timeline"], "tags": ["奈面", "警卫"]
+    },
+    {
+      "id": "fact_naimen_neighbor_reports",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "询问当地居民"},
+      "text": "居民知道深夜常有陌生人进入商店并听到怪声；集会可能一月多次，但额外集会人数少且不定期。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "传闻"]
+    },
+    {
+      "id": "fact_naimen_pawnshop_watchpost",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 159, "locator": "调查当铺"},
+      "text": "废弃当铺可作监视据点，但门缝监视可能被警察或邪教徒发现，并通报恩科万与姆达里。",
+      "kind": "obstacle", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "监视"]
+    },
+    {
+      "id": "fact_naimen_daytime_visitors",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 160, "locator": "在白天"},
+      "text": "白天访客短暂进出；值得注意者包括拿信封的警探、店主恩科万和肌肉光头的姆达里。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "观察"]
+    },
+    {
+      "id": "fact_naimen_mumdari_pattern",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 160, "locator": "在白天"},
+      "text": "姆达里可能去胖梅贝尔酒吧、哈德逊河港口或第129街的破旧房间；发现跟踪后会通过罗伯森处理，必要时派人绑架调查员。",
+      "kind": "npc", "visibility": "explicit",
+      "links": ["fact_naimen_daytime_visitors"], "tags": ["奈面", "威胁"]
+    },
+    {
+      "id": "fact_naimen_enkowan_front",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 161, "locator": "进入咀咀屋"},
+      "text": "恩科万独自看店，脖子上挂着开地下室门栓的钥匙；询问邪教会使他警惕，之后他会记录来访者特征。",
+      "kind": "npc", "visibility": "explicit",
+      "links": ["fact_naimen_juju_location"], "tags": ["奈面", "NPC"]
+    },
+    {
+      "id": "fact_naimen_shop_ledger_and_mask",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 161, "locator": "闯入咀咀屋"},
+      "text": "账本记载每周付给“W.R.14”的钱；恩科万床下藏有带干瘪人舌的血舌面具和豹皮潘加砍刀。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_enkowan_front"], "tags": ["奈面", "证据"]
+    },
+    {
+      "id": "fact_naimen_trapdoor_route",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 162, "locator": "深入地下"},
+      "text": "柜台下有活板门，通往陡峭石阶、刻符走廊和铁条加固的橡木门；仪式期间地下室门不上锁。",
+      "kind": "obstacle", "visibility": "explicit",
+      "links": ["fact_naimen_enkowan_front"], "tags": ["奈面", "路径"]
+    },
+    {
+      "id": "fact_naimen_symba_guardians",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 162, "locator": "祭祀房间的守卫"},
+      "text": "四个由谋杀受害者制成的西姆巴守卫守在壁龛；姆达里不在时会攻击进入祭祀房间的人，但不追到楼梯底端以上。",
+      "kind": "threat", "visibility": "explicit",
+      "links": ["fact_naimen_trapdoor_route"], "tags": ["奈面", "守卫"]
+    },
+    {
+      "id": "fact_naimen_shrine_items",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 163, "locator": "姆达里壁龛里的物品"},
+      "text": "壁龛保存血舌面具、羽毛法袍、狮子爪、《非洲的黑暗教派》、哈亚玛的面具、铜碗、权杖、金属头带和航海天文钟等物。",
+      "kind": "resource", "visibility": "explicit",
+      "links": ["fact_naimen_symba_guardians"], "tags": ["奈面", "证据"]
+    },
+    {
+      "id": "fact_naimen_victim_cashbox",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 163, "locator": "上锁的钱匣"},
+      "text": "钱匣内有珠宝、被害者个人物品和从杰克逊·埃利亚斯酒店房间偷走的东西，可证明教派与失踪案及谋杀案相关。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_shrine_items"], "tags": ["奈面", "证据"]
+    },
+    {
+      "id": "fact_naimen_chakota",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 164, "locator": "查寇塔"},
+      "text": "坑底的查寇塔是紫色血管遍布的圆柱形异形生物，长着被吞食者的脸；它无法离开坑，石盖移开后会在十分钟内寻求食物。",
+      "kind": "threat", "visibility": "explicit",
+      "links": ["fact_naimen_trapdoor_route"], "tags": ["奈面", "怪物"]
+    },
+    {
+      "id": "fact_naimen_ritual_sequence",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 164, "locator": "咀咀屋里的血舌祭祀仪式"},
+      "text": "约30名邪教徒在凌晨一点到一点半之间抵达，一点半开始仪式；需要至少两人牲，仪式中会移开查寇塔坑的石盖。",
+      "kind": "event", "visibility": "explicit",
+      "links": ["fact_naimen_moon_timeline", "fact_naimen_chakota"], "tags": ["奈面", "仪式"]
+    },
+    {
+      "id": "fact_naimen_ritual_revelation",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 164, "locator": "咀咀屋里的血舌祭祀仪式"},
+      "text": "姆达里在祭品额头刻记号并吟诵祷词，其中明显提到“奈亚拉托提普”。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_ritual_sequence"], "tags": ["奈面", "揭示"]
+    },
+    {
+      "id": "fact_naimen_intrusion_alarm",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 165, "locator": "直接闯入"},
+      "text": "若西姆巴守卫被杀而未被处理，每天来地下室的姆达里会发现有人闯入，并可能在证据暴露前清除调查员。",
+      "kind": "stakes", "visibility": "explicit",
+      "links": ["fact_naimen_symba_guardians", "fact_naimen_shrine_items"], "tags": ["奈面", "时钟"]
+    },
+    {
+      "id": "fact_naimen_evidence_routes",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 165, "locator": "搜集证据"},
+      "text": "可拍摄守卫、祭祀房间、查寇塔或受贿照片，也可带走面具、钱匣物品或守卫尸体；闪光灯会立即暴露，显眼失窃也容易被发现。",
+      "kind": "clue", "visibility": "explicit",
+      "links": ["fact_naimen_victim_cashbox", "fact_naimen_intrusion_alarm"], "tags": ["奈面", "取证"]
+    },
+    {
+      "id": "fact_naimen_raid_consequences",
+      "source": {"file": "Resource/奈亚拉托提普的面具v1.0.pdf", "page": 165, "locator": "搜集证据"},
+      "text": "罗伯森可能向姆达里通风报信，导致重要物品转移、纵火毁证并危及居民；普尔警督则可能突袭并扳倒教派与罗伯森。",
+      "kind": "stakes", "visibility": "explicit",
+      "links": ["fact_naimen_evidence_routes"], "tags": ["奈面", "结局"]
+    }
+  ],
+  "cards": [
+    {
+      "id": "card_naimen_juju_scene",
+      "profile_id": "cthulhu-dark-2e", "type": "scene",
+      "title": "咀咀屋", "subtitle": "艺术品店、院子与地下圣所",
+      "fact_ids": ["fact_naimen_juju_location","fact_naimen_prior_connections","fact_naimen_neighbor_reports","fact_naimen_trapdoor_route","fact_naimen_ritual_revelation"],
+      "edit_state": "approved",
+      "fields": {
+        "opening_image": "一条堆满杂物的小巷通向封闭小院；非洲面具隔着窗帘隐约可见，废弃当铺的后门正对商店入口。",
+        "immediate_actions": ["向居民打听深夜访客和怪声", "从窗户、当铺或街道盯梢", "营业时进店接触恩科万", "寻找活板门、钥匙或仪式窗口"],
+        "direct_clues": ["居民确认深夜有陌生人和怪声", "账本出现每周支付“W.R.14”的记录", "恩科万脖子上有地下室钥匙"],
+        "hidden_clues": ["床下的血舌面具与砍刀", "柜台后的活板门", "仪式祷词中的“奈亚拉托提普”"],
+        "gm_moves": ["让一名访客表现出不该被注意的规律", "让门缝后传来脚步或目光", "让恩科万把一次普通提问变成暴露", "让煤油灯亮起，说明今晚有集会"],
+        "risk_if_pressed": "强行开锁、偷钥或监视会被院中人、警察或恩科万察觉；一旦上报姆达里，调查就从取证转入失踪风险。",
+        "exit_conditions": ["带着账本、面具或钱匣证物离开", "确认月朔窗口后撤出并准备突袭", "被识破前切断跟踪并换据点", "把警方线索交给普尔而非罗伯森"]
+      }
+    },
+    {
+      "id": "card_naimen_enkowan_npc",
+      "profile_id": "cthulhu-dark-2e", "type": "npc",
+      "title": "塞拉斯·恩科万", "subtitle": "店主兼血舌教派看守",
+      "fact_ids": ["fact_naimen_enkowan_front","fact_naimen_shop_ledger_and_mask"],
+      "edit_state": "approved",
+      "fields": {
+        "role": "咀咀屋唯一看店人，也是地下室的日常掩护。",
+        "wants": "保住秘密，同时把可疑者的特征报给姆达里。",
+        "offers": "非洲工艺品解释、店铺作息、以及看似无意的线索。",
+        "pressure_point": "钥匙、账本和床下面具都在店内；公开骚动会让他失去掩护。",
+        "refusal_consequence": "他把来访者记入名单；姆达里随后派人观察、警告或绑架。",
+        "first_impression": "皱巴巴的老人披着红毯子，没牙地笑，主动问客人想找什么。"
+      }
+    },
+    {
+      "id": "card_naimen_mumdari_npc",
+      "profile_id": "cthulhu-dark-2e", "type": "npc",
+      "title": "穆昆加·姆达里", "subtitle": "祭司、执行者与地下圣所主人",
+      "fact_ids": ["fact_naimen_mumdari_pattern","fact_naimen_ritual_sequence","fact_naimen_intrusion_alarm"],
+      "edit_state": "approved",
+      "fields": {
+        "role": "教派武力与仪式核心，能调动警局保护和邪教徒。",
+        "wants": "维持献祭网络，清除已经看见太多的人。",
+        "offers": "若被骗过，他会给出行动规律；他的路线本身就是证据。",
+        "pressure_point": "贿赂记录、受害者物品、目击者和他每日检查地下室的习惯。",
+        "refusal_consequence": "先用罗伯森施压；不成则派六人在孤立时机绑走最弱的目标。"
+      }
+    },
+    {
+      "id": "card_naimen_symba_threat",
+      "profile_id": "cthulhu-dark-2e", "type": "threat",
+      "title": "西姆巴守卫", "subtitle": "门口之后的沉默界线",
+      "fact_ids": ["fact_naimen_symba_guardians"],
+      "edit_state": "approved",
+      "fields": {
+        "manifestation": "壁龛两侧立着四具肠外露、额刻教标的尸体形守卫。",
+        "intention": "不让任何人靠近姆达里的宝物。",
+        "danger_signs": "它们不在楼梯口拦截，而是在祭祀房间内等待进入者。",
+        "escalation": "一旦攻击开始，房间变成狭窄的死地；杀死它们也会留下闯入证据。",
+        "noncombat_exits": ["不越过门槛", "利用仪式或姆达里在场造成的不同状态", "用箱子和搬运计划预先设计撤出"]
+      }
+    },
+    {
+      "id": "card_naimen_chakota_threat",
+      "profile_id": "cthulhu-dark-2e", "type": "threat",
+      "title": "查寇塔", "subtitle": "坑中千面之灵",
+      "fact_ids": ["fact_naimen_chakota","fact_naimen_ritual_sequence"],
+      "edit_state": "approved",
+      "fields": {
+        "manifestation": "数十张哭泣的人脸嵌在紫色血管遍布的圆柱肉体上。",
+        "intention": "索求食物；石盖移开后十分钟内没有得到，就会更激烈地哭喊。",
+        "danger_signs": "石盖开启后的悲鸣先于攻击感；楼上的人也会听见。",
+        "escalation": "声音引来邪教徒或警卫；目睹它造成强烈 Insight 压力，而喂食会制造道德崩坏。",
+        "noncombat_exits": ["恢复石盖", "从楼梯撤离", "让它成为揭发教派的恐怖证物而非战斗目标"]
+      }
+    },
+    {
+      "id": "card_naimen_ritual_clock",
+      "profile_id": "cthulhu-dark-2e", "type": "clock",
+      "title": "月朔仪式钟", "subtitle": "1925年1月24-25日",
+      "fact_ids": ["fact_naimen_moon_timeline","fact_naimen_courtyard_guards","fact_naimen_ritual_sequence"],
+      "edit_state": "approved",
+      "fields": {
+        "name": "月朔仪式",
+        "stages": ["白天伪装与零散访客", "院中三人假扮酒鬼", "凌晨一点邪教徒陆续抵达", "一点半脱衣、歌舞并准备献祭", "石盖移开，人牲落入坑中"],
+        "advance_condition": "随游戏内时间和调查员延误推进；明显侦查也可能迫使额外集会。",
+        "current_stage": "开场默认停在第一阶段。",
+        "final_consequence": "至少两名人牲死亡；若调查员已暴露，他们很可能替代或增加祭品。"
+      }
+    },
+    {
+      "id": "card_naimen_exposure_clock",
+      "profile_id": "cthulhu-dark-2e", "type": "clock",
+      "title": "暴露与清算钟", "subtitle": "从被记住到被处理",
+      "fact_ids": ["fact_naimen_enkowan_front","fact_naimen_mumdari_pattern","fact_naimen_intrusion_alarm","fact_naimen_raid_consequences"],
+      "edit_state": "approved",
+      "fields": {
+        "name": "暴露与清算",
+        "stages": ["恩科万记住特征", "眼线跟踪调查员", "罗伯森发出警告", "姆达里安排绑架", "教派销毁证据并反扑"],
+        "advance_condition": "提问、跟踪、留下失窃痕迹、惊动守卫或依赖罗伯森都会推进。",
+        "current_stage": "首次进入商店前为0。",
+        "final_consequence": "关键证物被转移，咀咀屋纵火，居民受害，希尔顿·亚当斯失去脱罪机会。"
+      }
+    }
+  ]
+}

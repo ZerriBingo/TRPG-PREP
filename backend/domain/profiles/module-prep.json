@@ -1,0 +1,47 @@
+{
+  "id": "module-prep",
+  "name": "通用模组整理档案",
+  "version": "0.1",
+  "profile_kind": "prep",
+  "summary": "把 D&D、COC 等长模组整理成来源可追溯的场景入口、人物功能、威胁逻辑和时间压力，供目标规则档案重新编排。",
+  "card_definitions": [
+    {
+      "type": "scene_extract",
+      "display_name": "场景整理卡",
+      "description": "提取地点状况、调查入口、发现、压力与离场条件，不绑定某一种运行规则。",
+      "required_fields": ["situation", "entry_points", "discoveries", "pressure", "exit_conditions"],
+      "optional_fields": ["source_structure", "relevant_characters"]
+    },
+    {
+      "type": "character_function",
+      "display_name": "人物功能卡",
+      "description": "保留人物身份、目的、能提供什么和施压后果，供不同规则重新解释。",
+      "required_fields": ["role", "wants", "offers", "pressure_point", "refusal_consequence"],
+      "optional_fields": ["first_impression", "secret", "voice_notes"]
+    },
+    {
+      "type": "threat_logic",
+      "display_name": "威胁逻辑卡",
+      "description": "整理威胁的表现、意图、前兆、升级和可行解法，不制作数值面板。",
+      "required_fields": ["manifestation", "intention", "danger_signs", "escalation", "resolutions"],
+      "optional_fields": ["source_statblock", "retreat_condition"]
+    },
+    {
+      "type": "timeline_extract",
+      "display_name": "时间压力卡",
+      "description": "把仪式、追击、援军和后果整理成规则无关的阶段。",
+      "required_fields": ["name", "stages", "advance_condition"],
+      "optional_fields": ["final_consequence"]
+    }
+  ],
+  "risk_axes": ["reading_load", "missing_context", "pressure", "source_traceability"],
+  "failure_moves": ["mark_missing_context", "surface_source_gap", "flag_rule_conversion", "preserve_consequence"],
+  "gm_moves": ["open_source_page", "mark_scene_entry", "separate_fact_from_inference", "send_to_runtime_profile"],
+  "prompts": {
+    "scene_extract": "这一段原文在桌边最需要被看见的现场入口是什么？",
+    "character_function": "这个人物能改变什么：信息、关系、风险还是时间？",
+    "threat_logic": "威胁如何被察觉、想要什么、何时升级、有哪些非唯一解？",
+    "timeline_extract": "什么事件会在玩家不行动时继续发生？"
+  },
+  "scene_guidance": {}
+}

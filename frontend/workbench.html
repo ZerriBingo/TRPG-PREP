@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TRPG 备团工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23171b22'/%3E%3Cpath d='M8 8h16v4H18v12h-4V12H8z' fill='%23d4aa63'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/workbench.css?v=reassessment-20260828">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">可追溯事实 · 三板块备团流转</p>
+      <h1>TRPG 工作台</h1>
+    </div>
+    <div class="top-actions">
+      <span id="connection-status" class="status loading">连接中</span>
+      <button id="edit-toggle" class="ghost-link" type="button">编辑模式</button>
+      <button id="save-bundle" class="action-link" type="button" hidden disabled>保存更改</button>
+      <button id="reset-bundle" class="ghost-link" type="button" hidden>还原种子</button>
+      <a class="action-link" href="/api/domain/export">导出备团产物</a>
+    </div>
+  </header>
+
+  <nav class="work-nav" aria-label="工作台导航">
+    <button class="active" data-view="prep">备团任务</button>
+    <button data-view="review">候选复核</button>
+    <button data-view="shelf">书架</button>
+    <button data-view="facts">事实网</button>
+    <button data-view="cards">备团产物</button>
+    <button data-view="runtime">运行模式</button>
+  </nav>
+
+  <main>
+    <div id="global-error" class="error-panel" hidden></div>
+
+    <section id="view-prep" class="view active">
+      <section class="panel prep-create-panel">
+        <div class="panel-head">
+          <h2>新建备团任务</h2>
+          <span id="prep-llm-status" class="status loading">读取模型配置</span>
+        </div>
+        <form id="prep-job-form">
+          <div class="prep-upload-row">
+            <label class="prep-upload-field">上传模组 PDF<input id="prep-source-upload" type="file" accept="application/pdf,.pdf"></label>
+            <button id="prep-source-upload-button" class="edit-button" type="button">上传并选用</button>
+            <span id="prep-source-upload-status" class="muted"></span>
+          </div>
+          <div class="prep-form-grid">
+            <label>已上传来源<select id="prep-job-source" required><option value="">请先上传 PDF</option></select></label>
+            <label>页范围<input id="prep-job-range" required placeholder="159-165, 172, 180-183"></label>
+            <label>目标板块<select id="prep-job-profile">
+              <option value="cthulhu-dark-2e">现实恐怖</option>
+              <option value="daggerheart">奇幻冒险</option>
+              <option value="module-prep">通用备团</option>
+            </select></label>
+            <label>本次时长<select id="prep-job-minutes">
+              <option value="60">60 分钟</option>
+              <option value="90">90 分钟</option>
+              <option value="120" selected>120 分钟</option>
+              <option value="180">180 分钟</option>
+              <option value="240">240 分钟</option>
+            </select></label>
+          </div>
+          <div class="prep-form-actions">
+            <span id="prep-job-error" class="modal-error"></span>
+            <span id="prep-job-notice" class="modal-notice"></span>
+            <button id="prep-job-submit" class="action-link" type="submit">创建并开始</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel prep-model-panel">
+        <details>
+          <summary>模型连接</summary>
+          <form id="prep-config-form" class="prep-config-grid">
+            <label>Base URL<input id="prep-config-base-url" type="url" required></label>
+            <label>模型<input id="prep-config-model" list="prep-model-options" required></label>
+            <label>API Key<input id="prep-config-api-key" type="password" autocomplete="off" placeholder="留空保留已保存密钥"></label>
+            <label class="prep-fake-toggle"><input id="prep-config-fake" type="checkbox">使用离线 FakeLLM</label>
+            <div class="prep-config-actions">
+              <button id="prep-config-save" class="edit-button" type="submit">保存</button>
+              <button id="prep-config-test" class="edit-button" type="button">测试连接</button>
+              <span id="prep-config-status" class="muted"></span>
+            </div>
+          </form>
+          <datalist id="prep-model-options"></datalist>
+        </details>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>备团任务</h2>
+            <span id="prep-job-summary" class="muted"></span>
+          </div>
+          <button id="prep-job-refresh" class="edit-button toolbar-action" type="button">刷新</button>
+        </div>
+        <div id="prep-job-list" class="prep-job-list"></div>
+      </section>
+    </section>
+
+    <section id="view-shelf" class="view">
+      <div id="shelf-summary" class="summary-grid"></div>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>书架工作区</h2>
+          <select id="example-select" aria-label="选择书架工作区">
+            <option value="red_signal_fixture">红信号 · 综合夹具</option>
+            <option value="naimen_pilot">奈面 · 咀咀屋试点</option>
+          </select>
+          <div class="row-actions workspace-actions">
+            <button id="rename-workspace" class="edit-button" type="button" hidden>重命名</button>
+            <button id="delete-workspace" class="edit-button danger" type="button" hidden>删除项目</button>
+          </div>
+        </div>
+      <div id="bundle-detail"></div>
+      <div id="coverage-audit" class="coverage-audit"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>备团产物</h2><p id="artifact-draft-guidance" class="muted">从已提升事实生成可复核的多种桌边产物。</p></div>
+          <div class="row-actions">
+            <button id="open-artifacts" class="edit-button" type="button">打开产物复核</button>
+            <button id="draft-artifacts" class="action-link" type="button">生成备团产物草案</button>
+          </div>
+        </div>
+        <div id="artifact-stage-summary" class="workflow-stage-summary"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>运行场景</h2><p id="plan-draft-guidance" class="muted">只使用已批准产物，沿用当前任务上下文确定性组装。</p></div>
+          <button id="draft-plan" class="action-link" type="button">组装运行场景</button>
+        </div>
+        <div id="plan-list" class="plan-list"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>备团板块</h2>
+          <span class="muted">同一事实库，按目标组织不同桌边产物</span>
+        </div>
+        <div id="profile-grid" class="card-grid"></div>
+      </section>
+    </section>
+
+    <section id="view-facts" class="view">
+      <section class="panel toolbar-panel">
+        <input id="fact-search" type="search" placeholder="搜索事实、标签或来源页码">
+        <select id="fact-kind">
+          <option value="all">全部类型</option>
+          <option value="clue">线索</option>
+          <option value="npc">人物</option>
+          <option value="location">地点</option>
+          <option value="event">事件</option>
+          <option value="threat">威胁</option>
+          <option value="stakes">利害</option>
+          <option value="obstacle">障碍</option>
+          <option value="timeline">时间线</option>
+        </select>
+        <select id="fact-visibility">
+          <option value="all">全部可见性</option>
+          <option value="explicit">明示</option>
+          <option value="hidden">隐藏</option>
+          <option value="inferred">推断</option>
+          <option value="gm_suggestion">GM 建议</option>
+        </select>
+        <button id="source-prep" class="edit-button toolbar-action" type="button">按页准备事实</button>
+        <button id="create-fact" class="edit-button toolbar-action" type="button" hidden>新建事实</button>
+      </section>
+      <section class="panel relation-panel">
+        <div class="panel-head"><div><h2>局部关系图</h2><p class="muted">围绕选中的事实查看直接关联；节点自动排列，不保存位置。</p></div></div>
+        <div id="fact-relation-graph" class="relation-graph"></div>
+      </section>
+      <div id="fact-grid" class="card-grid"></div>
+    </section>
+
+    <section id="view-cards" class="view">
+      <section class="panel card-toolbar">
+        <select id="card-profile">
+          <option value="all">全部板块</option>
+        </select>
+        <select id="card-type">
+          <option value="all">全部卡型</option>
+        </select>
+        <span id="card-count" class="muted"></span>
+        <label class="card-select-all"><input id="card-select-all" type="checkbox">选择当前列表</label>
+        <button id="card-approve-selected" class="action-link toolbar-action" type="button" disabled>批准所选</button>
+        <button id="card-reopen-selected" class="edit-button toolbar-action" type="button" disabled>退回修改</button>
+        <button id="create-card" class="edit-button toolbar-action" type="button" hidden>新建产物</button>
+        <div id="card-review-error" class="review-detail-error"></div>
+      </section>
+      <div id="work-card-grid" class="card-grid"></div>
+    </section>
+
+    <section id="view-review" class="view">
+      <section class="panel review-toolbar">
+        <div class="panel-head">
+          <div>
+            <h2>候选复核</h2>
+            <p id="review-summary" class="muted">等待载入候选队列</p>
+          </div>
+          <button id="review-refresh" class="edit-button toolbar-action" type="button">刷新</button>
+        </div>
+        <div class="review-filter-grid">
+          <label>任务<select id="review-task-filter"><option value="">全部任务</option></select></label>
+          <label>状态<select id="review-state-filter">
+            <option value="needs_review">待复核</option>
+            <option value="accepted">已接受</option>
+            <option value="rejected">已拒绝</option>
+            <option value="all">全部状态</option>
+          </select></label>
+          <label>来源页<input id="review-page-filter" type="text" placeholder="如 4-6, 8" autocomplete="off"></label>
+          <label class="review-select-all"><input id="review-select-all" type="checkbox">选择当前列表</label>
+        </div>
+        <div class="review-batch-flow">
+          <section class="review-batch-group">
+            <div class="review-batch-title"><h3>复核所选</h3><span class="muted">改变候选的复核状态，不会写入书架。</span></div>
+            <div class="review-batch-controls review-batch-review-controls">
+              <label>复核结果<select id="review-batch-state">
+                <option value="accepted">接受</option>
+                <option value="rejected">拒绝</option>
+                <option value="needs_review">退回复核</option>
+              </select></label>
+              <label>共同说明<textarea id="review-batch-note" rows="2" placeholder="可选复核说明"></textarea></label>
+              <button id="review-batch-apply" class="edit-button toolbar-action" type="button" disabled>复核所选</button>
+            </div>
+          </section>
+          <section class="review-batch-group review-promote-group">
+            <div class="review-batch-title"><h3>送入书架</h3><span class="muted">仅处理已经接受、且尚未提升的候选。</span></div>
+            <div class="review-batch-controls review-batch-promote-controls">
+              <label>证据类型<select id="review-batch-evidence">
+                <option value="source_fact">原文事实</option>
+                <option value="inference">可验证推断</option>
+              </select></label>
+              <button id="review-batch-promote" class="action-link toolbar-action" type="button" disabled>送入书架</button>
+            </div>
+          </section>
+        </div>
+      </section>
+      <section class="review-layout">
+        <section class="panel review-list-panel">
+          <div id="review-candidate-list" class="review-candidate-list"></div>
+        </section>
+        <section class="panel review-detail-panel">
+          <div id="review-candidate-detail"></div>
+        </section>
+      </section>
+    </section>
+
+    <section id="view-runtime" class="view">
+      <section class="panel runtime-head">
+        <div class="panel-head">
+          <div>
+            <h2>桌边运行</h2>
+            <p class="muted">只保留当前场景、线索、时钟和 GM 移动；原文仍可从卡片来源回溯。</p>
+          </div>
+          <span id="session-status" class="status">运行状态加载中…</span>
+        </div>
+        <label for="runtime-profile">当前运行板块</label>
+        <select id="runtime-profile"></select>
+        <div id="profile-runtime"></div>
+        <div id="runtime-plan-status" class="runtime-plan-status"></div>
+      </section>
+      <section class="panel runtime-exploration-panel">
+        <div class="panel-head"><h2>可探索地点</h2><span class="muted">从当前计划的场景与地点卡切换</span></div>
+        <div id="runtime-exploration-list" class="runtime-exploration-list"></div>
+      </section>
+      <div id="scene-holder"></div>
+      <div id="beat-holder"></div>
+      <section class="panel runtime-controls">
+        <div class="panel-head">
+          <h2>运行操作</h2>
+          <div class="row-actions">
+            <button id="save-session" class="edit-button" type="button">保存运行状态</button>
+            <a id="export-session-review-markdown" class="edit-button" href="#">导出复盘 Markdown</a>
+            <a id="export-session-review-json" class="edit-button" href="#">导出复盘 JSON</a>
+            <button id="reset-session" class="edit-button danger" type="button">重置本次运行</button>
+          </div>
+        </div>
+        <div class="runtime-action-grid">
+          <label>GM 移动<select id="gm-move-select"></select></label>
+          <button id="apply-gm-move" class="action-link runtime-action-button" type="button">记录并执行</button>
+          <label>GM 运行备注<textarea id="session-note-input" rows="2" placeholder="记录临时准备、裁定或需要回看的资料"></textarea></label>
+          <button id="add-session-note" class="edit-button runtime-action-button" type="button">加入日志</button>
+          <label>未找到的 GM 信息<input id="lookup-gap-input" placeholder="例如：罗伯森如何回应直接证据"></label>
+          <button id="record-lookup-gap" class="edit-button runtime-action-button" type="button">记录缺口</button>
+        </div>
+      </section>
+      <section class="runtime-columns">
+        <section class="panel">
+          <div class="panel-head"><h2>推进钟</h2><span class="muted">每次推进都写入运行日志</span></div>
+          <div id="runtime-clocks" class="runtime-list"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>运行日志</h2><span id="session-log-count" class="muted"></span></div>
+          <div id="session-log" class="session-log"></div>
+        </section>
+      </section>
+      <section class="panel">
+        <label>本次运行总备注<textarea id="session-notes" rows="3" placeholder="记录需要回看原文的问题或下一次准备事项；不要写玩家隐私或外部数据"></textarea></label>
+      </section>
+    </section>
+  </main>
+
+  <div id="editor-modal" class="modal-backdrop" hidden>
+    <form id="plan-draft-editor" class="modal-panel" hidden>
+      <h3>组装运行场景</h3>
+      <p class="muted">沿用当前备团任务的来源、页范围、目标板块与时长，并自动纳入当前书架的已批准产物。这里不再要求重复选择或填写；组装后仍会停在草案状态。</p>
+      <div id="plan-draft-context" class="plan-draft-context"></div>
+      <div id="plan-card-picker" class="plan-card-picker"></div>
+      <div class="modal-actions">
+        <span id="plan-draft-error" class="modal-error"></span>
+        <button type="button" data-close-modal>取消</button>
+        <button id="plan-draft-submit" type="submit" class="accent">组装并保存草案</button>
+      </div>
+    </form>
+    <form id="source-prep-editor" class="modal-panel" hidden>
+      <h3>按页准备事实</h3>
+      <p class="muted">连续查看一小段原文，把你确认过的短事实逐条加入事实网。页面内容不会自动写入事实，也不会被当成模型推断。</p>
+      <div class="modal-grid">
+        <label>来源 PDF<select id="prep-source-file" required></select></label>
+        <label>当前页<input id="prep-page" type="number" min="1" required></label>
+        <label>起始页<input id="prep-start-page" type="number" min="1" required></label>
+        <label>结束页<input id="prep-end-page" type="number" min="1" required></label>
+      </div>
+      <div class="source-prep-nav">
+        <button id="prep-prev-page" class="edit-button" type="button">上一页</button>
+        <span id="prep-page-status" class="muted">尚未读取</span>
+        <button id="prep-next-page" class="edit-button" type="button">下一页</button>
+        <button id="prep-load-page" class="edit-button" type="button">读取当前页</button>
+      </div>
+      <div class="source-preview prep-preview">
+        <img id="prep-source-image" alt="PDF 原文页预览">
+        <pre id="prep-source-text"></pre>
+      </div>
+      <label>确认后的短事实<textarea id="prep-fact-text" rows="3" placeholder="只写你确认要在备团时调用的一条事实" required></textarea></label>
+      <div class="modal-grid">
+        <label>事实类型<select id="prep-fact-kind">
+          <option value="clue">线索</option><option value="npc">人物</option>
+          <option value="location">地点</option><option value="event">事件</option>
+          <option value="threat">威胁</option><option value="stakes">利害</option>
+          <option value="obstacle">障碍</option><option value="timeline">时间线</option>
+          <option value="resource">资源</option>
+        </select></label>
+        <label>可见性<select id="prep-fact-visibility">
+          <option value="explicit">原文明示</option><option value="hidden">原文隐藏</option>
+          <option value="inferred">GM 推断</option><option value="gm_suggestion">GM 建议</option>
+        </select></label>
+        <label>定位器<input id="prep-fact-locator" placeholder="章节、小标题或段落位置"></label>
+        <label>标签<input id="prep-fact-tags" placeholder="逗号分隔"></label>
+      </div>
+      <div class="modal-actions">
+        <span id="source-prep-error" class="modal-error"></span>
+        <button type="button" data-close-modal>关闭</button>
+        <button type="submit" class="accent">加入事实并继续</button>
+      </div>
+    </form>
+    <form id="plan-editor" class="modal-panel" hidden>
+      <h3>编辑场景计划</h3>
+      <p class="muted">这里编辑的是 GM 内部准备，不会把“软提示/硬推进”直接展示给玩家。</p>
+      <label>计划 JSON<textarea id="plan-json" rows="24" required></textarea></label>
+      <div class="modal-actions">
+        <span id="plan-editor-error" class="modal-error"></span>
+        <button type="button" data-close-modal>取消</button>
+        <button type="submit" class="accent">应用编辑</button>
+      </div>
+    </form>
+    <form id="fact-editor" class="modal-panel" hidden>
+      <h3 id="fact-editor-title">编辑事实</h3>
+      <label>事实内容<textarea id="fact-text" rows="4" required></textarea></label>
+      <div class="modal-grid">
+        <label>类型<select id="fact-kind-edit">
+          <option value="clue">线索</option><option value="npc">人物</option>
+          <option value="location">地点</option><option value="event">事件</option>
+          <option value="threat">威胁</option><option value="stakes">利害</option>
+          <option value="obstacle">障碍</option><option value="timeline">时间线</option>
+          <option value="resource">资源</option>
+        </select></label>
+        <label>可见性<select id="fact-visibility-edit">
+          <option value="explicit">明示</option><option value="hidden">隐藏</option>
+          <option value="inferred">推断</option><option value="gm_suggestion">GM 建议</option>
+        </select></label>
+        <label>PDF 页码<input id="fact-page" type="number" min="1" required></label>
+        <label>定位器<input id="fact-locator"></label>
+      </div>
+      <div class="source-preview-tools">
+        <label class="source-file-input">证据状态
+          <select id="fact-evidence-status">
+            <option value="source_fact">原文事实</option>
+            <option value="inference">可验证推断</option>
+            <option value="gm_authored">GM 创作</option>
+            <option value="model_candidate">模型候选</option>
+          </select>
+        </label>
+        <label class="source-file-input">来源文件<input id="fact-source-file" required></label>
+        <button id="fact-preview-source" class="edit-button" type="button">查看原文页</button>
+      </div>
+      <div id="fact-source-preview" class="source-preview" hidden>
+        <img id="fact-source-image" alt="PDF 原文页预览">
+        <pre id="fact-source-text"></pre>
+      </div>
+      <label>标签（逗号分隔）<input id="fact-tags"></label>
+      <label>关联事实 ID（逗号分隔）<input id="fact-links"></label>
+      <label>备注<textarea id="fact-notes" rows="2"></textarea></label>
+      <div class="modal-actions">
+        <span id="fact-editor-error" class="modal-error"></span>
+        <button type="button" data-close-modal>取消</button>
+        <button type="submit" class="accent">更新关联产物</button>
+      </div>
+    </form>
+    <form id="card-editor" class="modal-panel" hidden>
+      <h3 id="card-editor-title">编辑备团产物</h3>
+      <div class="modal-grid">
+        <label>所属板块<select id="card-profile-edit"></select></label>
+        <label>卡型<select id="card-type-edit"></select></label>
+        <label>标题<input id="card-title" required></label>
+        <label>副标题<input id="card-subtitle"></label>
+      </div>
+      <label>引用事实 ID（逗号分隔）<input id="card-fact-ids" required></label>
+      <label>字段 JSON<textarea id="card-fields" rows="14" required></textarea></label>
+      <div class="modal-actions">
+        <span id="card-editor-error" class="modal-error"></span>
+        <button type="button" data-close-modal>取消</button>
+        <button type="submit" class="accent">保存为已修改</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="/workbench.js?v=reassessment-20260828"></script>
+</body>
+</html>

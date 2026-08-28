@@ -1,0 +1,12 @@
+# 运行时数据（SQLite、上传的 PDF、生成的备团产物）
+data/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.playwright-cli/
+_tmp*.py
+_tmp*.patch
+
+# Local/reference PDFs may be copyrighted or too large for the source repo.
+Resource/*.pdf

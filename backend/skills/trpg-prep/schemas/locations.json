@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "信息集合（场景卡式整理页）",
+  "type": "object",
+  "required": [
+    "locations"
+  ],
+  "properties": {
+    "locations": {
+      "type": "array",
+      "description": "场景卡列表：每个地点一张卡片",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "地点名（一级标题，保留原文）"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string",
+            "description": "场景外观/氛围描述（源自模组原文；若模组没有描述，基于已知信息补充并标注「（GM 建议）」）"
+          },
+          "npcs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "可能在此出现的角色名单"
+          },
+          "info": {
+            "type": "array",
+            "description": "场景下信息（二级标题）：现场发生的事、可观察到的细节",
+            "items": {
+              "type": "object",
+              "required": [
+                "title"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "description": "信息标题（二级标题），如『堵在门口』"
+                },
+                "description": {
+                  "type": "string",
+                  "description": "现场情况描述"
+                },
+                "disclosure": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "信息披露（三级）：通过交谈/偷听/调查可获得的具体信息"
+                }
+              }
+            }
+          },
+          "extras": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "补充信息：附近商铺、杂项可观察内容、氛围细节等"
+          },
+          "read_aloud": {
+            "type": "string",
+            "description": "可直接朗读的框文本：GM 念给玩家听的场景描写（第二人称、现在时、60-150 字；基于模组原文改写，原文缺失时合理补充并标注「（GM 建议）」）"
+          }
+        }
+      }
+    }
+  }
+}

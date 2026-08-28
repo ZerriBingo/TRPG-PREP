@@ -1,0 +1,43 @@
+{
+  "id": "daggerheart",
+  "name": "Daggerheart 叙事档案",
+  "version": "0.2",
+  "summary": "以环境调度、敌人意图、压力与硬选择为核心的奇幻冒险档案。",
+  "card_definitions": [
+    {
+      "type": "environment",
+      "display_name": "环境卡",
+      "description": "把可利用物、危险物和非战斗出口组织成战斗与遭遇舞台。",
+      "required_fields": ["opening_image", "usable_features", "hazards", "positioning", "environment_changes", "noncombat_exits"],
+      "optional_fields": ["distance_notes", "sensory_details"]
+    },
+    {
+      "type": "enemy",
+      "display_name": "意图敌人卡",
+      "description": "记录敌人想做什么、如何暴露危险，以及哪些解决方式成立。",
+      "required_fields": ["intention", "signature_actions", "danger_signs", "damaged_behavior", "resolutions"],
+      "optional_fields": ["statblock_ref", "retreat_condition"]
+    },
+    {
+      "type": "encounter_clock",
+      "display_name": "遭遇钟",
+      "description": "追踪援军、警报、崩塌或追击等遭遇级推进。",
+      "required_fields": ["name", "stages", "advance_condition"],
+      "optional_fields": ["current_stage", "final_consequence"]
+    }
+  ],
+  "risk_axes": ["hp", "stress", "positioning", "attention"],
+  "failure_moves": ["cost_forward", "worsen_position", "enemy_advances"],
+  "gm_moves": ["telegraph_danger", "change_the_environment", "show_enemy_intention", "offer_a_hard_choice"],
+  "prompts": {
+    "environment": "这个空间会奖励冒险，还是惩罚鲁莽？谁占据有利位置？",
+    "enemy": "它此刻想要什么？玩家看到哪个信号后应该改变计划？"
+  },
+  "scene_guidance": {
+    "arrival": "先描述可利用物、危险和位置关系，让空间成为可回应的现场，不给玩家念战术菜单。",
+    "investigation": "把玩家的行动变成改变位置、资源或关系的机会；不要把每个障碍写成只有一个正确解。",
+    "pressure": "用环境变化、援军、追击或时钟把遭遇往前推，并先让玩家看见危险信号。",
+    "confrontation": "展示敌人的意图和标志动作，保留环境利用与非战斗解法；按叙事后果推进，不套模拟引擎式敌人数值。",
+    "aftermath": "处理场地变化、压力、敌人撤退与新的硬选择，让下一拍从已发生的后果自然长出来。"
+  }
+}
