@@ -36,6 +36,9 @@ Stabilize engineering governance and the supplemental location-card workflow bef
 - Acceptance criteria are board-specific. The complete single-chapter runtime gate applies to the reality-horror board; other boards require their own confirmed criteria.
 - A location is runtime-relevant when players may investigate it, return to it, seek help there, or use it to advance the fiction. Evidence-only locations may still need a compact independently visible scene treatment so the GM does not have to leave runtime mode to recover context.
 - Job state is a shared product concept across analysis, review, artifact generation, and supplemental work; each job exposes phase, progress, failure, and retry semantics.
+- Fantasy/adventure preparation is split by play function: out-of-combat story material, in-combat scene material, and travel/transition material. A short adventure may need only a few strong beats; a city-based adventure may need a wider web of recurring places, factions, and social consequences.
+- The fantasy board may borrow organizational principles from the supplied homebrew reference (clear campaign distinctions, inciting situation, GM-facing principles, locations, and concise adversary/environment support) while ignoring its system-specific numeric guidance and terminology in product output.
+- Seed projects are fixtures for development only. They must not appear in or remain undeletable in a user's formal bookshelf. Fixture JSON may remain in the repository for tests.
 
 ## Verification
 

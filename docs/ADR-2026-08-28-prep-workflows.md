@@ -37,3 +37,10 @@ Status: accepted for implementation
 - Location coverage is narrative and operational, not merely evidentiary. A place where players may investigate, return, seek help, or create a consequential follow-up should be independently visible in runtime mode. Small evidence-oriented places may use a compact scene treatment, but must not disappear into an off-screen fact list.
 - A unified task-center model is part of the product direction: analysis, review, artifact, and supplemental jobs should share observable lifecycle semantics.
 - Deleting legacy data remains an unresolved migration decision; no destructive cleanup is authorized by this clarification alone.
+
+## Board-Specific Clarification (2026-08-29)
+
+- Fantasy/adventure preparation has three functional bands: out-of-combat narrative, in-combat scenes, and travel/transitions. Card density follows the selected source and play scope rather than a fixed per-page or per-scene count.
+- The supplied homebrew reference is used only as an organizational reference: concise principles, setting distinctions, an inciting situation, locations, GM guidance, and compact encounter support. Numeric balance guidance and named system mechanics are outside this product contract.
+- Seed projects are development fixtures, not product content. Formal bookshelf cleanup should remove seed instances while retaining repository fixtures for automated tests.
+- User-managed legacy analysis versions remain a separate, manual deletion decision.
