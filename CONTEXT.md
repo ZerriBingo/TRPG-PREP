@@ -15,6 +15,9 @@ Stabilize engineering governance and the supplemental location-card workflow bef
 - **Artifact**: a structured prep card derived from promoted facts.
 - **Runtime scene**: an assembled, locked-at-runtime plan that may be deleted and rebuilt before play.
 - **Supplemental card job**: an incremental artifact job scoped to uncovered facts; it may append to an existing artifact set.
+- **Fact closure**: the complete set of promoted facts a card is allowed to cite. Every field citation must stay inside this set.
+- **Coverage audit**: a report over source evidence that distinguishes deterministic card coverage from locations needing GM review.
+- **Runtime snapshot**: the state created when a scene starts; it can change during play without rewriting the artifact draft.
 
 ## Engineering Rules
 
@@ -23,6 +26,13 @@ Stabilize engineering governance and the supplemental location-card workflow bef
 3. Background jobs must expose durable status, phase, progress, and failure details to the UI.
 4. Mechanical pagination is diagnostic only; source ranges may be discontinuous and cross page boundaries.
 5. Prefer small interfaces with deep implementations; keep storage, domain validation, and LLM adapters behind explicit seams.
+
+## Resolved Product Direction (2026-08-29)
+
+- The first release gate is one complete chapter workflow, not whole-book automation.
+- The bookshelf-to-runtime path is primary; the facts graph is a secondary retrieval and provenance view.
+- Supplemental cards are incremental and reviewable, never a silent full regeneration.
+- Important locations may form a non-linear network; runtime navigation must not force a route.
 
 ## Verification
 

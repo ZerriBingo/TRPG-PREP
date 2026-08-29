@@ -21,3 +21,12 @@ Status: accepted for implementation
 
 - Whether coverage should promote an entity index in addition to fact-kind matching.
 - Which automatic graph layout remains usable on mobile without persisted coordinates.
+
+## Confirmed Direction (2026-08-29)
+
+- The first acceptance target is a complete single-chapter workflow from uploaded PDF to usable runtime scene.
+- A card's `fact_ids` form its fact closure; field sources may not cite facts outside that closure.
+- Coverage has deterministic and review-required layers; model-discovered locations do not enter the runtime package automatically.
+- The bookshelf-to-runtime path is primary. The facts graph remains a secondary retrieval and provenance surface.
+- Supplemental generation appends reviewable cards only. It never silently regenerates the full board.
+- Runtime navigation supports a non-linear location network. A started scene owns a runtime snapshot; deleting the assembled scene is the rebuild path.
