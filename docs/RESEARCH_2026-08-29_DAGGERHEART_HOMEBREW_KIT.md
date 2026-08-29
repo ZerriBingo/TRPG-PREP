@@ -19,3 +19,7 @@ For fantasy/adventure, the generator should classify material into:
 3. Travel/transition support: route context, discoveries, complications, and optional detours.
 
 The classification is a preparation aid, not a new rules engine. The board must avoid exposing source-system names or numeric recommendations from the reference.
+
+## Environment-led combat implication
+
+The supplied environment-card example shows why a generic combat-scene summary is insufficient: the environment itself expresses the pressure of the scene, its changing condition, what it tends to do, and how those effects escalate or trigger. In product terms, the environment card is an operating surface that can stand at the center of a combat scene, while adversary cards provide the actors that respond within it. This is an organizational translation only; it does not import numeric balance rules.

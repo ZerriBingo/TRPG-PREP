@@ -44,3 +44,10 @@ Status: accepted for implementation
 - The supplied homebrew reference is used only as an organizational reference: concise principles, setting distinctions, an inciting situation, locations, GM guidance, and compact encounter support. Numeric balance guidance and named system mechanics are outside this product contract.
 - Seed projects are development fixtures, not product content. Formal bookshelf cleanup should remove seed instances while retaining repository fixtures for automated tests.
 - User-managed legacy analysis versions remain a separate, manual deletion decision.
+
+## Combat Support Clarification (2026-08-29)
+
+- For fantasy/adventure, the environment card may be the primary combat-scene card. It carries the scene pressure, changing conditions, prompts, and escalation cues; adversary cards are companion operating aids.
+- A generic scene card must not duplicate or obscure the environment card. The artifact set should distinguish out-of-combat narrative, travel/transition, environment-led combat, and concise adversary/support cards.
+- The supplied environment-card example was reviewed locally. Its transferable structure is: a compact premise, motives or tendencies, and a small set of concrete features with timing/trigger language. Numeric values and source-system names remain outside the product contract.
+- Seed-project removal is confirmed for formal user data; repository fixtures remain for tests. Manual deletion of user-selected historical analysis versions remains separate.
