@@ -41,6 +41,12 @@ Stabilize engineering governance and the supplemental location-card workflow bef
 - Seed projects are fixtures for development only. They must not appear in or remain undeletable in a user's formal bookshelf. Fixture JSON may remain in the repository for tests.
 - In fantasy/adventure, an environment card can be the primary combat-scene operating surface, not merely an attachment. It should carry the scene's pressure, changing conditions, tactical/narrative prompts, and escalation cues; adversary cards are read alongside it and should stay concise.
 - Fantasy artifact layout therefore follows function: a scene may have one environment card plus zero or more adversary/support cards, while out-of-combat and travel material remain separate. The generator must not produce a generic scene card that hides or duplicates the environment card's job.
+- A fantasy combat scene is a grouped runtime unit: one environment-led operating card, optional adversary/support cards, and optional clocks or phase changes.
+- City-scale fantasy preparation uses a hub-and-entity shape: a situation hub plus independently searchable recurring locations, people, factions, and consequences. One-off minor material may stay in a beat or hub.
+- Travel and transition material is optional, supports detours, and never encodes a mandatory route.
+- Source statistics are preserved only as cited source material. Any cross-board conversion is a GM-reviewable suggestion, never an automatic rewrite.
+- Seed cleanup is an explicit fixture-ID operation against formal user data. Repository fixtures remain for tests; user-owned historical analysis versions are not touched by seed cleanup.
+- The task center is a shared user-facing surface with job type, phase, progress, failure, retry, and append/replace impact.
 
 ## Verification
 

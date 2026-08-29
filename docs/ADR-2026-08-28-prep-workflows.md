@@ -51,3 +51,12 @@ Status: accepted for implementation
 - A generic scene card must not duplicate or obscure the environment card. The artifact set should distinguish out-of-combat narrative, travel/transition, environment-led combat, and concise adversary/support cards.
 - The supplied environment-card example was reviewed locally. Its transferable structure is: a compact premise, motives or tendencies, and a small set of concrete features with timing/trigger language. Numeric values and source-system names remain outside the product contract.
 - Seed-project removal is confirmed for formal user data; repository fixtures remain for tests. Manual deletion of user-selected historical analysis versions remains separate.
+
+## Final Direction Confirmation (2026-08-29)
+
+- Fantasy combat is represented as an environment-led scene group: the environment card is the primary operating surface, with concise adversary/support cards and optional clocks or phases.
+- City-scale fantasy content uses a situation hub plus independently searchable recurring entities; minor one-off material may remain inside a beat or hub.
+- Travel and transition content remains optional and supports detours rather than a fixed route.
+- Source statistics remain cited source material. Conversions across boards are GM-reviewable suggestions and never automatic rewrites.
+- Seed cleanup is limited to explicit fixture IDs in formal user data. Repository fixtures and user-owned historical versions are preserved.
+- The task center is a shared user-facing surface with durable lifecycle and impact semantics.
