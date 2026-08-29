@@ -30,3 +30,10 @@ Status: accepted for implementation
 - The bookshelf-to-runtime path is primary. The facts graph remains a secondary retrieval and provenance surface.
 - Supplemental generation appends reviewable cards only. It never silently regenerates the full board.
 - Runtime navigation supports a non-linear location network. A started scene owns a runtime snapshot; deleting the assembled scene is the rebuild path.
+
+## Additional Clarifications (2026-08-29)
+
+- The complete single-chapter runtime acceptance gate is specific to the reality-horror board. Fantasy/adventure and general-prep boards must not inherit that gate without their own decision.
+- Location coverage is narrative and operational, not merely evidentiary. A place where players may investigate, return, seek help, or create a consequential follow-up should be independently visible in runtime mode. Small evidence-oriented places may use a compact scene treatment, but must not disappear into an off-screen fact list.
+- A unified task-center model is part of the product direction: analysis, review, artifact, and supplemental jobs should share observable lifecycle semantics.
+- Deleting legacy data remains an unresolved migration decision; no destructive cleanup is authorized by this clarification alone.

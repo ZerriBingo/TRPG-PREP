@@ -33,6 +33,9 @@ Stabilize engineering governance and the supplemental location-card workflow bef
 - The bookshelf-to-runtime path is primary; the facts graph is a secondary retrieval and provenance view.
 - Supplemental cards are incremental and reviewable, never a silent full regeneration.
 - Important locations may form a non-linear network; runtime navigation must not force a route.
+- Acceptance criteria are board-specific. The complete single-chapter runtime gate applies to the reality-horror board; other boards require their own confirmed criteria.
+- A location is runtime-relevant when players may investigate it, return to it, seek help there, or use it to advance the fiction. Evidence-only locations may still need a compact independently visible scene treatment so the GM does not have to leave runtime mode to recover context.
+- Job state is a shared product concept across analysis, review, artifact generation, and supplemental work; each job exposes phase, progress, failure, and retry semantics.
 
 ## Verification
 
