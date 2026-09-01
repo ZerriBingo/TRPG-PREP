@@ -1,31 +1,18 @@
 {
   "id": "evidence_status_fixture",
   "name": "Evidence status validation fixture",
-  "description": "Minimal auditable bundle for source, candidate, and GM-authored facts.",
+  "description": "Minimal current-contract bundle for source, candidate, and GM-authored facts.",
   "profile_ids": ["cthulhu-dark-2e"],
   "facts": [
     {
       "id": "fact_evidence_source",
       "source_refs": [
-        {
-          "file": "fixture://evidence-status",
-          "page": 1,
-          "locator": "ledger entry",
-          "excerpt": "The ledger has a torn-out page.",
-          "region": "upper table",
-          "source_version": "fixture-v1"
-        },
-        {
-          "file": "fixture://evidence-status",
-          "page": 2,
-          "locator": "night report",
-          "excerpt": "The clerk heard paper tearing after midnight.",
-          "source_version": "fixture-v1"
-        }
+        {"file": "fixture://evidence-status", "page": 1, "locator": "ledger entry", "source_version": "fixture-v1"},
+        {"file": "fixture://evidence-status", "page": 2, "locator": "night report", "source_version": "fixture-v1"}
       ],
       "evidence_status": "source_fact",
       "text": "A missing ledger page is supported by the ledger and the night report.",
-      "kind": "clue",
+      "kind": "location",
       "visibility": "explicit",
       "links": [],
       "tags": ["fixture", "source"]
@@ -34,7 +21,7 @@
       "id": "fact_evidence_candidate",
       "evidence_status": "model_candidate",
       "text": "The missing page may identify the person who paid the clerk.",
-      "kind": "clue",
+      "kind": "location",
       "visibility": "inferred",
       "links": ["fact_evidence_source"],
       "tags": ["fixture", "candidate"]
@@ -51,37 +38,38 @@
   ],
   "cards": [
     {
-      "id": "card_evidence_scene",
+      "id": "card_evidence_location",
       "profile_id": "cthulhu-dark-2e",
-      "type": "scene",
-      "title": "The torn ledger",
+      "type": "location",
+      "title": "The archive office",
       "fact_ids": ["fact_evidence_source", "fact_evidence_gm"],
       "edit_state": "approved",
       "fields": {
-        "opening_image": "A damp ledger lies open beneath a desk lamp.",
-        "immediate_actions": ["Inspect the ledger"],
+        "normal_state": "A clerk works beneath a desk lamp.",
+        "arrival_description": "A damp ledger lies open on the desk.",
+        "relevant_characters": ["The clerk"],
         "direct_clues": ["A page is missing"],
         "hidden_clues": ["Fresh paper fibers remain in the binding"],
         "gm_moves": ["Let the clerk notice the attention"],
-        "risk_if_pressed": "The clerk may destroy the remaining record.",
-        "exit_conditions": ["The investigators secure a copy or a witness"]
+        "first_triggers": ["The clerk closes the ledger when strangers approach."],
+        "return_changes": ["The remaining record may be removed"]
       }
     },
     {
       "id": "card_evidence_candidate_draft",
       "profile_id": "cthulhu-dark-2e",
-      "type": "scene",
+      "type": "location",
       "title": "Candidate-only draft",
       "fact_ids": ["fact_evidence_candidate"],
       "edit_state": "generated",
       "fields": {
-        "opening_image": "A theory is waiting for review, not for play.",
-        "immediate_actions": ["Review the candidate"],
+        "normal_state": "A theory is waiting for review.",
+        "arrival_description": "No approved description is available.",
+        "relevant_characters": ["Unconfirmed subject"],
         "direct_clues": ["No approved clue is available"],
         "hidden_clues": ["The model proposed a possible link"],
         "gm_moves": ["Hold the draft for review"],
-        "risk_if_pressed": "An unsupported conclusion could enter play.",
-        "exit_conditions": ["Approve, edit, or reject the candidate"]
+        "return_changes": ["No runtime state is valid before approval"]
       }
     }
   ],
@@ -89,27 +77,14 @@
     {
       "id": "plan_evidence_reviewed",
       "profile_id": "cthulhu-dark-2e",
-      "title": "Reviewed evidence scene",
+      "title": "Reviewed evidence runtime",
       "source_file": "fixture://evidence-status",
       "source_pages": [1, 2],
-      "premise": "The group follows a verified lead while the GM keeps authored advice distinct.",
-      "card_ids": ["card_evidence_scene"],
-      "beats": [
-        {
-          "id": "beat_evidence_arrival",
-          "title": "Inspect the ledger",
-          "mode": "arrival",
-          "source_pages": [1, 2],
-          "framing": "Show the ledger before anyone explains it.",
-          "situation": "The clerk can see the investigators studying the missing page.",
-          "card_ids": ["card_evidence_scene"],
-          "reveal_fact_ids": ["fact_evidence_source", "fact_evidence_gm"],
-          "soft_cues": [],
-          "hard_cues": [],
-          "question_prompts": [],
-          "exit_when": ["The group chooses what to do with the record."]
-        }
-      ],
+      "premise": "The group follows a verified lead.",
+      "card_ids": ["card_evidence_location"],
+      "navigation_mode": "location",
+      "location_card_ids": ["card_evidence_location"],
+      "beats": [],
       "exit_states": ["The evidence changes hands."]
     }
   ]

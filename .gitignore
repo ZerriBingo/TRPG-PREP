@@ -5,8 +5,9 @@ __pycache__/
 *.pyc
 .venv/
 .playwright-cli/
+output/
 _tmp*.py
 _tmp*.patch
 
-# Local/reference PDFs may be copyrighted or too large for the source repo.
-Resource/*.pdf
+# Local/reference material may be copyrighted or too large for the public source repo.
+Resource/

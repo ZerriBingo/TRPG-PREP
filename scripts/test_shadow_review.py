@@ -84,7 +84,6 @@ async def main() -> None:
                 assert len(original_candidates) == 2
                 first_id = original_candidates[0]["id"]
                 second_id = original_candidates[1]["id"]
-                original_text = original_candidates[0]["text"]
 
                 queue = await client.get("/api/domain/shadow/review-queue")
                 assert queue.status_code == 200, queue.text
@@ -93,24 +92,35 @@ async def main() -> None:
                     second_id,
                 ]
 
+                edited = await client.patch(
+                    f"/api/domain/shadow/candidates/{first_id}",
+                    json={
+                        "text": "A witness saw the shop locked after midnight; retain it as a lead, not a conclusion.",
+                        "review_note": "The source supports a nighttime observation, but not the cause.",
+                        "content_basis": "inference",
+                    },
+                )
+                assert edited.status_code == 200, edited.text
                 accepted = await client.post(
                     f"/api/domain/shadow/candidates/{first_id}/review",
-                    json={
-                        "review_state": "accepted",
-                        "reviewed_text": "A witness saw the shop locked after midnight; retain it as a lead, not a conclusion.",
-                        "review_note": "The source supports a nighttime observation, but not the cause.",
-                    },
+                    json={"review_state": "accepted", "content_basis": "inference"},
                 )
                 assert accepted.status_code == 200, accepted.text
                 accepted_candidate = accepted.json()["candidate"]
-                assert accepted_candidate["text"] == original_text
+                assert accepted_candidate["text"].startswith("A witness saw")
                 assert accepted_candidate["evidence_status"] == "model_candidate"
                 assert accepted_candidate["review_state"] == "accepted"
-                assert accepted_candidate["reviewed_text"].startswith("A witness saw")
                 assert accepted_candidate["review_note"].startswith("The source supports")
-                assert len(accepted_candidate["review_history"]) == 1
-                assert accepted_candidate["review_history"][0]["review_state"] == "accepted"
-                assert accepted_candidate["reviewed_at"] == accepted_candidate["review_history"][0]["created_at"]
+                # Editing and accepting are two explicit operations. History
+                # keeps metadata for both, while the candidate stores only its
+                # current text.
+                assert len(accepted_candidate["review_history"]) == 2
+                assert accepted_candidate["review_history"][0]["review_state"] == "needs_review"
+                assert accepted_candidate["review_history"][0]["action"] == "edit"
+                assert accepted_candidate["review_history"][1]["review_state"] == "accepted"
+                assert accepted_candidate["review_history"][1]["action"] == "review"
+                assert all("reviewed_text" not in event for event in accepted_candidate["review_history"])
+                assert accepted_candidate["reviewed_at"] == accepted_candidate["review_history"][-1]["created_at"]
 
                 pending = await client.get("/api/domain/shadow/review-queue")
                 assert pending.status_code == 200, pending.text
@@ -160,16 +170,18 @@ async def main() -> None:
                     candidate["review_state"] == "needs_review"
                     for candidate in reopened.json()["candidates"]
                 )
-                assert reopened.json()["candidates"][0]["reviewed_text"] == accepted_candidate[
-                    "reviewed_text"
-                ]
+                assert reopened.json()["candidates"][0]["text"] == accepted_candidate["text"]
 
                 detail = await client.get(f"/api/domain/shadow/tasks/{task_id}")
                 assert detail.status_code == 200, detail.text
                 assert len(detail.json()["candidates"]) == 2
+                detail_candidates = {candidate["id"]: candidate for candidate in detail.json()["candidates"]}
+                assert len(detail_candidates[first_id]["review_history"]) == 3
+                assert len(detail_candidates[second_id]["review_history"]) == 2
                 assert all(
-                    len(candidate["review_history"]) == 2
-                    for candidate in detail.json()["candidates"]
+                    "reviewed_text" not in event
+                    for candidate in detail_candidates.values()
+                    for event in candidate["review_history"]
                 )
 
                 missing = await client.post(

@@ -32,7 +32,7 @@ def event(
     *,
     plan_id: str,
     card_id: str,
-    beat_id: str,
+    beat_id: str | None,
     subject_type: str | None = None,
     subject_id: str | None = None,
     metadata: dict[str, str | int | float | bool] | None = None,
@@ -71,11 +71,11 @@ def main() -> None:
 
     scene_id = "card_naimen_juju_scene"
     clock_id = "card_naimen_ritual_clock"
-    beat_id = plan.beats[0].id
+    beat_id = None
     session = SessionState(
         example_id=bundle.id,
         current_plan_id=plan.id,
-        current_beat_id=beat_id,
+        current_beat_id=None,
         current_card_id=scene_id,
         revealed_clue_keys=[scene_id + ":direct:0"],
         clock_stages={clock_id: 1, "card_naimen_exposure_clock": 0},

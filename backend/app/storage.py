@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +165,127 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _json_contains_source_file(value: object, source_file: str | set[str]) -> bool:
+    """Inspect persisted JSON without coupling the storage layer to domain models."""
+    raw_variants = {source_file} if isinstance(source_file, str) else source_file
+    variants: set[str] = set()
+    for item in raw_variants:
+        if not isinstance(item, str):
+            continue
+        normalized = item.strip().replace("\\", "/")
+        if not normalized:
+            continue
+        variants.add(normalized)
+        try:
+            variants.add(str((PROJECT_ROOT / normalized).resolve()).replace("\\", "/"))
+        except (OSError, ValueError):
+            pass
+
+    def matches(item: object) -> bool:
+        if not isinstance(item, str):
+            return False
+        normalized = item.strip().replace("\\", "/")
+        if normalized in variants:
+            return True
+        try:
+            absolute = str((PROJECT_ROOT / normalized).resolve()).replace("\\", "/")
+        except (OSError, ValueError):
+            return False
+        return absolute in variants
+
+    if isinstance(value, dict):
+        values = {value.get("source_file"), value.get("file"), value.get("pdf_path")}
+        if any(matches(item) for item in values):
+            return True
+        return any(_json_contains_source_file(item, variants) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_source_file(item, variants) for item in value)
+    return False
+
+
+def _json_load(value: object) -> object:
+    try:
+        return json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def source_file_references(source_file: str) -> list[dict[str, str]]:
+    """Return durable user-facing reasons a local source cannot be deleted."""
+    source_file = str(source_file or "").strip().replace("\\", "/")
+    if not source_file:
+        return []
+    absolute = str((PROJECT_ROOT / source_file).resolve()).replace("\\", "/")
+    variants = {source_file, absolute}
+    references: list[dict[str, str]] = []
+
+    def search_rows(table: str, columns: tuple[str, ...] = ("data",)) -> list[sqlite3.Row]:
+        """Use SQLite text matching to avoid decoding every large JSON blob."""
+        if not variants:
+            return []
+        clauses = " OR ".join(
+            f"{column} LIKE ?" for column in columns for _ in variants
+        )
+        params = [f"%{variant}%" for column in columns for variant in variants]
+        return conn.execute(
+            f"SELECT * FROM {table} WHERE {clauses}", params
+        ).fetchall()
+
+    def add(kind: str, identifier: str, label: str) -> None:
+        key = (kind, identifier)
+        if any((item["kind"], item["id"]) == key for item in references):
+            return
+        references.append({"kind": kind, "id": identifier, "label": label})
+
+    conn = _conn()
+    try:
+        for row in search_rows("prep_jobs"):
+            data = _json_load(row["data"])
+            if _json_contains_source_file(data, variants):
+                add("prep_job", row["id"], "备团任务")
+        for row in search_rows("shadow_tasks"):
+            data = _json_load(row["data"])
+            if _json_contains_source_file(data, variants):
+                add("shadow_task", row["id"], "候选分析任务")
+        for row in search_rows("shadow_candidates"):
+            data = _json_load(row["data"])
+            if _json_contains_source_file(data, variants):
+                add("candidate", row["id"], "候选内容")
+        for row in search_rows("candidate_promotions"):
+            data = _json_load(row["data"])
+            if _json_contains_source_file(data, variants):
+                add("promotion", row["candidate_id"], "已提升事实")
+        for row in search_rows("domain_bundles"):
+            data = _json_load(row["data"])
+            if _json_contains_source_file(data, variants):
+                add("workspace", row["id"], "书架工作区")
+        for row in search_rows("artifact_jobs"):
+            data = _json_load(row["data"])
+            workspace_id = data.get("workspace_id") if isinstance(data, dict) else None
+            if _json_contains_source_file(data, variants):
+                add("artifact_job", row["id"], "备团产物任务")
+            elif workspace_id:
+                bundle = conn.execute(
+                    "SELECT data FROM domain_bundles WHERE id = ?", (workspace_id,)
+                ).fetchone()
+                if bundle and _json_contains_source_file(_json_load(bundle["data"]), variants):
+                    add("artifact_job", row["id"], "备团产物任务")
+        for row in search_rows("campaigns", ("pdf_path",)):
+            if _json_contains_source_file({"pdf_path": row["pdf_path"]}, variants):
+                add("campaign", str(row["id"]), "旧版项目")
+    finally:
+        conn.close()
+    return references
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 # ---------- 领域运行包 ----------
 
 def save_domain_bundle(bundle_id: str, data: dict) -> str:
@@ -209,17 +331,16 @@ def delete_domain_workspace(bundle_id: str) -> bool:
     """Delete a saved bookshelf workspace and its project-scoped runtime data."""
     conn = _conn()
     try:
-        bundle = conn.execute(
-            "SELECT 1 FROM domain_bundles WHERE id = ?", (bundle_id,)
-        ).fetchone()
-        if bundle is None:
-            # A prep task may have no promoted facts yet, so there is no bundle
-            # row to remove.  Still clean any orphaned project records below.
-            exists = conn.execute(
-                "SELECT 1 FROM prep_jobs WHERE id = ?", (bundle_id,)
-            ).fetchone()
-            if exists is None:
-                return False
+        had_records = any(
+            conn.execute(query, (bundle_id,)).fetchone() is not None
+            for query in (
+                "SELECT 1 FROM domain_bundles WHERE id = ?",
+                "SELECT 1 FROM candidate_promotions WHERE workspace_id = ? LIMIT 1",
+                "SELECT 1 FROM artifact_jobs WHERE workspace_id = ? LIMIT 1",
+                "SELECT 1 FROM session_states WHERE id = ?",
+                "SELECT 1 FROM prep_jobs WHERE id = ?",
+            )
+        )
 
         conn.execute("DELETE FROM candidate_promotions WHERE workspace_id = ?", (bundle_id,))
         conn.execute(
@@ -231,7 +352,105 @@ def delete_domain_workspace(bundle_id: str) -> bool:
         conn.execute("DELETE FROM session_states WHERE id = ?", (bundle_id,))
         conn.execute("DELETE FROM domain_bundles WHERE id = ?", (bundle_id,))
         conn.commit()
-        return True
+        return had_records
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_workspace_instances(workspace_ids: list[str]) -> int:
+    """Atomically remove explicit development workspace instances and owned rows."""
+    targets = list(
+        dict.fromkeys(
+            value.strip()
+            for value in workspace_ids
+            if isinstance(value, str) and value.strip()
+        )
+    )
+    if not targets:
+        return 0
+
+    target_set = set(targets)
+    placeholders = ",".join("?" for _ in targets)
+    conn = _conn()
+    try:
+        matched_prep_ids: list[str] = []
+        shadow_task_ids: list[str] = []
+        matched_targets: set[str] = set()
+        prep_rows = conn.execute("SELECT id, data FROM prep_jobs").fetchall()
+        for row in prep_rows:
+            try:
+                raw = json.loads(row["data"])
+            except (TypeError, json.JSONDecodeError):
+                raw = {}
+            nested_workspace_id = raw.get("workspace_id") if isinstance(raw, dict) else None
+            if row["id"] not in target_set and nested_workspace_id not in target_set:
+                continue
+            matched_prep_ids.append(row["id"])
+            matched_targets.add(row["id"] if row["id"] in target_set else nested_workspace_id)
+            windows = raw.get("windows", []) if isinstance(raw, dict) else []
+            for window in windows:
+                if isinstance(window, dict) and window.get("shadow_task_id"):
+                    shadow_task_ids.append(window["shadow_task_id"])
+
+        for target in targets:
+            checks = (
+                ("SELECT 1 FROM domain_bundles WHERE id = ?", (target,)),
+                ("SELECT 1 FROM candidate_promotions WHERE workspace_id = ? LIMIT 1", (target,)),
+                ("SELECT 1 FROM artifact_jobs WHERE workspace_id = ? LIMIT 1", (target,)),
+                ("SELECT 1 FROM session_states WHERE id = ?", (target,)),
+                ("SELECT 1 FROM prep_jobs WHERE id = ?", (target,)),
+            )
+            if any(conn.execute(query, params).fetchone() is not None for query, params in checks):
+                matched_targets.add(target)
+
+        if shadow_task_ids:
+            task_ids = list(dict.fromkeys(shadow_task_ids))
+            task_placeholders = ",".join("?" for _ in task_ids)
+            conn.execute(
+                f"DELETE FROM shadow_candidates WHERE task_id IN ({task_placeholders})",
+                task_ids,
+            )
+            conn.execute(
+                f"DELETE FROM shadow_runs WHERE task_id IN ({task_placeholders})",
+                task_ids,
+            )
+            conn.execute(
+                f"DELETE FROM shadow_tasks WHERE id IN ({task_placeholders})",
+                task_ids,
+            )
+
+        conn.execute(
+            f"DELETE FROM candidate_promotions WHERE workspace_id IN ({placeholders})",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM artifact_job_steps WHERE job_id IN "
+            f"(SELECT id FROM artifact_jobs WHERE workspace_id IN ({placeholders}))",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM artifact_jobs WHERE workspace_id IN ({placeholders})",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM session_states WHERE id IN ({placeholders})",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM domain_bundles WHERE id IN ({placeholders})",
+            targets,
+        )
+        if matched_prep_ids:
+            prep_placeholders = ",".join("?" for _ in matched_prep_ids)
+            conn.execute(
+                f"DELETE FROM prep_jobs WHERE id IN ({prep_placeholders})",
+                matched_prep_ids,
+            )
+        conn.commit()
+        return len(matched_targets)
     except Exception:
         conn.rollback()
         raise
@@ -401,6 +620,36 @@ def list_shadow_tasks() -> list[dict]:
     return [json.loads(row["data"]) for row in rows]
 
 
+def delete_orphan_prep_shadow_tasks() -> int:
+    """Remove analysis windows whose owning prep job no longer exists."""
+    conn = _conn()
+    try:
+        prep_ids = {row["id"] for row in conn.execute("SELECT id FROM prep_jobs").fetchall()}
+        orphan_ids: list[str] = []
+        for row in conn.execute("SELECT id, data FROM shadow_tasks").fetchall():
+            try:
+                data = json.loads(row["data"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            key = str(data.get("idempotency_key", ""))
+            owner = key.split(":", 1)[0] if key.startswith("prep_job_") else ""
+            if owner and owner not in prep_ids:
+                orphan_ids.append(row["id"])
+        if not orphan_ids:
+            return 0
+        placeholders = ",".join("?" for _ in orphan_ids)
+        conn.execute(f"DELETE FROM shadow_candidates WHERE task_id IN ({placeholders})", orphan_ids)
+        conn.execute(f"DELETE FROM shadow_runs WHERE task_id IN ({placeholders})", orphan_ids)
+        conn.execute(f"DELETE FROM shadow_tasks WHERE id IN ({placeholders})", orphan_ids)
+        conn.commit()
+        return len(orphan_ids)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def save_shadow_task(data: dict) -> None:
     conn = _conn()
     conn.execute(
@@ -478,6 +727,56 @@ def save_shadow_candidates(candidates: list[dict]) -> None:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"unknown shadow candidate: {candidate['id']}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def replace_shadow_candidates(
+    task_id: str,
+    removed_candidate_ids: list[str],
+    replacements: list[dict],
+) -> None:
+    """Atomically replace current candidates for one shadow task.
+
+    This is the persistence seam for candidate edit/split/merge. The removed
+    rows must belong to the task; no other task's review queue can be touched.
+    """
+    removed = list(dict.fromkeys(item for item in removed_candidate_ids if item))
+    if not removed or not replacements:
+        raise ValueError("candidate replacement needs removed and replacement rows")
+    conn = _conn()
+    try:
+        placeholders = ",".join("?" for _ in removed)
+        rows = conn.execute(
+            f"SELECT id FROM shadow_candidates WHERE task_id = ? AND id IN ({placeholders})",
+            [task_id, *removed],
+        ).fetchall()
+        if {row["id"] for row in rows} != set(removed):
+            raise ValueError("candidate replacement contains an unknown task candidate")
+        conn.execute(
+            f"DELETE FROM shadow_candidates WHERE task_id = ? AND id IN ({placeholders})",
+            [task_id, *removed],
+        )
+        for candidate in replacements:
+            if candidate.get("task_id") != task_id:
+                raise ValueError("replacement candidate belongs to another task")
+            conn.execute(
+                "INSERT INTO shadow_candidates "
+                "(id, task_id, run_id, review_state, data, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    candidate["id"],
+                    candidate["task_id"],
+                    candidate["run_id"],
+                    candidate["review_state"],
+                    json.dumps(candidate, ensure_ascii=False),
+                    candidate["created_at"],
+                ),
+            )
         conn.commit()
     except Exception:
         conn.rollback()

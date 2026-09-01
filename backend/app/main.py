@@ -15,15 +15,16 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import hashlib
 import json
 import re
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
 import fitz
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -31,32 +32,140 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from . import artifacts, analyze, extract, generate, llm, prep, shadow, skill_loader, storage
 from ..domain import (
     DomainValidationError,
+    DisplayMaterial,
+    DisplayMaterialLink,
     ExampleBundle,
     PrepJobCreate,
     SessionLogEntry,
     SessionState,
     ScenePlan,
     ShadowTaskSpec,
+    ShadowCandidateEdit,
+    ShadowCandidateMergeIn,
+    ShadowCandidateSplitIn,
     build_session_review,
     draft_scene_plan_from_workspace,
     export_cards_markdown,
     export_session_review_markdown,
     load_profiles,
+    is_handout_fact,
     validate_bundle,
     validate_session,
 )
 from .llm import make_client
 
 storage.init_db()
-artifacts.recover_interrupted_artifact_jobs()
 
 PROJECT_ROOT = storage.PROJECT_ROOT
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 DOMAIN_DIR = PROJECT_ROOT / "backend" / "domain"
 
-app = FastAPI(title="trpg-prep", description="TRPG 备团助手")
 MAX_DOMAIN_PDF_BYTES = 512 * 1024 * 1024
 SEED_DOMAIN_WORKSPACES = {"red_signal_fixture", "naimen_pilot"}
+PUBLIC_PROFILE_NAMES = {
+    "cthulhu-dark-2e": "现实恐怖",
+    "daggerheart": "奇幻冒险",
+    "module-prep": "通用备团",
+}
+PUBLIC_PROFILE_SUMMARIES = {
+    "cthulhu-dark-2e": "线索、调查压力、恐怖递进与不可逆代价",
+    "daggerheart": "场景、环境、意图、压力与动态后果",
+    "module-prep": "章节地图、人物功能、线索、威胁与时间线",
+}
+PUBLIC_PROFILE_IDS = {
+    "cthulhu-dark-2e": "reality-horror",
+    "daggerheart": "fantasy-adventure",
+    "module-prep": "general-prep",
+}
+PUBLIC_CARD_DESCRIPTIONS = {
+    ("cthulhu-dark-2e", "location"): "整理可访问、可折返地点的常态、抵达描述、人物、线索、触发内容与回访变化。",
+    ("cthulhu-dark-2e", "chapter_overview"): "承载跨地点背景、真相、阴谋、结局与全章后果。",
+    ("cthulhu-dark-2e", "npc"): "记录人物在调查中的功能、诉求、交换和施压后果。",
+    ("cthulhu-dark-2e", "threat"): "描述威胁如何被感知、升级与绕过，不制作数值面板。",
+    ("cthulhu-dark-2e", "clock"): "把时间、暴露和仪式后果变成可见的推进阶段。",
+    ("daggerheart", "environment"): "把可利用物、危险和非战斗出口组织成遭遇舞台。",
+    ("daggerheart", "enemy"): "记录对手意图、危险信号、受创变化和可行解法。",
+    ("daggerheart", "encounter_clock"): "追踪援军、警报、崩塌或追击等遭遇级推进。",
+    ("module-prep", "scene_extract"): "提取地点状况、调查入口、发现、压力与离场条件，供后续备团整理。",
+    ("module-prep", "character_function"): "保留人物身份、目的、可提供内容和施压后果，供后续备团解释。",
+    ("module-prep", "threat_logic"): "整理威胁的表现、意图、前兆、升级和可行解法，不制作数值面板。",
+    ("module-prep", "timeline_extract"): "把仪式、追击、援军和后果整理成规则无关的阶段。",
+}
+
+
+def public_profile_name(profile_id: str) -> str:
+    """Map an internal profile id to the neutral label used by the UI."""
+    return PUBLIC_PROFILE_NAMES.get(profile_id, "备团板块")
+
+
+def public_profile_definition(profile_id: str, definition: object) -> dict:
+    """Expose only card contract data needed to render/edit a board.
+
+    Profile ids and source profile names are implementation details. The
+    browser still receives stable card types and field contracts, but never
+    receives the concrete rule-profile name.
+    """
+    return {
+        "type": definition.type,
+        "display_name": definition.display_name,
+        "description": PUBLIC_CARD_DESCRIPTIONS.get(
+            (profile_id, definition.type), "当前板块的结构化备团字段。"
+        ),
+        "required_fields": list(definition.required_fields),
+        "optional_fields": list(definition.optional_fields),
+    }
+
+
+def public_profiles(profiles: dict) -> dict:
+    return {
+        PUBLIC_PROFILE_IDS.get(profile_id, profile_id): {
+            "display_name": public_profile_name(profile_id),
+            "profile_kind": profile.profile_kind,
+            "summary": PUBLIC_PROFILE_SUMMARIES.get(
+                profile_id, "按当前工作区契约组织备团产物"
+            ),
+            "card_definitions": [
+                public_profile_definition(profile_id, definition)
+                for definition in profile.card_definitions
+            ],
+            # These are stable semantic prompts used by the runtime view. They
+            # contain no source profile name or system-specific numeric rules.
+            "risk_axes": list(profile.risk_axes),
+            "failure_moves": list(profile.failure_moves),
+            "gm_moves": list(profile.gm_moves),
+            "prompts": dict(profile.prompts),
+            "scene_guidance": dict(profile.scene_guidance),
+        }
+        for profile_id, profile in profiles.items()
+    }
+
+
+def remove_seed_workspace_instances() -> int:
+    """Remove persisted development fixtures without touching repository JSON."""
+    return storage.delete_workspace_instances(sorted(SEED_DOMAIN_WORKSPACES))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Run persistence maintenance only when the service actually starts."""
+    remove_seed_workspace_instances()
+    artifacts.recover_interrupted_artifact_jobs()
+    yield
+
+
+app = FastAPI(
+    title="trpg-prep",
+    description="TRPG 备团助手",
+    lifespan=lifespan,
+)
+
+
+@app.middleware("http")
+async def disable_workbench_asset_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path in {"/", "/workbench.html", "/workbench.js", "/workbench.css"}:
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def load_domain_example(example_id: str) -> ExampleBundle:
@@ -163,21 +272,28 @@ class ShadowRunIn(BaseModel):
 
 
 class ShadowReviewIn(BaseModel):
-    """A GM review action that leaves the original model candidate unchanged."""
+    """A review mark with optional current-record text replacement."""
 
     model_config = ConfigDict(extra="forbid")
 
     review_state: Literal["needs_review", "accepted", "rejected"]
-    reviewed_text: str | None = Field(default=None, max_length=2000)
+    text: str | None = Field(default=None, max_length=2000)
     review_note: str | None = Field(default=None, max_length=2000)
+    content_basis: Literal["source_fact", "inference", "gm_authored"] | None = None
 
-    @field_validator("reviewed_text", "review_note")
+    @field_validator("text", "review_note")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
         return value or None
+
+    @model_validator(mode="after")
+    def normalize_text_alias(self) -> "ShadowReviewIn":
+        if self.text is not None and self.content_basis is None:
+            self.content_basis = "inference"
+        return self
 
 
 class ShadowReviewBatchIn(BaseModel):
@@ -216,7 +332,7 @@ class ShadowPromotionIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    evidence_status: Literal["source_fact", "inference"]
+    evidence_status: Literal["source_fact", "inference", "gm_authored"]
 
 
 class CardReviewBatchIn(BaseModel):
@@ -236,6 +352,38 @@ class CardReviewBatchIn(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("card review ids must be unique")
         return ids
+
+
+class DisplayMaterialCreateIn(BaseModel):
+    """Create a display-material record from one explicitly classified fact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_fact_id: str = Field(min_length=1)
+    title: str | None = Field(default=None, max_length=160)
+    gm_notes: str = Field(default="", max_length=2000)
+
+    @field_validator("source_fact_id", "title", "gm_notes")
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip()
+
+
+class DisplayMaterialUpdateIn(BaseModel):
+    """Update GM-facing display metadata and confirmed runtime links."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=160)
+    gm_notes: str = Field(default="", max_length=2000)
+    links: list[DisplayMaterialLink] = Field(default_factory=list, max_length=100)
+
+    @field_validator("title", "gm_notes")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
 
 
 # ---------- 工具 ----------
@@ -258,20 +406,6 @@ def _safe_filename(name: str) -> str:
     return name[-80:]
 
 
-def _resolve_domain_source(file_name: str) -> Path:
-    if not file_name or "://" in file_name:
-        raise HTTPException(400, "该事实没有可预览的本地 PDF 来源")
-    root = PROJECT_ROOT.resolve()
-    candidate = (PROJECT_ROOT / file_name).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as error:
-        raise HTTPException(400, "来源文件必须位于项目目录内") from error
-    if candidate.suffix.lower() != ".pdf" or not candidate.is_file():
-        raise HTTPException(404, "找不到来源 PDF")
-    return candidate
-
-
 def _pdf_files_under(root: Path) -> list[str]:
     files: set[str] = set()
     if not root.is_dir():
@@ -286,6 +420,47 @@ def _pdf_files_under(root: Path) -> list[str]:
             continue
         files.add(relative.as_posix())
     return sorted(files, key=str.casefold)
+
+
+def _uploaded_pdf_path(file_name: str) -> Path:
+    """Resolve a user upload while keeping the Resource directory read-only."""
+    value = str(file_name or "").strip().replace("\\", "/")
+    candidate = (PROJECT_ROOT / value).resolve()
+    upload_root = storage.UPLOAD_DIR.resolve()
+    try:
+        candidate.relative_to(upload_root)
+    except ValueError as error:
+        raise HTTPException(400, "只能操作已上传的 PDF 文件") from error
+    if candidate.suffix.lower() != ".pdf" or not candidate.is_file():
+        raise HTTPException(404, "未找到已上传的 PDF 文件")
+    return candidate
+
+
+def _upload_display_name(path: Path) -> str:
+    name = path.name
+    return re.sub(r"^[0-9a-f]{8,16}-", "", name, flags=re.IGNORECASE) or name
+
+
+def _upload_item(relative: str) -> dict:
+    path = _uploaded_pdf_path(relative)
+    references = storage.source_file_references(relative)
+    try:
+        document = fitz.open(path)
+        try:
+            page_count = document.page_count
+        finally:
+            document.close()
+    except Exception:
+        page_count = None
+    return {
+        "file": relative,
+        "original_name": _upload_display_name(path),
+        "size_bytes": path.stat().st_size,
+        "sha256": storage.file_sha256(path),
+        "page_count": page_count,
+        "referenced": bool(references),
+        "references": references,
+    }
 
 
 # ---------- 配置 ----------
@@ -424,22 +599,35 @@ def export_markdown(cid: int):
 
 @app.get("/api/domain/workbench")
 def get_domain_workbench(
-    example: str = Query("red_signal_fixture", pattern=r"^[a-z][a-z0-9_-]*$"),
+    example: str | None = Query(default=None),
 ):
     profiles = load_profiles(DOMAIN_DIR / "profiles")
+    # The workbench is intentionally empty until the GM chooses a bookshelf
+    # project.  Keeping a fixture as the query default made a fresh window
+    # appear to belong to a development seed, and an empty query used to
+    # surface an opaque FastAPI 422 error instead of this state.
+    if example is None or not example.strip():
+        return {
+            "bundle": None,
+            "profiles": public_profiles(profiles),
+            "saved_at": None,
+            "saved_state": "empty",
+            "has_seed": False,
+            "prep_context": None,
+            "artifact_job": None,
+            "handout_fact_ids": [],
+            "display_materials": [],
+            "display_material_pages": [],
+        }
+    if not re.fullmatch(r"^[a-z][a-z0-9_-]*$", example):
+        raise HTTPException(422, "工作区 id 格式无效")
     bundle, saved_at, saved_state = load_runtime_domain_example(example)
     validate_bundle(bundle, profiles)
     prep_job = prep.find_prep_job_by_workspace(example)
-    artifact_job = artifacts.latest_artifact_job(example)
-    runtime_profile_ids = {
-        profile_id for profile_id in bundle.profile_ids
-        if profile_id in profiles and profiles[profile_id].profile_kind == "runtime"
-    }
-    location_facts = [fact for fact in bundle.facts if fact.kind == "location" and fact.evidence_status != "model_candidate"]
-    covered_location_ids = {
-        fact.id for fact in location_facts
-        if any(card.profile_id in runtime_profile_ids and card.type in {"scene", "investigation_site", "environment"} and fact.id in card.fact_ids for card in bundle.cards)
-    }
+    handout_facts = [
+        fact for fact in bundle.facts
+        if is_handout_fact(fact) and fact.evidence_status != "model_candidate"
+    ]
     prep_context = None
     if prep_job is not None:
         prep_context = {
@@ -450,22 +638,32 @@ def get_domain_workbench(
                 span.model_dump(mode="json") for span in prep_job.scope.page_spans
             ],
             "profile_id": prep_job.scope.profile_id,
-            "session_minutes": prep_job.scope.session_minutes,
             "status": prep_job.status,
         }
+    artifact_jobs = artifacts.list_artifact_jobs(
+        example,
+        profile_id=prep_job.scope.profile_id if prep_job is not None else None,
+    )
+    artifact_job = artifacts.select_artifact_job(
+        artifact_jobs,
+        profile_id=prep_job.scope.profile_id if prep_job is not None else None,
+    )
+    display_material_pages = prep.display_material_source_pages(prep_job) if prep_job else []
     return {
         "bundle": bundle.model_dump(mode="json", by_alias=True),
-        "profiles": {key: value.model_dump(mode="json") for key, value in profiles.items()},
+        "profiles": public_profiles(profiles),
         "saved_at": saved_at,
         "saved_state": saved_state,
         "has_seed": (DOMAIN_DIR / "examples" / f"{example}.json").is_file(),
         "prep_context": prep_context,
         "artifact_job": artifact_job.model_dump(mode="json") if artifact_job else None,
-        "coverage": {
-            "location_total": len(location_facts),
-            "location_covered": len(covered_location_ids),
-            "uncovered_location_titles": [fact.text[:80] for fact in location_facts if fact.id not in covered_location_ids][:20],
-        },
+        # This derived index lets the browser label explicitly classified
+        # display-material facts without changing their stored classification.
+        "handout_fact_ids": [fact.id for fact in handout_facts],
+        "display_materials": [
+            material.model_dump(mode="json") for material in bundle.display_materials
+        ],
+        "display_material_pages": display_material_pages,
     }
 
 
@@ -479,10 +677,12 @@ def get_domain_workspaces():
             bundle = ExampleBundle.model_validate(raw_bundle)
         except ValidationError:
             continue
+        if bundle.id in SEED_DOMAIN_WORKSPACES:
+            # Repository fixtures remain addressable by explicit test URLs,
+            # but are never presented as formal user bookshelf projects.
+            continue
         kind = (
-            "seed"
-            if bundle.id in SEED_DOMAIN_WORKSPACES
-            else "prep"
+            "prep"
             if bundle.id.startswith("prep_job_")
             else "saved"
         )
@@ -516,17 +716,118 @@ def delete_domain_plan(example: str, plan_id: str):
     if not any(plan.id == plan_id for plan in bundle.plans):
         raise HTTPException(404, "未找到该运行场景")
     bundle.plans = [plan for plan in bundle.plans if plan.id != plan_id]
+    bundle.display_materials = [
+        material.model_copy(update={
+            "links": [link for link in material.links if link.plan_id != plan_id]
+        })
+        for material in bundle.display_materials
+    ]
     storage.delete_session_state(example)
     validate_bundle(bundle, profiles)
     updated_at = storage.save_domain_bundle(example, bundle.model_dump(mode="json", by_alias=True))
     return {"ok": True, "saved_at": updated_at}
 
 
+@app.post("/api/domain/examples/{example}/display-materials")
+def create_display_material(example: str, body: DisplayMaterialCreateIn):
+    """Confirm one source fact as a display material without model rewriting."""
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    bundle, _, _ = load_runtime_domain_example(example)
+    validate_bundle(bundle, profiles)
+    fact = next((item for item in bundle.facts if item.id == body.source_fact_id), None)
+    if fact is None:
+        raise HTTPException(404, "未找到来源事实")
+    if not is_handout_fact(fact):
+        raise HTTPException(422, "只有明确标记为展示材料的事实才能建立展示材料记录")
+    if fact.evidence_status == "model_candidate":
+        raise HTTPException(422, "模型候选尚未提升，不能建立展示材料记录")
+    existing = next(
+        (material for material in bundle.display_materials if body.source_fact_id in material.source_fact_ids),
+        None,
+    )
+    if existing is not None:
+        return {"ok": True, "created": False, "material": existing.model_dump(mode="json")}
+    digest = hashlib.sha256(f"{example}:{body.source_fact_id}".encode("utf-8")).hexdigest()[:16]
+    material = DisplayMaterial(
+        id=f"material_m_{digest}",
+        title=body.title or fact.text[:160],
+        source_fact_ids=[fact.id],
+        source_refs=list(fact.source_refs),
+        gm_notes=body.gm_notes,
+        links=[],
+    )
+    bundle.display_materials.append(material)
+    try:
+        validate_bundle(bundle, profiles)
+    except DomainValidationError as error:
+        raise HTTPException(422, str(error)) from error
+    updated_at = storage.save_domain_bundle(example, bundle.model_dump(mode="json", by_alias=True))
+    return {
+        "ok": True,
+        "created": True,
+        "material": material.model_dump(mode="json"),
+        "saved_at": updated_at,
+    }
+
+
+@app.put("/api/domain/examples/{example}/display-materials/{material_id}")
+def update_display_material(
+    example: str, material_id: str, body: DisplayMaterialUpdateIn
+):
+    """Save GM metadata and explicit location/beat associations for a material."""
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    bundle, _, _ = load_runtime_domain_example(example)
+    validate_bundle(bundle, profiles)
+    material_index = next(
+        (index for index, item in enumerate(bundle.display_materials) if item.id == material_id),
+        None,
+    )
+    if material_index is None:
+        raise HTTPException(404, "未找到展示材料")
+    current = bundle.display_materials[material_index]
+    updated = current.model_copy(update={"title": body.title, "gm_notes": body.gm_notes, "links": body.links})
+    bundle.display_materials[material_index] = updated
+    selected_links = {
+        (link.plan_id, link.beat_id)
+        for link in body.links
+        if link.beat_id is not None
+    }
+    for plan in bundle.plans:
+        for beat in plan.beats:
+            retained = [item for item in beat.display_material_ids if item != material_id]
+            if (plan.id, beat.id) in selected_links:
+                retained.append(material_id)
+            beat.display_material_ids = retained
+    try:
+        validate_bundle(bundle, profiles)
+    except DomainValidationError as error:
+        raise HTTPException(422, str(error)) from error
+    updated_at = storage.save_domain_bundle(example, bundle.model_dump(mode="json", by_alias=True))
+    return {"ok": True, "material": updated.model_dump(mode="json"), "saved_at": updated_at}
+
+
+@app.delete("/api/domain/examples/{example}/display-materials/{material_id}")
+def delete_display_material(example: str, material_id: str):
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    bundle, _, _ = load_runtime_domain_example(example)
+    validate_bundle(bundle, profiles)
+    if not any(item.id == material_id for item in bundle.display_materials):
+        raise HTTPException(404, "未找到展示材料")
+    bundle.display_materials = [item for item in bundle.display_materials if item.id != material_id]
+    for plan in bundle.plans:
+        for beat in plan.beats:
+            beat.display_material_ids = [item for item in beat.display_material_ids if item != material_id]
+    try:
+        validate_bundle(bundle, profiles)
+    except DomainValidationError as error:
+        raise HTTPException(422, str(error)) from error
+    updated_at = storage.save_domain_bundle(example, bundle.model_dump(mode="json", by_alias=True))
+    return {"ok": True, "saved_at": updated_at}
+
+
 @app.patch("/api/domain/workspaces/{workspace_id}")
 def rename_domain_workspace(workspace_id: str, body: WorkspaceRenameIn):
-    """Rename only a saved/prep bookshelf workspace; seed examples stay immutable."""
-    if workspace_id in SEED_DOMAIN_WORKSPACES:
-        raise HTTPException(409, "内置种子项目不能重命名")
+    """Rename a saved/prep bookshelf workspace."""
     saved = storage.load_domain_bundle(workspace_id)
     if not saved:
         raise HTTPException(404, "未找到该书架项目")
@@ -560,9 +861,6 @@ def rename_domain_workspace(workspace_id: str, body: WorkspaceRenameIn):
 @app.delete("/api/domain/workspaces/{workspace_id}")
 def delete_domain_workspace(workspace_id: str):
     """Delete a saved bookshelf project and all of its project-owned records."""
-    if workspace_id in SEED_DOMAIN_WORKSPACES:
-        raise HTTPException(409, "内置种子项目不能删除")
-
     prep_jobs = prep.list_prep_jobs_by_workspace(workspace_id)
     if any(job.status == "running" for job in prep_jobs):
         raise HTTPException(409, "项目仍有运行中的分析版本，请先取消后再删除")
@@ -582,38 +880,6 @@ def delete_domain_workspace(workspace_id: str):
     return {"ok": True}
 
 
-@app.get("/api/domain/source-page")
-def get_domain_source_page(
-    file: str = Query(..., min_length=1),
-    page: int = Query(..., ge=1),
-):
-    source_path = _resolve_domain_source(file)
-    document = None
-    try:
-        document = fitz.open(source_path)
-        page_count = document.page_count
-        if page > page_count:
-            raise HTTPException(404, f"PDF 只有 {page_count} 页")
-        source_page = document[page - 1]
-        text = source_page.get_text("text").strip()
-        pixmap = source_page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
-        image = base64.b64encode(pixmap.tobytes("jpeg", jpg_quality=78)).decode("ascii")
-    except HTTPException:
-        raise
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(422, f"读取 PDF 页面失败: {error}") from error
-    finally:
-        if document is not None:
-            document.close()
-    return {
-        "file": file,
-        "page": page,
-        "page_count": page_count,
-        "text": text,
-        "image_data": f"data:image/jpeg;base64,{image}",
-    }
-
-
 @app.get("/api/domain/source-files")
 def get_domain_source_files():
     uploads = _pdf_files_under(storage.UPLOAD_DIR)
@@ -621,6 +887,7 @@ def get_domain_source_files():
     return {
         "files": sorted(set(uploads + resources), key=str.casefold),
         "uploads": uploads,
+        "upload_items": [_upload_item(file_name) for file_name in uploads],
         "resources": resources,
     }
 
@@ -634,6 +901,7 @@ async def upload_domain_source_file(file: UploadFile = File(...)):
     storage.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     destination = storage.UPLOAD_DIR / f"{uuid.uuid4().hex[:12]}-{safe_name}"
     size = 0
+    digest = hashlib.sha256()
     document = None
     try:
         with destination.open("wb") as output:
@@ -645,6 +913,7 @@ async def upload_domain_source_file(file: UploadFile = File(...)):
                 if size > MAX_DOMAIN_PDF_BYTES:
                     raise HTTPException(413, "PDF 不能超过 512 MB")
                 output.write(chunk)
+                digest.update(chunk)
         with destination.open("rb") as source:
             if source.read(5) != b"%PDF-":
                 raise HTTPException(400, "文件内容不是有效 PDF")
@@ -664,13 +933,66 @@ async def upload_domain_source_file(file: UploadFile = File(...)):
         if document is not None:
             document.close()
         await file.close()
+
+    content_hash = digest.hexdigest()
+    # Content-addressed reuse keeps a renamed re-upload from creating a second
+    # source record while retaining the first filename as the canonical path.
+    for existing_relative in _pdf_files_under(storage.UPLOAD_DIR):
+        existing = (PROJECT_ROOT / existing_relative).resolve()
+        if existing == destination.resolve():
+            continue
+        try:
+            if storage.file_sha256(existing) != content_hash:
+                continue
+            existing_document = fitz.open(existing)
+            try:
+                existing_page_count = existing_document.page_count
+            finally:
+                existing_document.close()
+        except Exception:
+            continue
+        destination.unlink(missing_ok=True)
+        return {
+            "file": existing_relative,
+            "original_name": _upload_display_name(existing),
+            "page_count": existing_page_count,
+            "size_bytes": existing.stat().st_size,
+            "sha256": content_hash,
+            "reused": True,
+        }
     relative = destination.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
     return {
         "file": relative,
         "original_name": original_name,
         "page_count": page_count,
         "size_bytes": size,
+        "sha256": content_hash,
+        "reused": False,
     }
+
+
+def _delete_uploaded_source(file: str) -> dict[str, object]:
+    relative = file.strip().replace("\\", "/")
+    path = _uploaded_pdf_path(relative)
+    references = storage.source_file_references(relative)
+    if references:
+        labels = "、".join(
+            f"{item['label']}（{item['id']}）" for item in references[:8]
+        )
+        raise HTTPException(409, f"文件仍被使用，不能删除：{labels}")
+    path.unlink()
+    return {"ok": True, "file": relative}
+
+
+@app.delete("/api/domain/source-files")
+def delete_domain_source_file(file: str = Query(..., min_length=1, max_length=500)):
+    return _delete_uploaded_source(file)
+
+
+@app.post("/api/domain/source-files/delete")
+def post_delete_domain_source_file(file: str = Query(..., min_length=1, max_length=500)):
+    """Compatibility verb for hosts or proxies that reject DELETE requests."""
+    return _delete_uploaded_source(file)
 
 
 @app.post("/api/domain/prep/jobs")
@@ -713,12 +1035,21 @@ def get_domain_prep_job(job_id: str):
 
 @app.post("/api/domain/prep/jobs/{job_id}/run", status_code=202)
 def run_domain_prep_job(job_id: str, background_tasks: BackgroundTasks):
+    config = storage.get_config()
+    if not config["fake"] and not config["api_key"]:
+        raise HTTPException(422, "an API key or FakeLLM mode is required")
     try:
-        job = prep.start_prep_job(job_id)
+        job = prep.start_prep_job(
+            job_id,
+            model_id=config["model"],
+            fake_model=config["fake"],
+        )
     except prep.PrepJobNotFoundError as error:
         raise HTTPException(404, str(error)) from error
     except prep.PrepJobConflictError as error:
         raise HTTPException(409, str(error)) from error
+    except prep.PrepError as error:
+        raise HTTPException(422, str(error)) from error
     background_tasks.add_task(prep.execute_prep_job, job.id)
     return {"job": job.model_dump(mode="json")}
 
@@ -726,9 +1057,16 @@ def run_domain_prep_job(job_id: str, background_tasks: BackgroundTasks):
 @app.post("/api/domain/prep/jobs/{job_id}/rebuild", status_code=202)
 def rebuild_domain_prep_job(job_id: str, background_tasks: BackgroundTasks):
     """Create and start a new analysis version in the same bookshelf project."""
+    config = storage.get_config()
+    if not config["fake"] and not config["api_key"]:
+        raise HTTPException(422, "an API key or FakeLLM mode is required")
     try:
         rebuilt = prep.rebuild_prep_job(job_id)
-        started = prep.start_prep_job(rebuilt.id)
+        started = prep.start_prep_job(
+            rebuilt.id,
+            model_id=config["model"],
+            fake_model=config["fake"],
+        )
     except prep.PrepJobNotFoundError as error:
         raise HTTPException(404, str(error)) from error
     except prep.PrepSourceError as error:
@@ -794,9 +1132,45 @@ def get_domain_prep_job_candidates(
     }
 
 
+def _promote_accepted_prep_candidates(candidates, review_state: str) -> list[dict]:
+    """Promote prep-owned candidates regardless of which review seam called them."""
+    if review_state != "accepted":
+        return []
+    prep_task_ids = {
+        window.shadow_task_id
+        for job in prep.list_prep_jobs()
+        for window in job.windows
+        if window.shadow_task_id
+    }
+    promotions = []
+    try:
+        for candidate in candidates:
+            if candidate.task_id not in prep_task_ids:
+                continue
+            evidence_status = (
+                candidate.content_basis
+                if candidate.content_basis in {"inference", "gm_authored"}
+                else "source_fact"
+            )
+            fact, workspace_id, created = prep.promote_shadow_candidate(
+                candidate.id, evidence_status=evidence_status
+            )
+            promotions.append({
+                "candidate_id": candidate.id,
+                "workspace_id": workspace_id,
+                "fact_id": fact.id,
+                "created": created,
+            })
+    except prep.PrepPromotionConflictError as error:
+        raise HTTPException(409, str(error)) from error
+    except (DomainValidationError, ValidationError) as error:
+        raise HTTPException(422, str(error)) from error
+    return promotions
+
+
 @app.post("/api/domain/prep/jobs/{job_id}/candidates/review")
 def review_domain_prep_job_candidates(job_id: str, body: ShadowReviewBatchIn):
-    """Apply one review action to candidates across every window in a prep job."""
+    """Review prep candidates and put accepted content on its bookshelf."""
     try:
         available = prep.list_prep_job_candidates(job_id, review_state=None)
     except prep.PrepJobNotFoundError as error:
@@ -816,7 +1190,11 @@ def review_domain_prep_job_candidates(job_id: str, body: ShadowReviewBatchIn):
         raise HTTPException(404, str(error)) from error
     except shadow.ShadowResultValidationError as error:
         raise HTTPException(422, str(error)) from error
-    return {"candidates": [item.model_dump(mode="json") for item in candidates]}
+    promotions = _promote_accepted_prep_candidates(candidates, body.review_state)
+    return {
+        "candidates": [item.model_dump(mode="json") for item in candidates],
+        "promotions": promotions,
+    }
 
 
 @app.get("/api/domain/examples/{example}/session")
@@ -873,6 +1251,7 @@ def create_domain_shadow_task(spec: ShadowTaskSpec):
 
 @app.get("/api/domain/shadow/tasks")
 def get_domain_shadow_tasks():
+    storage.delete_orphan_prep_shadow_tasks()
     return {"tasks": [task.model_dump(mode="json") for task in shadow.list_shadow_tasks()]}
 
 
@@ -912,14 +1291,53 @@ def review_domain_shadow_candidate(candidate_id: str, body: ShadowReviewIn):
         candidate = shadow.review_shadow_candidate(
             candidate_id,
             review_state=body.review_state,
-            reviewed_text=body.reviewed_text,
+            text=body.text,
             review_note=body.review_note,
-            update_reviewed_text="reviewed_text" in body.model_fields_set,
+            update_text="text" in body.model_fields_set,
             update_review_note="review_note" in body.model_fields_set,
+            content_basis=body.content_basis,
         )
     except shadow.ShadowCandidateNotFoundError as error:
         raise HTTPException(404, str(error)) from error
     except shadow.ShadowResultValidationError as error:
+        raise HTTPException(422, str(error)) from error
+    return {"candidate": candidate.model_dump(mode="json")}
+
+
+@app.patch("/api/domain/shadow/candidates/{candidate_id}")
+def edit_domain_shadow_candidate(candidate_id: str, body: ShadowCandidateEdit):
+    """Replace the current candidate record and return it to review."""
+    try:
+        candidate = shadow.edit_shadow_candidate(candidate_id, body)
+    except shadow.ShadowCandidateNotFoundError as error:
+        raise HTTPException(404, str(error)) from error
+    except (shadow.ShadowResultValidationError, ValueError) as error:
+        raise HTTPException(422, str(error)) from error
+    return {"candidate": candidate.model_dump(mode="json")}
+
+
+@app.post("/api/domain/shadow/candidates/{candidate_id}/split")
+def split_domain_shadow_candidate(
+    candidate_id: str, body: ShadowCandidateSplitIn
+):
+    """Replace one candidate with explicitly entered child candidates."""
+    try:
+        candidates = shadow.split_shadow_candidate(candidate_id, body)
+    except shadow.ShadowCandidateNotFoundError as error:
+        raise HTTPException(404, str(error)) from error
+    except (shadow.ShadowResultValidationError, ValueError) as error:
+        raise HTTPException(422, str(error)) from error
+    return {"candidates": [item.model_dump(mode="json") for item in candidates]}
+
+
+@app.post("/api/domain/shadow/candidates/merge")
+def merge_domain_shadow_candidates(body: ShadowCandidateMergeIn):
+    """Replace a same-task candidate set with one explicitly entered result."""
+    try:
+        candidate = shadow.merge_shadow_candidates(body)
+    except shadow.ShadowCandidateNotFoundError as error:
+        raise HTTPException(404, str(error)) from error
+    except (shadow.ShadowResultValidationError, ValueError) as error:
         raise HTTPException(422, str(error)) from error
     return {"candidate": candidate.model_dump(mode="json")}
 
@@ -937,14 +1355,22 @@ def review_domain_shadow_candidates(body: ShadowReviewBatchIn):
         raise HTTPException(404, str(error)) from error
     except shadow.ShadowResultValidationError as error:
         raise HTTPException(422, str(error)) from error
-    return {"candidates": [item.model_dump(mode="json") for item in candidates]}
+    # Keep the generic batch seam safe for callers whose client-side task
+    # ownership is stale. Prep candidates must be promoted in the same request;
+    # standalone shadow candidates remain review-only.
+    promotions = _promote_accepted_prep_candidates(candidates, body.review_state)
+    return {
+        "candidates": [item.model_dump(mode="json") for item in candidates],
+        "promotions": promotions,
+    }
 
 
 @app.post("/api/domain/shadow/candidates/{candidate_id}/promote")
 def promote_domain_shadow_candidate(candidate_id: str, body: ShadowPromotionIn):
     try:
         fact, workspace_id, created = prep.promote_shadow_candidate(
-            candidate_id, evidence_status=body.evidence_status
+            candidate_id,
+            evidence_status=body.evidence_status,
         )
     except shadow.ShadowCandidateNotFoundError as error:
         raise HTTPException(404, str(error)) from error
@@ -1015,74 +1441,41 @@ def draft_domain_cards(example: str, background_tasks: BackgroundTasks):
     bundle, _, _ = load_runtime_domain_example(example)
     validate_bundle(bundle, profiles)
     prep_job = prep.find_prep_job_by_workspace(example)
-    profile_id = (
-        prep_job.scope.profile_id
-        if prep_job is not None
-        else next((item for item in bundle.profile_ids if item in profiles), None)
-    )
+    if prep_job is None:
+        raise HTTPException(
+            422,
+            "生成备团产物需要明确的备团任务范围；请先创建并完成一项备团任务",
+        )
+    profile_id = prep_job.scope.profile_id
     if profile_id is None or profile_id not in profiles:
         raise HTTPException(422, "当前书架没有可用的备团板块")
-    if any(card.profile_id == profile_id for card in bundle.cards):
+    if artifacts.has_profile_artifacts(bundle, profile_id):
         raise HTTPException(
             409,
             "当前板块已经有备团产物；请先完成现有草案的复核，不重复生成一套平行卡片",
         )
     config = storage.get_config()
-    job, created = artifacts.create_artifact_job(
-        example,
-        profile_id,
-        model_id=config["model"],
-        fake_model=config["fake"],
-    )
+    try:
+        job, created = artifacts.create_artifact_job(
+            example,
+            profile_id,
+            model_id=config["model"],
+            fake_model=config["fake"],
+        )
+    except artifacts.ArtifactJobConflictError as error:
+        raise HTTPException(409, str(error)) from error
     if created:
         background_tasks.add_task(
             artifacts.execute_artifact_job,
             job.id,
             workspace_id=example,
             profile_id=profile_id,
-            session_minutes=(
-                prep_job.scope.session_minutes if prep_job is not None else None
-            ),
         )
     return {
         "ok": True,
         "created": created,
         "job": job.model_dump(mode="json"),
     }
-
-
-@app.post("/api/domain/examples/{example}/cards/draft-missing-locations", status_code=202)
-def draft_missing_location_cards(example: str, background_tasks: BackgroundTasks):
-    """Queue a focused supplemental draft for uncovered location facts."""
-    profiles = load_profiles(DOMAIN_DIR / "profiles")
-    bundle, _, _ = load_runtime_domain_example(example)
-    validate_bundle(bundle, profiles)
-    prep_job = prep.find_prep_job_by_workspace(example)
-    profile_id = prep_job.scope.profile_id if prep_job is not None else next(
-        (item for item in bundle.profile_ids if item in profiles and profiles[item].profile_kind == "runtime"), None
-    )
-    profile = profiles.get(profile_id) if profile_id else None
-    if profile is None:
-        raise HTTPException(422, "当前书架没有可用的运行板块")
-    runtime_card_ids = {card.id for card in bundle.cards if card.profile_id == profile.id and card.type in {"scene", "investigation_site", "environment"}}
-    covered = {fact_id for card in bundle.cards if card.id in runtime_card_ids for fact_id in card.fact_ids}
-    missing = [fact for fact in bundle.facts if fact.kind == "location" and fact.evidence_status != "model_candidate" and fact.id not in covered]
-    if not missing:
-        raise HTTPException(409, "当前没有发现尚未覆盖的来源地点")
-    focused = bundle.model_copy(deep=True)
-    focused.facts = missing
-    config = storage.get_config()
-    job, created = artifacts.create_artifact_job(example, profile.id, model_id=config["model"], fake_model=config["fake"], fact_ids=[fact.id for fact in missing])
-    if created:
-        background_tasks.add_task(
-            artifacts.execute_artifact_job,
-            job.id,
-            workspace_id=example,
-            profile_id=profile.id,
-            session_minutes=prep_job.scope.session_minutes if prep_job else None,
-            fact_ids=[fact.id for fact in missing],
-        )
-    return {"ok": True, "created": created, "job": job.model_dump(mode="json"), "focused_fact_count": len(missing)}
 
 
 @app.get("/api/domain/examples/{example}/cards/draft-jobs/{job_id}")
@@ -1095,6 +1488,38 @@ def get_domain_card_draft_job(example: str, job_id: str):
     if job.workspace_id != example:
         raise HTTPException(404, "未找到该工作区的产物生成任务")
     return {"job": job.model_dump(mode="json")}
+
+
+@app.post("/api/domain/examples/{example}/cards/draft-jobs/{job_id}/retry", status_code=202)
+def retry_domain_card_draft_job(
+    example: str, job_id: str, background_tasks: BackgroundTasks
+):
+    """Retry exactly one failed artifact request, preserving its scope and kind."""
+    try:
+        job = artifacts.get_artifact_job(job_id)
+    except artifacts.ArtifactGenerationError as error:
+        raise HTTPException(404, str(error)) from error
+    if job.workspace_id != example:
+        raise HTTPException(404, "未找到该工作区的产物生成任务")
+    config = storage.get_config()
+    try:
+        job, created = artifacts.retry_artifact_job(
+            job_id,
+            model_id=config["model"],
+            fake_model=config["fake"],
+        )
+    except artifacts.ArtifactJobConflictError as error:
+        raise HTTPException(409, str(error)) from error
+    if not created:
+        raise HTTPException(409, "只有失败的产物任务可以重试")
+    prep_job = prep.find_prep_job_by_workspace(example)
+    background_tasks.add_task(
+        artifacts.execute_artifact_job,
+        job.id,
+        workspace_id=example,
+        profile_id=job.profile_id,
+    )
+    return {"ok": True, "created": True, "job": job.model_dump(mode="json")}
 
 
 @app.post("/api/domain/examples/{example}/cards/review")
@@ -1181,9 +1606,6 @@ def draft_domain_plan(example: str):
             profile_id=prep_job.scope.profile_id if prep_job is not None else None,
             source_file=source_file,
             source_pages=source_pages,
-            session_minutes=(
-                prep_job.scope.session_minutes if prep_job is not None else None
-            ),
         )
     except DomainValidationError as error:
         raise HTTPException(422, str(error)) from error
@@ -1247,6 +1669,23 @@ def save_domain_bundle(example: str, bundle: ExampleBundle):
     if bundle.id != example:
         raise HTTPException(400, "运行包 id 与 URL 不一致")
     profiles = load_profiles(DOMAIN_DIR / "profiles")
+    existing_saved = storage.load_domain_bundle(example)
+    if existing_saved:
+        try:
+            existing_bundle = ExampleBundle.model_validate(existing_saved[0])
+        except ValidationError as error:
+            raise HTTPException(422, f"现有书架项目数据无效: {error}") from error
+        existing_plans = {
+            plan.id: plan.model_dump(mode="json") for plan in existing_bundle.plans
+        }
+        incoming_plans = {
+            plan.id: plan.model_dump(mode="json") for plan in bundle.plans
+        }
+        if existing_plans != incoming_plans:
+            raise HTTPException(
+                409,
+                "运行场景已经组装并锁定；请删除该场景后重新组装，不能直接编辑场景计划",
+            )
     try:
         validate_bundle(bundle, profiles)
     except DomainValidationError as error:
@@ -1274,12 +1713,18 @@ def reset_domain_bundle(example: str):
 
 @app.get("/api/domain/export")
 def export_domain_markdown(
-    example: str = Query("red_signal_fixture", pattern=r"^[a-z][a-z0-9_-]*$"),
+    example: str | None = Query(default=None),
 ):
+    if example is None or not example.strip():
+        raise HTTPException(400, "请先选择书架工作区")
+    if not re.fullmatch(r"^[a-z][a-z0-9_-]*$", example):
+        raise HTTPException(422, "工作区 id 格式无效")
     profiles = load_profiles(DOMAIN_DIR / "profiles")
     bundle, _, _ = load_runtime_domain_example(example)
     validate_bundle(bundle, profiles)
-    markdown = export_cards_markdown(bundle.cards, bundle.facts, profiles)
+    markdown = export_cards_markdown(
+        bundle.cards, bundle.facts, profiles, bundle.display_materials
+    )
     return StreamingResponse(
         iter([markdown.encode("utf-8")]),
         media_type="text/markdown; charset=utf-8",

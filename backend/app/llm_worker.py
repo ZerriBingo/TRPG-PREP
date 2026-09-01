@@ -2,10 +2,12 @@
 
 独立进程避开 uvicorn 工作线程与 libcurl 的冲突（挂死/超时不生效问题）。
 stdin 输入 JSON: {"base_url","api_key","model","messages","temperature","max_tokens","stream"}
-stdout 输出 JSON: {"content": ...} 或 {"error": "..."}
+stdout 输出 JSON: {"content": ...} 或
+{"error": "...", "kind": "http|network|timeout|response|worker", "status": 429}
 """
 import json
 import sys
+import socket
 
 import curl_cffi.requests as creq
 
@@ -50,14 +52,28 @@ def main() -> None:
             content = data["choices"][0]["message"]["content"]
         print(json.dumps({"content": content}, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
-        status = getattr(getattr(e, "response", None), "status_code", None)
+        response = getattr(e, "response", None)
+        status = getattr(response, "status_code", None)
         body = ""
         try:
-            body = e.response.text[:200] if getattr(e, "response", None) is not None else ""
+            body = response.text[:500] if response is not None else ""
         except Exception:  # noqa: BLE001
             pass
+        error_name = type(e).__name__
+        error_text = str(e)
+        lowered = error_text.casefold()
+        if response is not None and isinstance(status, int) and status > 0:
+            kind = "http"
+        elif "timed out" in lowered or "timeout" in lowered or "operation timed out" in lowered:
+            kind = "timeout"
+        elif isinstance(e, (ConnectionError, TimeoutError, OSError, socket.error)) or "curl:" in lowered:
+            kind = "network"
+        else:
+            kind = "response"
         print(json.dumps({"error": f"{type(e).__name__}: {e}",
-                          "status": status, "body": body}, ensure_ascii=False))
+                          "kind": kind, "status": status, "body": body,
+                          "error_type": error_name,
+                          "timeout": cfg.get("request_timeout")}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

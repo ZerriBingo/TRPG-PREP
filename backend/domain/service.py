@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import DerivedCard, ExampleBundle, RuleProfile, SceneBeat, ScenePlan, SessionState, SourceFact
+from .models import DerivedCard, DisplayMaterial, ExampleBundle, RuleProfile, SceneBeat, ScenePlan, SessionState, SourceFact
 
 
 class DomainValidationError(ValueError):
@@ -16,6 +16,8 @@ class DomainValidationError(ValueError):
 SCENE_PLAN_CARD_TYPES = frozenset({
     "scene",
     "investigation_site",
+    "location",
+    "chapter_overview",
     "environment",
     "scene_extract",
     "npc",
@@ -28,7 +30,12 @@ SCENE_PLAN_CARD_TYPES = frozenset({
     "operation_clock",
     "encounter_clock",
 })
-SCENE_PLAN_ANCHOR_TYPES = frozenset({"scene", "investigation_site", "environment"})
+SCENE_PLAN_ANCHOR_TYPES = frozenset({"location", "environment"})
+
+
+def is_handout_fact(fact: SourceFact) -> bool:
+    """Return whether a fact was explicitly classified as display material."""
+    return fact.kind == "handout"
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -50,6 +57,18 @@ def load_profiles(directory: str | Path) -> dict[str, RuleProfile]:
     if not profiles:
         raise DomainValidationError(f"no rule profiles found in {directory}")
     return profiles
+
+
+_PROFILE_DISPLAY_NAMES = {
+    "cthulhu-dark-2e": "现实恐怖",
+    "daggerheart": "奇幻冒险",
+    "module-prep": "通用备团",
+}
+
+
+def _profile_display_name(profile_id: str, profile: RuleProfile | None = None) -> str:
+    """Return the neutral board name used in exports and user-facing copy."""
+    return _PROFILE_DISPLAY_NAMES.get(profile_id, "备团板块")
 
 
 def _fact_index(facts: list[SourceFact]) -> dict[str, SourceFact]:
@@ -183,6 +202,38 @@ def validate_bundle(
     card_ids = {card.id for card in bundle.cards}
     cards_by_id = {card.id: card for card in bundle.cards}
     fact_ids = {fact.id for fact in bundle.facts}
+    material_ids: set[str] = set()
+    materials_by_id: dict[str, DisplayMaterial] = {}
+    for material in bundle.display_materials:
+        if material.id in material_ids:
+            raise DomainValidationError(f"duplicate display material id: {material.id}")
+        material_ids.add(material.id)
+        materials_by_id[material.id] = material
+        missing_material_facts = [
+            fact_id for fact_id in material.source_fact_ids if fact_id not in fact_ids
+        ]
+        if missing_material_facts:
+            raise DomainValidationError(
+                f"display material {material.id} refers to missing facts: {missing_material_facts}"
+            )
+        candidate_material_facts = [
+            fact_id
+            for fact_id in material.source_fact_ids
+            if fact_index[fact_id].evidence_status == "model_candidate"
+        ]
+        if candidate_material_facts:
+            raise DomainValidationError(
+                f"display material {material.id} refers to model candidate facts: {candidate_material_facts}"
+            )
+        non_material_facts = [
+            fact_id
+            for fact_id in material.source_fact_ids
+            if not is_handout_fact(fact_index[fact_id])
+        ]
+        if non_material_facts:
+            raise DomainValidationError(
+                f"display material {material.id} must cite explicitly classified display-material facts: {non_material_facts}"
+            )
     bundle_profile_ids = set(bundle.profile_ids)
     outside_card_profiles = sorted({
         card.profile_id for card in bundle.cards
@@ -193,10 +244,12 @@ def validate_bundle(
             f"cards refer to profiles outside the bundle: {outside_card_profiles}"
         )
     plan_ids: set[str] = set()
+    plans_by_id: dict[str, ScenePlan] = {}
     for plan in bundle.plans:
         if plan.id in plan_ids:
             raise DomainValidationError(f"duplicate scene plan id: {plan.id}")
         plan_ids.add(plan.id)
+        plans_by_id[plan.id] = plan
         if plan.profile_id not in bundle.profile_ids:
             raise DomainValidationError(f"plan {plan.id} refers to a profile outside the bundle")
         if profiles[plan.profile_id].profile_kind != "runtime":
@@ -223,10 +276,18 @@ def validate_bundle(
                 f"plan {plan.id} refers to unapproved cards: {unapproved_cards}"
             )
         if not any(
-            cards_by_id[card_id].type in {"scene", "investigation_site", "environment"}
+            cards_by_id[card_id].type in SCENE_PLAN_ANCHOR_TYPES
             for card_id in plan.card_ids
         ):
-            raise DomainValidationError(f"plan {plan.id} has no scene card")
+            raise DomainValidationError(f"plan {plan.id} has no runtime location card")
+        expected_location_ids = [
+            card_id for card_id in plan.card_ids
+            if cards_by_id[card_id].type in SCENE_PLAN_ANCHOR_TYPES
+        ]
+        if plan.location_card_ids != expected_location_ids:
+            raise DomainValidationError(
+                f"plan {plan.id} location index does not match its runtime cards"
+            )
         plan_fact_ids = [
             fact_id
             for card_id in plan.card_ids
@@ -240,6 +301,8 @@ def validate_bundle(
         for beat in plan.beats:
             if len(beat.card_ids) != len(set(beat.card_ids)):
                 raise DomainValidationError(f"beat {beat.id} contains duplicate card ids")
+            if len(beat.display_material_ids) != len(set(beat.display_material_ids)):
+                raise DomainValidationError(f"beat {beat.id} contains duplicate display material ids")
             missing_beat_cards = [card_id for card_id in beat.card_ids if card_id not in card_ids]
             if missing_beat_cards:
                 raise DomainValidationError(f"beat {beat.id} refers to missing cards: {missing_beat_cards}")
@@ -248,6 +311,25 @@ def validate_bundle(
                 raise DomainValidationError(
                     f"beat {beat.id} refers to cards outside plan {plan.id}: {outside_plan_cards}"
                 )
+            missing_materials = [
+                material_id for material_id in beat.display_material_ids
+                if material_id not in material_ids
+            ]
+            if missing_materials:
+                raise DomainValidationError(
+                    f"beat {beat.id} refers to missing display materials: {missing_materials}"
+                )
+            missing_confirmations = [
+                material_id for material_id in beat.display_material_ids
+                if (plan.id, beat.id) not in {
+                    (link.plan_id, link.beat_id)
+                    for link in materials_by_id[material_id].links
+                }
+            ]
+            if missing_confirmations:
+                raise DomainValidationError(
+                    f"beat {beat.id} contains unconfirmed display material links: {missing_confirmations}"
+                )
             missing_facts = [fact_id for fact_id in beat.reveal_fact_ids if fact_id not in fact_ids]
             if missing_facts:
                 raise DomainValidationError(f"beat {beat.id} refers to missing facts: {missing_facts}")
@@ -255,6 +337,28 @@ def validate_bundle(
             if candidate_refs:
                 raise DomainValidationError(
                     f"beat {beat.id} refers to model candidate facts: {candidate_refs}"
+                )
+    for material in bundle.display_materials:
+        for link in material.links:
+            plan = plans_by_id.get(link.plan_id)
+            if plan is None:
+                raise DomainValidationError(
+                    f"display material {material.id} refers to missing plan {link.plan_id}"
+                )
+            if link.card_id is not None:
+                if link.card_id not in plan.location_card_ids:
+                    raise DomainValidationError(
+                        f"display material {material.id} refers to a location outside plan {plan.id}"
+                    )
+                continue
+            if link.beat_id not in {beat.id for beat in plan.beats}:
+                raise DomainValidationError(
+                    f"display material {material.id} refers to missing beat {link.beat_id}"
+                )
+            beat = next(beat for beat in plan.beats if beat.id == link.beat_id)
+            if material.id not in beat.display_material_ids:
+                raise DomainValidationError(
+                    f"display material {material.id} link is not listed on beat {link.beat_id}"
                 )
     return fact_index
 
@@ -273,11 +377,27 @@ def validate_session(session: SessionState, bundle: ExampleBundle) -> None:
         beat_ids = {beat.id for beat in plan_by_id[session.current_plan_id].beats}
         if session.current_beat_id not in beat_ids:
             raise DomainValidationError("session points to a missing scene beat")
+    if session.current_plan_id is not None:
+        active_plan = plan_by_id[session.current_plan_id]
+        if active_plan.navigation_mode == "location" and session.current_beat_id is not None:
+            raise DomainValidationError("location-led runtime cannot point to a scene beat")
     if session.current_plan_id is not None and session.current_card_id is not None:
         if session.current_card_id not in plan_by_id[session.current_plan_id].card_ids:
             raise DomainValidationError("session current card is outside the current scene plan")
     if session.current_card_id is not None and session.current_card_id not in card_by_id:
         raise DomainValidationError("session points to a missing current card")
+    for trigger_key, trigger_state in session.trigger_states.items():
+        parts = trigger_key.split(":")
+        if len(parts) != 3 or parts[1] != "first" or not parts[2].isdigit():
+            raise DomainValidationError(f"invalid location trigger key: {trigger_key}")
+        card = card_by_id.get(parts[0])
+        if card is None or card.type != "location":
+            raise DomainValidationError(f"location trigger points to a missing location card: {trigger_key}")
+        triggers = card.fields.get("first_triggers", [])
+        if not isinstance(triggers, list) or int(parts[2]) >= len(triggers):
+            raise DomainValidationError(f"location trigger index is out of range: {trigger_key}")
+        if trigger_state not in {"unhandled", "active", "resolved"}:
+            raise DomainValidationError(f"invalid location trigger state: {trigger_state}")
     clock_cards = {
         card.id: card for card in bundle.cards
         if card.type in {"clock", "operation_clock", "encounter_clock"}
@@ -548,18 +668,47 @@ def draft_scene_plan(
     def rule_focus(mode: str) -> str | None:
         return profile.scene_guidance.get(mode) if profile is not None else None
 
-    scene_cards = [card for card in selected if card.type in {"scene", "investigation_site", "environment"}]
+    scene_cards = [card for card in selected if card.type in SCENE_PLAN_ANCHOR_TYPES]
     npc_cards = [card for card in selected if card.type in {"npc", "character"}]
     clock_cards = [card for card in selected if card.type in {"clock", "operation_clock", "encounter_clock"}]
     threat_cards = [card for card in selected if card.type in {"threat", "enemy", "anomaly"}]
     if not scene_cards:
-        raise DomainValidationError("a scene plan needs one scene, investigation site, or environment card")
+        raise DomainValidationError("a scene plan needs one location or environment card")
     facts_by_card = {card.id: list(card.fact_ids) for card in selected}
 
     def facts_for(cards: list[DerivedCard]) -> list[str]:
         return list(dict.fromkeys(
             fact_id for card in cards for fact_id in facts_by_card.get(card.id, [])
         ))
+
+    # Overview/support cards do not change the navigation model. A plan with
+    # location anchors remains location-led even when it also includes the
+    # chapter overview, NPCs, threats, clocks, or display references.
+    location_led = bool(scene_cards) and all(card.type == "location" for card in scene_cards)
+    if location_led:
+        slug = re.sub(r"[^a-z0-9_-]+", "_", title.lower()).strip("_") or "runtime"
+        plan_id = "plan_" + bundle.id + "_" + slug
+        existing_ids = {item.id for item in bundle.plans}
+        suffix = 2
+        candidate_id = plan_id
+        while candidate_id in existing_ids:
+            candidate_id = plan_id + "_" + str(suffix)
+            suffix += 1
+        overview = next((card for card in selected if card.type == "chapter_overview"), None)
+        endings = overview.fields.get("endings", []) if overview is not None else []
+        return ScenePlan(
+            id=candidate_id,
+            profile_id=profile_id,
+            title=title,
+            source_file=source_file,
+            source_pages=source_pages,
+            premise=premise,
+            card_ids=[card.id for card in selected],
+            navigation_mode="location",
+            location_card_ids=[card.id for card in scene_cards],
+            beats=[],
+            exit_states=endings if isinstance(endings, list) else [],
+        )
 
     beats: list[SceneBeat] = []
 
@@ -570,7 +719,7 @@ def draft_scene_plan(
             f"{card.title}：{card.fields.get('first_impression') or card.fields.get('role') or '按其动机行动'}"
             for card in npc_cards
         )
-        arrival_framing = str(scene.fields.get("opening_image", scene.title))
+        arrival_framing = str(scene.fields.get("arrival_description") or scene.fields.get("opening_image") or scene.title)
         if npc_reference:
             arrival_framing += " 在场参考：" + npc_reference + "。不要一次把这些资料全说完，只在玩家注意到或询问时调用。"
         beats.append(SceneBeat(
@@ -579,7 +728,7 @@ def draft_scene_plan(
             mode="arrival",
             source_pages=source_pages,
             framing=arrival_framing,
-            situation=str(scene.fields.get("opening_image", scene.title)),
+            situation=str(scene.fields.get("arrival_description") or scene.fields.get("opening_image") or scene.title),
             rule_focus=rule_focus("arrival"),
             card_ids=[card.id for card in arrival_cards],
             reveal_fact_ids=facts_for(arrival_cards),
@@ -687,6 +836,8 @@ def draft_scene_plan(
         source_pages=source_pages,
         premise=premise,
         card_ids=[card.id for card in selected],
+        navigation_mode="beat",
+        location_card_ids=[card.id for card in scene_cards],
         beats=beats,
         exit_states=["带着新线索离开", "压力升级后转场", "目标改变", "暂时失败但故事继续"],
     )
@@ -699,7 +850,6 @@ def draft_scene_plan_from_workspace(
     profile_id: str | None = None,
     source_file: str | None = None,
     source_pages: list[int] | None = None,
-    session_minutes: int | None = None,
 ) -> ScenePlan:
     """Draft from persisted workspace context without accepting GM-authored inputs.
 
@@ -718,7 +868,25 @@ def draft_scene_plan_from_workspace(
             "当前板块只负责材料整理，不能直接组装运行场景"
         )
 
+    trusted_source = (source_file or "").strip()
+    trusted_pages = sorted({page for page in (source_pages or []) if page > 0})
+    # A preparation task owns the selected source scope. When a caller passes
+    # a source scope, only cards with matching provenance belong to this plan.
+    # Standalone bundles without scope retain the historical all-approved-card
+    # assembly path.
     fact_index = {fact.id: fact for fact in bundle.facts}
+
+    def card_matches_scope(card: DerivedCard) -> bool:
+        """Keep an assembled plan inside its task-owned source scope."""
+        if not trusted_source or not trusted_pages:
+            return True
+        allowed_pages = set(trusted_pages)
+        return any(
+            ref.file == trusted_source and ref.page in allowed_pages
+            for fact_id in card.fact_ids
+            for ref in (fact_index.get(fact_id).source_refs if fact_index.get(fact_id) else [])
+        )
+
     selected: list[DerivedCard] = []
     for card in bundle.cards:
         if card.profile_id != profile_id or card.type not in SCENE_PLAN_CARD_TYPES:
@@ -731,19 +899,9 @@ def draft_scene_plan_from_workspace(
             if fact_id in fact_index
         ):
             continue
-        selected.append(card)
-    if not selected:
-        raise DomainValidationError(
-            "当前书架尚无已批准的可编排产物；请先完成产物生成与复核"
-        )
-    scene_cards = [card for card in selected if card.type in SCENE_PLAN_ANCHOR_TYPES]
-    if not scene_cards:
-        raise DomainValidationError(
-            "当前书架尚无已批准的场景或环境产物，不能组装运行场景"
-        )
+        if card_matches_scope(card):
+            selected.append(card)
 
-    trusted_source = (source_file or "").strip()
-    trusted_pages = sorted({page for page in (source_pages or []) if page > 0})
     if not trusted_source:
         selected_fact_ids = {
             fact_id for card in selected for fact_id in card.fact_ids
@@ -767,6 +925,16 @@ def draft_scene_plan_from_workspace(
         trusted_pages = sorted(inferred_pages)
     if not trusted_pages:
         raise DomainValidationError("当前备团范围没有可用页码，不能组装运行场景")
+    selected = [card for card in selected if card_matches_scope(card)]
+    if not selected:
+        raise DomainValidationError(
+            "当前备团任务范围内没有已批准的可编排产物；请先完成该范围的产物生成与复核"
+        )
+    scene_cards = [card for card in selected if card.type in SCENE_PLAN_ANCHOR_TYPES]
+    if not scene_cards:
+        raise DomainValidationError(
+            "当前备团任务范围内没有已批准的场景或环境产物，不能组装运行场景"
+        )
 
     anchor = scene_cards[0]
     opening = anchor.fields.get("opening_image") or anchor.fields.get("situation")
@@ -774,14 +942,11 @@ def draft_scene_plan_from_workspace(
         premise = f"{anchor.title}：{opening.strip()}"
     else:
         premise = f"以「{anchor.title}」为当前情境，具体走向由桌边行动决定。"
-    title_suffix = (
-        f"{session_minutes} 分钟运行场景" if session_minutes else "运行场景"
-    )
     return draft_scene_plan(
         bundle,
         profile_id,
         [card.id for card in selected],
-        f"{bundle.name} · {title_suffix}",
+        f"{bundle.name} · 运行场景",
         trusted_source,
         trusted_pages,
         premise,
@@ -843,14 +1008,15 @@ def export_cards_markdown(
     cards: list[DerivedCard],
     facts: list[SourceFact],
     profiles: Mapping[str, RuleProfile],
+    display_materials: list[DisplayMaterial] | None = None,
 ) -> str:
     fact_by_id = {fact.id: fact for fact in facts}
     sections: list[str] = ["# 派生卡组", ""]
 
     for card in cards:
         profile = profiles.get(card.profile_id)
-        profile_name = profile.name if profile else card.profile_id
-        sections.extend([f"## {card.title}", "", f"- 规则档案：{profile_name}", f"- 卡型：{card.type}", ""])
+        profile_name = _profile_display_name(card.profile_id, profile)
+        sections.extend([f"## {card.title}", "", f"- 备团板块：{profile_name}", f"- 卡型：{card.type}", ""])
         if card.subtitle:
             sections.extend([card.subtitle, ""])
 
@@ -874,6 +1040,27 @@ def export_cards_markdown(
                     refs = "无原文来源"
                 sections.append(
                     f"- [{fact.evidence_status}] {fact.text}（{refs}）"
+                )
+            sections.append("")
+
+    materials = display_materials or []
+    if materials:
+        sections.extend(["# 展示材料", ""])
+        for material in materials:
+            sections.extend([f"## {material.title}", ""])
+            if material.gm_notes:
+                sections.extend(["### GM 备注", "", material.gm_notes, ""])
+            sections.extend(["### 来源", ""])
+            for source in material.source_refs:
+                sections.append(
+                    f"- {source.file}，PDF p{source.page}"
+                    + (f"，{source.locator}" if source.locator else "")
+                )
+            if material.links:
+                sections.extend(["", "### 已确认运行关联", ""])
+                sections.extend(
+                    f"- {link.plan_id} / {link.card_id or link.beat_id}"
+                    for link in material.links
                 )
             sections.append("")
 

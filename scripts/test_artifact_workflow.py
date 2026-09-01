@@ -90,6 +90,35 @@ async def main() -> None:
             storage.save_domain_bundle(
                 bundle.id, bundle.model_dump(mode="json", by_alias=True)
             )
+            prep_job = PrepJob(
+                id="prep_job_artifact_batch",
+                status="completed",
+                scope=PrepScope(
+                    source_file="fixture://artifact-source",
+                    source_version="v1",
+                    page_spans=[PageSpan(start=1, end=4)],
+                    profile_id="cthulhu-dark-2e",
+                    objective="batch review",
+                ),
+                model_id="fake-artifact-workflow",
+                prompt_version="test",
+                schema_version="test",
+                workspace_id=bundle.id,
+                windows=[
+                    ExtractionWindow(
+                        id="prep_window_artifact_scope",
+                        page_span=PageSpan(start=1, end=4),
+                        core_span=PageSpan(start=1, end=4),
+                        status="succeeded",
+                        candidate_count=0,
+                        input_chars=10,
+                    )
+                ],
+                candidate_count=0,
+                created_at=storage.now(),
+                updated_at=storage.now(),
+            )
+            storage.create_prep_job(prep_job.model_dump(mode="json"))
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
@@ -119,7 +148,7 @@ async def main() -> None:
                 assert reloaded.status_code == 200, reloaded.text
                 cards = reloaded.json()["bundle"]["cards"]
                 assert {card["type"] for card in cards} == {
-                    "scene", "npc", "threat", "clock"
+                    "location", "chapter_overview", "npc", "threat", "clock"
                 }
                 assert all(card["edit_state"] == "generated" for card in cards)
                 assert all(card["generation"]["model_id"] == "fake-artifact-workflow" for card in cards)
@@ -159,6 +188,12 @@ async def main() -> None:
                 plan = plan_response.json()["plan"]
                 assert plan["title"].endswith("运行场景")
                 assert set(plan["card_ids"]) == set(card_ids)
+                assert plan["navigation_mode"] == "location"
+                assert plan["location_card_ids"] == [
+                    card_id for card_id in card_ids
+                    if next(card["type"] for card in cards if card["id"] == card_id) == "location"
+                ]
+                assert plan["beats"] == []
 
                 reopen = await client.post(
                     f"/api/domain/examples/{bundle.id}/cards/review",
@@ -175,7 +210,7 @@ async def main() -> None:
                 )
                 assert reloaded.status_code == 200, reloaded.text
                 saved_bundle = reloaded.json()["bundle"]
-                assert len(saved_bundle["cards"]) == 4
+                assert len(saved_bundle["cards"]) == 5
                 assert len(saved_bundle["plans"]) == 1
 
                 task_ids = []
@@ -205,21 +240,11 @@ async def main() -> None:
                         },
                     )
                     assert run_response.status_code == 200, run_response.text
-                prep_job = PrepJob(
-                    id="prep_job_artifact_batch",
-                    status="completed",
-                    scope=PrepScope(
-                        source_file="fixture://artifact-source",
-                        source_version="v1",
-                        page_spans=[PageSpan(start=1, end=2)],
-                        profile_id="cthulhu-dark-2e",
-                        objective="batch review",
-                    ),
-                    model_id="fake-artifact-workflow",
-                    prompt_version="test",
-                    schema_version="test",
-                    workspace_id=bundle.id,
-                    windows=[
+                prep_job = prep_job.model_copy(update={
+                    "scope": prep_job.scope.model_copy(update={
+                        "page_spans": [PageSpan(start=1, end=2)]
+                    }),
+                    "windows": [
                         ExtractionWindow(
                             id=f"prep_window_artifact_{index}",
                             page_span=PageSpan(start=index + 1, end=index + 1),
@@ -231,11 +256,10 @@ async def main() -> None:
                         )
                         for index in range(2)
                     ],
-                    candidate_count=2,
-                    created_at=storage.now(),
-                    updated_at=storage.now(),
-                )
-                storage.create_prep_job(prep_job.model_dump(mode="json"))
+                    "candidate_count": 2,
+                    "updated_at": storage.now(),
+                })
+                storage.save_prep_job(prep_job.model_dump(mode="json"))
                 prep_candidates = await client.get(
                     f"/api/domain/prep/jobs/{prep_job.id}/candidates"
                 )
@@ -254,8 +278,14 @@ async def main() -> None:
                     failure_bundle.id,
                     failure_bundle.model_dump(mode="json", by_alias=True),
                 )
-                original_generate = artifacts._generate_direct_step
-                artifacts._generate_direct_step = lambda *args, **kwargs: (_ for _ in ()).throw(
+                failure_prep_job = prep_job.model_copy(update={
+                    "id": "prep_job_artifact_failure",
+                    "workspace_id": failure_bundle.id,
+                    "updated_at": storage.now(),
+                })
+                storage.create_prep_job(failure_prep_job.model_dump(mode="json"))
+                original_generate = artifacts._generate_hierarchical_artifacts
+                artifacts._generate_hierarchical_artifacts = lambda *args, **kwargs: (_ for _ in ()).throw(
                     artifacts.ArtifactGenerationError("forced artifact failure")
                 )
                 try:
@@ -270,8 +300,15 @@ async def main() -> None:
                     assert failed_status.status_code == 200, failed_status.text
                     assert failed_status.json()["job"]["status"] == "failed"
                     assert "forced artifact failure" in failed_status.json()["job"]["error"]
+
+                    new_request = await client.post(
+                        f"/api/domain/examples/{failure_bundle.id}/cards/draft"
+                    )
+                    assert new_request.status_code == 202, new_request.text
+                    assert new_request.json()["job"]["id"] == failed_job_id
+                    assert new_request.json()["created"] is False
                 finally:
-                    artifacts._generate_direct_step = original_generate
+                    artifacts._generate_hierarchical_artifacts = original_generate
         finally:
             storage.DB_PATH = original_db_path
             storage.init_db()

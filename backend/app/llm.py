@@ -117,6 +117,11 @@ def _repair_truncated(s: str) -> str | None:
     n = len(s)
     if n < 2:
         return None
+    # A response ending immediately after an opening container is not a
+    # recoverable truncation: closing it would silently turn missing model
+    # content into an empty result.
+    if re.search(r"[\[{]\s*$", s):
+        return None
     cuts = [n]
     for m in re.finditer(r"[,\{\[\]}]", s):
         cuts.append(m.end())
@@ -201,10 +206,50 @@ class LLMClient:
             capture_output=True, text=True, timeout=subprocess_timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        raw = (proc.stdout or "").strip()
         try:
-            return json.loads(proc.stdout or "{}")
+            result = json.loads(raw or "{}")
         except ValueError:
-            return {"error": f"worker 输出异常: {proc.stdout[:200]}"}
+            detail = raw[:300] or (proc.stderr or "").strip()[:300] or "没有可解析的 worker 输出"
+            return {
+                "error": f"worker 输出异常: {detail}",
+                "kind": "worker",
+                "status": None,
+                "body": detail,
+                "error_type": "WorkerOutputError",
+            }
+        if proc.returncode != 0 and not result.get("error"):
+            detail = (proc.stderr or raw or "worker 子进程异常").strip()[:500]
+            return {
+                "error": f"worker 子进程退出码 {proc.returncode}: {detail}",
+                "kind": "worker",
+                "status": None,
+                "body": detail,
+                "error_type": "WorkerProcessError",
+            }
+        return result
+
+    def _format_worker_error(self, out: dict) -> str:
+        """Turn a worker failure into an actionable message without fake HTTP codes."""
+        kind = out.get("kind")
+        status = out.get("status")
+        body = str(out.get("body") or "").strip()
+        detail = body or str(out.get("error") or "未知错误").strip()
+        # Older workers persisted a missing status as ``0``. Treat it as a
+        # transport failure instead of presenting a fictitious HTTP response.
+        if kind == "http" and status in (None, 0, "0", ""):
+            kind = "network"
+        if kind == "network":
+            return f"API 网络连接失败：未收到 HTTP 响应\nURL: {self._url()}\n详情: {detail}"
+        if kind == "timeout":
+            timeout_label = out.get("timeout") or "请求"
+            return f"API 请求超时（{timeout_label}）\nURL: {self._url()}\n详情: {detail}"
+        if kind == "worker":
+            return f"API worker 执行失败：{detail}\nURL: {self._url()}"
+        if kind == "response":
+            return f"API 响应解析失败\nURL: {self._url()}\n详情: {detail}"
+        status_label = str(status) if status is not None else "未知"
+        return f"API 请求失败 HTTP {status_label}\nURL: {self._url()}\n响应: {detail}"
 
     def chat(self, messages: list[dict], temperature: float = 0.3,
              max_tokens: int = 8000,
@@ -223,9 +268,7 @@ class LLMClient:
                     if status in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1:
                         time.sleep(_retry_delay(attempt, status or 0))
                         continue
-                    raise RuntimeError(
-                        f"API 请求失败 HTTP {status}\nURL: {self._url()}\n响应: {out.get('body', '')}"
-                    )
+                    raise RuntimeError(self._format_worker_error(out))
                 return out["content"]
             except subprocess.TimeoutExpired:
                 if attempt < RETRY_ATTEMPTS - 1:
@@ -279,6 +322,24 @@ class LLMClient:
 
 
 FAKE_OUTPUTS: dict[str, dict] = {}
+
+
+def _fake_segment_output(messages: list[dict]) -> dict:
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    match = re.search(r"^SELECTED_PAGES_JSON=(.+)$", content, re.MULTILINE)
+    pages = json.loads(match.group(1)) if match else [1]
+    if not pages:
+        return {"segments": []}
+    segments = []
+    start = previous = int(pages[0])
+    for raw_page in pages[1:]:
+        page = int(raw_page)
+        if page != previous + 1:
+            segments.append({"start": start, "end": previous, "label": "离线语义段"})
+            start = page
+        previous = page
+    segments.append({"start": start, "end": previous, "label": "离线语义段"})
+    return {"segments": segments}
 
 
 def _fake_prep_output(messages: list[dict]) -> dict:
@@ -389,15 +450,33 @@ def _fake_local_digest_output(messages: list[dict]) -> dict:
         "resource": "resource",
     }
     grouped: dict[str, list[dict]] = {}
+    location_items: list[dict] = []
     for fact in facts:
-        grouped.setdefault(kind_map.get(fact.get("kind"), "background"), []).append(fact)
+        kind = kind_map.get(fact.get("kind"), "background")
+        if kind == "location":
+            location_items.append(fact)
+        else:
+            grouped.setdefault(kind, []).append(fact)
     units = []
-    for index, (kind, items) in enumerate(grouped.items(), start=1):
+    for fact in location_items:
+        title = str(fact.get("text") or "离线地点").strip()[:80]
+        units.append(
+            {
+                "kind": "location",
+                "title": title,
+                "summary": str(fact.get("text") or "离线地点索引")[:700],
+                "fact_ids": [fact["id"]],
+                "entity_keys": [title],
+                "relationship_hints": [],
+                "open_questions": [],
+            }
+        )
+    for kind, items in grouped.items():
         sample = " / ".join(str(item.get("text", "")) for item in items[:2])[:700]
         units.append(
             {
                 "kind": kind,
-                "title": f"离线局部整理 {index}",
+                "title": f"离线局部整理 {len(units) + 1}",
                 "summary": sample or "离线局部整理索引",
                 "fact_ids": [item["id"] for item in items],
                 "entity_keys": [],
@@ -451,6 +530,47 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
 
     definitions = profile.get("card_definitions", [])
     cards = []
+    if profile.get("profile_kind") == "runtime" and len(fact_ids) <= 90:
+        unit_facts: dict[str, list[str]] = {}
+        for unit in units:
+            unit_facts.setdefault(str(unit.get("kind") or "background"), []).extend(unit.get("fact_ids", []))
+        type_units = {
+            "location": ("location", "scene"),
+            "chapter_overview": tuple(unit_facts),
+            "npc": ("npc",),
+            "threat": ("threat",),
+            "clock": ("timeline", "outcome"),
+        }
+        for index, definition in enumerate(definitions, start=1):
+            if definition["type"] == "location":
+                location_units = [unit for unit in units if unit.get("kind") == "location"]
+                if location_units:
+                    for location_index, unit in enumerate(location_units, start=1):
+                        cards.append({
+                            "type": "location",
+                            "title": str(unit.get("title") or f"FakeLLM 地点 {location_index}"),
+                            "purpose": "独立验证一个可进入、调查或折返的地点。",
+                            "fact_ids": list(dict.fromkeys(unit.get("fact_ids", []))),
+                            "focus": list(dict.fromkeys(unit.get("entity_keys", []))),
+                            "open_questions": [],
+                        })
+                    continue
+            relevant = list(dict.fromkeys(
+                fact_id
+                for kind in type_units.get(definition["type"], ())
+                for fact_id in unit_facts.get(kind, [])
+            ))
+            if not relevant:
+                relevant = fact_ids[:1]
+            cards.append({
+                "type": definition["type"],
+                "title": f"FakeLLM {definition.get('display_name') or definition['type']} {index}",
+                "purpose": "在离线流程中验证完整运行卡组与原始事实回读。",
+                "fact_ids": relevant,
+                "focus": ["来源覆盖", "运行资料"],
+                "open_questions": [],
+            })
+        return {"cards": cards, "open_questions": []}
     for index, chunk in enumerate(chunks, start=1):
         definition = definitions[(index - 1) % len(definitions)]
         display_name = definition.get("display_name") or definition["type"]
@@ -510,6 +630,8 @@ class FakeLLM:
 
     def _output(self, messages: list[dict]) -> str:
         task = find_task(messages)
+        if task == "prep:segment":
+            return json.dumps(_fake_segment_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:fact_extract":
             return json.dumps(_fake_prep_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_draft":

@@ -15,10 +15,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app import artifacts, prep, storage  # noqa: E402
-from backend.app.main import app  # noqa: E402
+from backend.app.main import app, remove_seed_workspace_instances  # noqa: E402
 from backend.domain import (  # noqa: E402
     ExampleBundle,
+    ExtractionWindow,
     PageSpan,
+    PrepJob,
+    PrepScope,
     SourceFact,
     SourceRef,
     load_profiles,
@@ -90,6 +93,41 @@ async def main() -> None:
 
             bundle = large_workspace()
             storage.save_domain_bundle(bundle.id, bundle.model_dump(mode="json"))
+            prep_job = PrepJob(
+                id="prep_job_r4_large_workspace",
+                status="completed",
+                scope=PrepScope(
+                    source_file="fixture://large",
+                    source_version="v1",
+                    page_spans=[PageSpan(start=1, end=20)],
+                    profile_id="cthulhu-dark-2e",
+                    objective="maintenance fixture",
+                ),
+                model_id="fake-r4",
+                prompt_version="test",
+                schema_version="test",
+                workspace_id=bundle.id,
+                windows=[
+                    ExtractionWindow(
+                        id="prep_window_r4_large_workspace",
+                        page_span=PageSpan(start=1, end=20),
+                        core_span=PageSpan(start=1, end=20),
+                        status="succeeded",
+                        input_chars=10,
+                    )
+                ],
+                created_at=storage.now(),
+                updated_at=storage.now(),
+            )
+            storage.create_prep_job(prep_job.model_dump(mode="json"))
+            seed_bundle = ExampleBundle.model_validate_json(
+                (ROOT / "backend" / "domain" / "examples" / "naimen_pilot.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            storage.save_domain_bundle(seed_bundle.id, seed_bundle.model_dump(mode="json"))
+            assert remove_seed_workspace_instances() == 1
+            assert storage.load_domain_bundle(seed_bundle.id) is None
             ordered_facts = artifacts._facts_for_workspace(bundle, bundle.id)
             assert ordered_facts[0].source_refs[0].page == 1
             assert ordered_facts[0].id == "fact_large_0"
@@ -112,7 +150,6 @@ async def main() -> None:
                 bundle,
                 profiles["cthulhu-dark-2e"],
                 [{"id": "fact_large_0", "text": "fixture"}],
-                120,
                 require_runtime_anchor=False,
                 batch_index=1,
                 batch_count=2,
@@ -129,7 +166,7 @@ async def main() -> None:
                 fake_model=True,
             )[0]
             artifact_job = artifacts._save_job(
-                artifact_job, status="failed", error="old task fixture"
+                artifact_job, status="completed", phase="completed", error=None
             )
 
             async with httpx.AsyncClient(
@@ -147,9 +184,9 @@ async def main() -> None:
                 seed_rename = await client.patch(
                     "/api/domain/workspaces/naimen_pilot", json={"name": "不可改"}
                 )
-                assert seed_rename.status_code == 409, seed_rename.text
+                assert seed_rename.status_code == 404, seed_rename.text
                 seed_delete = await client.delete("/api/domain/workspaces/naimen_pilot")
-                assert seed_delete.status_code == 409, seed_delete.text
+                assert seed_delete.status_code == 404, seed_delete.text
 
                 draft = await client.post(
                     f"/api/domain/examples/{bundle.id}/cards/draft"

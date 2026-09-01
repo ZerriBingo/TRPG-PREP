@@ -1,8 +1,18 @@
 """Rule-agnostic domain models and validation for the rebuilt prep tool."""
 
-from .models import ArtifactDraftJob, CardGeneration, EvidenceStatus, DerivedCard, FactProvenance, RuleProfile, SceneBeat, ScenePlan, SessionLogEntry, SessionState, SourceFact, SourceRef
+from .models import ArtifactDraftJob, CardGeneration, DisplayMaterial, DisplayMaterialLink, EvidenceStatus, DerivedCard, FactProvenance, RuleProfile, SceneBeat, ScenePlan, SessionLogEntry, SessionState, SourceFact, SourceRef
 from .prep import ExtractionWindow, PageSpan, PrepJob, PrepJobCreate, PrepScope, parse_page_spans
-from .shadow import ShadowCandidate, ShadowCandidateDraft, ShadowResponse, ShadowRun, ShadowTask, ShadowTaskSpec
+from .shadow import (
+    ShadowCandidate,
+    ShadowCandidateDraft,
+    ShadowCandidateEdit,
+    ShadowCandidateMergeIn,
+    ShadowCandidateSplitIn,
+    ShadowResponse,
+    ShadowRun,
+    ShadowTask,
+    ShadowTaskSpec,
+)
 from .service import (
     DomainValidationError,
     ExampleBundle,
@@ -14,12 +24,15 @@ from .service import (
     load_profiles,
     draft_scene_plan,
     draft_scene_plan_from_workspace,
+    is_handout_fact,
     validate_session,
     validate_bundle,
 )
 
 __all__ = [
     "DerivedCard",
+    "DisplayMaterial",
+    "DisplayMaterialLink",
     "ArtifactDraftJob",
     "CardGeneration",
     "EvidenceStatus",
@@ -38,6 +51,9 @@ __all__ = [
     "SessionState",
     "ShadowCandidate",
     "ShadowCandidateDraft",
+    "ShadowCandidateEdit",
+    "ShadowCandidateMergeIn",
+    "ShadowCandidateSplitIn",
     "ShadowResponse",
     "ShadowRun",
     "ShadowTask",
@@ -49,6 +65,7 @@ __all__ = [
     "export_session_review_markdown",
     "draft_scene_plan",
     "draft_scene_plan_from_workspace",
+    "is_handout_fact",
     "load_json",
     "load_profile",
     "load_profiles",

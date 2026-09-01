@@ -9,6 +9,7 @@ FactKind = Literal[
     "clue",
     "npc",
     "location",
+    "handout",
     "event",
     "threat",
     "stakes",
@@ -31,6 +32,8 @@ ArtifactJobPhase = Literal[
     "completed",
 ]
 BeatMode = Literal["arrival", "investigation", "pressure", "revelation", "confrontation", "aftermath", "transition"]
+RuntimeNavigationMode = Literal["location", "beat"]
+TriggerState = Literal["unhandled", "active", "resolved"]
 SessionLogKind = Literal[
     # Legacy values remain readable so existing saved sessions do not break.
     "move",
@@ -266,6 +269,55 @@ class DerivedCard(BaseModel):
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
 
+class DisplayMaterialLink(BaseModel):
+    """A confirmed runtime association to either a location card or a beat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(pattern=r"^plan_[a-z][a-z0-9_-]*$")
+    card_id: str | None = Field(default=None, pattern=r"^card_[a-z0-9_-]+$")
+    beat_id: str | None = Field(default=None, pattern=r"^beat_[a-z][a-z0-9_-]*$")
+
+    @model_validator(mode="after")
+    def has_one_runtime_target(self) -> "DisplayMaterialLink":
+        if (self.card_id is None) == (self.beat_id is None):
+            raise ValueError("display material link needs exactly one card or beat target")
+        return self
+
+
+class DisplayMaterial(BaseModel):
+    """A source-page asset that may be shown to players without rewriting it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^material_[a-z][a-z0-9_-]*$")
+    title: str = Field(min_length=1, max_length=160)
+    source_fact_ids: list[str] = Field(min_length=1, max_length=50)
+    source_refs: list[SourceRef] = Field(min_length=1, max_length=100)
+    gm_notes: str = Field(default="", max_length=2000)
+    links: list[DisplayMaterialLink] = Field(default_factory=list, max_length=100)
+
+    @field_validator("title", "gm_notes")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("source_fact_ids")
+    @classmethod
+    def unique_source_fact_ids(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("display material source fact ids must be unique")
+        return cleaned
+
+    @model_validator(mode="after")
+    def links_are_unique(self) -> "DisplayMaterial":
+        keys = [(link.plan_id, link.card_id, link.beat_id) for link in self.links]
+        if len(keys) != len(set(keys)):
+            raise ValueError("display material links must be unique")
+        return self
+
+
 class ArtifactDraftJob(BaseModel):
     """Persisted status for a potentially long-running artifact generation request."""
 
@@ -288,7 +340,6 @@ class ArtifactDraftJob(BaseModel):
     input_fingerprint: str | None = Field(default=None, max_length=160)
     budget_method: str = Field(default="conservative-cjk-v1", min_length=1, max_length=80)
     open_questions: list[str] = Field(default_factory=list, max_length=50)
-    fact_ids: list[str] = Field(default_factory=list, max_length=1000)
     error: str | None = Field(default=None, max_length=2000)
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)
@@ -323,6 +374,9 @@ class SceneBeat(BaseModel):
     situation: str = Field(min_length=1)
     rule_focus: str | None = None
     card_ids: list[str] = Field(default_factory=list)
+    # Display materials are referenced separately from GM-facing cards. They
+    # are populated only after an explicit scene/beat association.
+    display_material_ids: list[str] = Field(default_factory=list)
     reveal_fact_ids: list[str] = Field(default_factory=list)
     soft_cues: list[str] = Field(default_factory=list)
     hard_cues: list[str] = Field(default_factory=list)
@@ -347,7 +401,9 @@ class ScenePlan(BaseModel):
     source_pages: list[int] = Field(default_factory=list)
     premise: str = Field(min_length=1)
     card_ids: list[str] = Field(default_factory=list)
-    beats: list[SceneBeat] = Field(min_length=1)
+    navigation_mode: RuntimeNavigationMode = "beat"
+    location_card_ids: list[str] = Field(default_factory=list)
+    beats: list[SceneBeat] = Field(default_factory=list)
     exit_states: list[str] = Field(default_factory=list)
     notes: str | None = None
 
@@ -357,10 +413,18 @@ class ScenePlan(BaseModel):
         return value.strip() if value is not None else None
 
     @model_validator(mode="after")
-    def beat_ids_are_unique(self) -> "ScenePlan":
+    def navigation_is_consistent(self) -> "ScenePlan":
         beat_ids = [beat.id for beat in self.beats]
         if len(beat_ids) != len(set(beat_ids)):
             raise ValueError(f"duplicate scene beat id in plan {self.id}")
+        if len(self.location_card_ids) != len(set(self.location_card_ids)):
+            raise ValueError(f"duplicate location card id in plan {self.id}")
+        if any(card_id not in self.card_ids for card_id in self.location_card_ids):
+            raise ValueError(f"location cards must belong to plan {self.id}")
+        if self.navigation_mode == "location" and self.beats:
+            raise ValueError(f"location-led plan {self.id} cannot contain linear beats")
+        if self.navigation_mode == "beat" and not self.beats:
+            raise ValueError(f"beat-led plan {self.id} needs at least one beat")
         return self
 
 
@@ -405,6 +469,7 @@ class SessionState(BaseModel):
     current_plan_id: str | None = None
     current_beat_id: str | None = None
     current_card_id: str | None = None
+    trigger_states: dict[str, TriggerState] = Field(default_factory=dict)
     revealed_clue_keys: list[str] = Field(default_factory=list)
     clock_stages: dict[str, int] = Field(default_factory=dict)
     log: list[SessionLogEntry] = Field(default_factory=list)
@@ -425,4 +490,5 @@ class ExampleBundle(BaseModel):
     profile_ids: list[str] = Field(min_length=1)
     facts: list[SourceFact]
     cards: list[DerivedCard]
+    display_materials: list[DisplayMaterial] = Field(default_factory=list)
     plans: list[ScenePlan] = Field(default_factory=list)

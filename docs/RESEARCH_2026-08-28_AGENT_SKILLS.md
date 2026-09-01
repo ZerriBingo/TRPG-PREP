@@ -24,11 +24,11 @@
 
 本项目目前同时存在旧 campaign 链路、domain workbench、prep job、artifact job 和运行模式。架构梳理 Skill 可在继续开发前生成模块边界、数据流和淘汰候选，适合解决“维护混乱”而不是继续堆功能。
 
-### 3. `grill-with-docs` / 设计质询类 Skill
+### 3. `grilling` / 设计质询类 Skill
 
 优先级：高。
 
-现有 `grilling` 能进行决策追问，但更需要结合仓库事实、现有文档和已确认约束。类似 `grill-with-docs` 的能力可以把问题限定在真实代码和文档上，减少重复询问与方向漂移。社区讨论也把 `codebase-architecture`、`grill-with-docs` 和 UI mockup 视为一套较完整的前置工作流，但这属于社区经验，不是仓库官方承诺。citeturn0search7
+现有 `grilling` 能进行决策追问；执行时必须同时读取 `CONTEXT.md`、当前 ADR 和实现状态，把问题限定在真实代码和已确认约束上，减少重复询问与方向漂移。社区目录中的相似名称不是本仓库已安装的 Skill，也不应被当成可调用命令。
 
 ### 4. `ui-mockups` / 结构化 UI 设计类 Skill
 
@@ -40,7 +40,7 @@
 
 优先级：中。
 
-适合在 Git 和 issue tracker 建立后使用，将“补卡失败”“计划覆盖不足”“规则名泄漏”“默认书架选择”等问题拆成可追踪条目。当前没有 issue tracker 配置，暂不应安装后直接运行。
+适合在 Git 和 issue tracker 建立后使用，将“覆盖不足”“规则名泄漏”“默认书架选择”等问题拆成可追踪条目。已删除的增量补卡不再作为待实现 issue。
 
 ### 6. 任务专用测试/调试 Skill
 
@@ -60,10 +60,10 @@ VoltAgent 目录应优先筛选 e2e、Playwright、regression、debugging、data
 1. 先完成 Git 初始化、`CONTEXT.md`、`docs/agents/issue-tracker.md` 和现有维护记录整理。
 2. 显式运行 `setup-matt-pocock-skills`，确认项目级 tracker、标签和文档目录。
 3. 调用架构梳理 Skill，产出旧链路、domain 链路和持久化边界图。
-4. 用 `grill-with-docs` 重新审查场景覆盖、补卡、事实网和运行模式的产品决策。
+4. 用 `grilling` 重新审查场景覆盖、事实网和运行模式的产品决策；增量补卡路径已删除。
 5. 用 `ui-mockups` 固定关系图、地点导航和结构化编辑器的交互稿。
 6. 再引入测试/调试/迁移类 Skill，并给每个 Skill 建立来源、权限、适用范围和回滚记录。
-7. 最后才恢复补卡与完整章节真实上游验收。
+7. 最后才进行完整章节真实上游验收；不恢复增量补卡路径。
 
 ## 路由结论
 

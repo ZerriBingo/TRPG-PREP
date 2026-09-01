@@ -90,7 +90,6 @@ async def main() -> None:
                         "source_file": relative_source,
                         "page_range": "6-2",
                         "profile_id": "cthulhu-dark-2e",
-                        "session_minutes": 120,
                     },
                 )
                 assert invalid.status_code == 422, invalid.text
@@ -101,7 +100,6 @@ async def main() -> None:
                         "source_file": relative_source,
                         "page_range": "8-9",
                         "profile_id": "cthulhu-dark-2e",
-                        "session_minutes": 120,
                     },
                 )
                 assert outside.status_code == 422, outside.text
@@ -112,7 +110,6 @@ async def main() -> None:
                         "source_file": relative_source,
                         "page_range": "2-6, 8",
                         "profile_id": "cthulhu-dark-2e",
-                        "session_minutes": 120,
                     },
                 )
                 assert created.status_code == 200, created.text
@@ -183,7 +180,7 @@ async def main() -> None:
                     for candidate in normalized_boundary["candidates"]
                 ] == ["Owned by this core."]
                 assert job["scope"]["notes"] is None
-                assert "120 分钟" in job["scope"]["objective"]
+                assert job["scope"]["objective"]
 
                 started = await client.post(f"/api/domain/prep/jobs/{job_id}/run")
                 assert started.status_code == 202, started.text
@@ -198,7 +195,7 @@ async def main() -> None:
                     await asyncio.sleep(0.05)
                 assert completed is not None
                 assert completed["status"] == "completed", completed
-                assert completed["candidate_count"] == 3
+                assert completed["candidate_count"] == 2, completed
                 assert all(
                     window["status"] == "succeeded"
                     for window in completed["windows"]
@@ -209,8 +206,8 @@ async def main() -> None:
                 )
                 assert candidates_response.status_code == 200, candidates_response.text
                 candidates = candidates_response.json()["candidates"]
-                assert len(candidates) == 3
-                assert [ref["page"] for ref in candidates[0]["source_refs"]] == [2, 5]
+                assert len(candidates) == 2
+                assert [ref["page"] for ref in candidates[0]["source_refs"]] == [2, 6]
                 assert all(
                     ref["source_version"].startswith("sha256:")
                     for candidate in candidates
@@ -223,13 +220,18 @@ async def main() -> None:
                 )
 
                 candidate_id = candidates[0]["id"]
+                edited = await client.patch(
+                    f"/api/domain/shadow/candidates/{candidate_id}",
+                    json={
+                        "text": "A reviewed fact crosses its owned page boundary.",
+                        "review_note": "Verified against both cited pages.",
+                        "content_basis": "source_fact",
+                    },
+                )
+                assert edited.status_code == 200, edited.text
                 accepted = await client.post(
                     f"/api/domain/shadow/candidates/{candidate_id}/review",
-                    json={
-                        "review_state": "accepted",
-                        "reviewed_text": "A reviewed fact crosses its owned page boundary.",
-                        "review_note": "Verified against both cited pages.",
-                    },
+                    json={"review_state": "accepted", "content_basis": "source_fact"},
                 )
                 assert accepted.status_code == 200, accepted.text
                 promoted = await client.post(
@@ -247,7 +249,7 @@ async def main() -> None:
                 assert promoted_fact["evidence_status"] == "source_fact"
                 assert [
                     reference["page"] for reference in promoted_fact["source_refs"]
-                ] == [2, 5]
+                ] == [2, 6]
                 assert promoted_fact["provenance"]["candidate_id"] == candidate_id
                 assert promoted_fact["provenance"]["review_id"].startswith(
                     "shadow_review_"
@@ -288,7 +290,7 @@ async def main() -> None:
                     "/api/domain/shadow/review-queue?review_state=all"
                 )
                 assert queue.status_code == 200, queue.text
-                assert len(queue.json()["candidates"]) == 3
+                assert len(queue.json()["candidates"]) == 2
 
                 task_batch = await client.post(
                     f"/api/domain/prep/jobs/{job_id}/candidates/review",
@@ -299,11 +301,12 @@ async def main() -> None:
                     },
                 )
                 assert task_batch.status_code == 200, task_batch.text
-                assert len(task_batch.json()["candidates"]) == 3
+                assert len(task_batch.json()["candidates"]) == 2
                 assert all(
                     candidate["review_state"] == "accepted"
                     for candidate in task_batch.json()["candidates"]
                 )
+                assert len(task_batch.json()["promotions"]) == 2
                 chapter_sized = await client.post(
                     f"/api/domain/prep/jobs/{job_id}/candidates/review",
                     json={
@@ -352,7 +355,6 @@ async def main() -> None:
                             "source_file": relative_source,
                             "page_range": "2-3",
                             "profile_id": "daggerheart",
-                            "session_minutes": 90,
                         },
                     )
                     assert loose_created.status_code == 200, loose_created.text
@@ -396,44 +398,6 @@ async def main() -> None:
                 finally:
                     prep.make_client = original_make_client
 
-                # Simulate a persisted task produced by the old splitter. The
-                # current API must expose a new analysis version without
-                # mutating its candidates or creating a parallel bookshelf.
-                legacy = storage.load_prep_job(job_id)
-                assert legacy is not None
-                legacy["window_strategy"] = "legacy-overlap-v1"
-                storage.save_prep_job(legacy)
-                legacy_detail = await client.get(f"/api/domain/prep/jobs/{job_id}")
-                assert legacy_detail.status_code == 200, legacy_detail.text
-                assert legacy_detail.json()["job"]["rebuild_available"] is True
-
-                rebuilt = await client.post(
-                    f"/api/domain/prep/jobs/{job_id}/rebuild"
-                )
-                assert rebuilt.status_code == 202, rebuilt.text
-                rebuilt_job_id = rebuilt.json()["job"]["id"]
-                assert rebuilt.json()["previous_job_id"] == job_id
-                assert rebuilt_job_id != job_id
-                assert (
-                    await client.get(f"/api/domain/prep/jobs/{job_id}")
-                ).status_code == 200
-                rebuilt_completed = None
-                for _ in range(100):
-                    rebuilt_detail = await client.get(
-                        f"/api/domain/prep/jobs/{rebuilt_job_id}"
-                    )
-                    assert rebuilt_detail.status_code == 200, rebuilt_detail.text
-                    rebuilt_completed = rebuilt_detail.json()["job"]
-                    if rebuilt_completed["status"] not in {"queued", "running"}:
-                        break
-                    await asyncio.sleep(0.05)
-                assert rebuilt_completed is not None
-                assert rebuilt_completed["status"] == "completed", rebuilt_completed
-                assert rebuilt_completed["window_strategy"] == "core-context-v3"
-                assert rebuilt_completed["workspace_id"] == job_id
-                assert rebuilt_completed["analysis_version"] == 2
-                assert rebuilt_completed["previous_job_id"] == job_id
-
                 first_task_ids = [
                     window["shadow_task_id"]
                     for window in completed["windows"]
@@ -454,7 +418,7 @@ async def main() -> None:
                     f"/api/domain/workbench?example={job_id}"
                 )
                 assert retained_workspace.status_code == 200
-                assert len(retained_workspace.json()["bundle"]["facts"]) == 1
+                assert len(retained_workspace.json()["bundle"]["facts"]) == 2
 
             assert storage.load_domain_bundle("naimen_pilot") is None
             assert storage.load_session_state("naimen_pilot") is None

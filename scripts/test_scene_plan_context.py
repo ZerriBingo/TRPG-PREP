@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from backend.app import prep, storage  # noqa: E402
 from backend.app.main import app  # noqa: E402
-from backend.domain import ExampleBundle, PrepJobCreate, load_json  # noqa: E402
+from backend.domain import ExampleBundle, PrepJobCreate, SourceRef, load_json  # noqa: E402
 
 
 def make_source_pdf(path: Path) -> None:
@@ -58,20 +58,74 @@ async def main() -> None:
                     source_file=source_file,
                     page_range="2-4",
                     profile_id="cthulhu-dark-2e",
-                    session_minutes=90,
                 )
             )
             seed = ExampleBundle.model_validate(
                 load_json(DOMAIN / "examples" / "naimen_pilot.json")
             )
+            # The runtime plan seam is task-owned. Use the fixture only as a
+            # shape source, then attach every fact/card to the task's uploaded
+            # PDF and selected page span so the scope contract is meaningful.
+            source_ref = {"file": source_file, "page": 2}
             workspace = seed.model_copy(
                 deep=True,
                 update={
                     "id": job.id,
                     "name": "Task-owned scene workspace",
                     "plans": [],
+                    "facts": [
+                        fact.model_copy(update={"source": source_ref})
+                        for fact in seed.facts
+                    ],
                 },
             )
+            # The task owns its source scope.  Keep the seed card shape, but
+            # make every supporting fact belong to this fixture's p2-4 input;
+            # reusing the pilot's p159-165 references would correctly be
+            # rejected by the scope filter.
+            workspace.facts = [
+                fact.model_copy(
+                    update={
+                        "source": SourceRef(file=source_file, page=2),
+                        "source_refs": [
+                            SourceRef(file=source_file, page=2)
+                            for _ in fact.source_refs
+                        ]
+                    }
+                )
+                for fact in workspace.facts
+            ]
+            workspace.cards = [
+                card.model_copy(
+                    update={
+                        "type": "location",
+                        "fields": {
+                            "normal_state": card.fields["opening_image"],
+                            "arrival_description": card.fields["opening_image"],
+                            "relevant_characters": card.fields.get("npc_hooks") or [card.title],
+                            "direct_clues": card.fields["direct_clues"],
+                            "hidden_clues": card.fields["hidden_clues"],
+                            "gm_moves": card.fields["gm_moves"],
+                            "return_changes": card.fields.get("exit_conditions", []),
+                        },
+                        "field_sources": {
+                            key: list(card.fact_ids)
+                            for key in (
+                                "normal_state",
+                                "arrival_description",
+                                "relevant_characters",
+                                "direct_clues",
+                                "hidden_clues",
+                                "gm_moves",
+                                "return_changes",
+                            )
+                        },
+                    }
+                )
+                if card.type == "scene"
+                else card
+                for card in workspace.cards
+            ]
             storage.save_domain_bundle(
                 workspace.id, workspace.model_dump(mode="json", by_alias=True)
             )
@@ -88,7 +142,7 @@ async def main() -> None:
                 assert context["source_file"] == source_file
                 assert context["page_spans"] == [{"start": 2, "end": 4, "label": None}]
                 assert context["profile_id"] == "cthulhu-dark-2e"
-                assert context["session_minutes"] == 90
+                assert "session_minutes" not in context
 
                 drafted = await client.post(
                     f"/api/domain/examples/{workspace.id}/plans/draft",
@@ -106,7 +160,7 @@ async def main() -> None:
                 assert plan["profile_id"] == "cthulhu-dark-2e"
                 assert plan["source_file"] == source_file
                 assert plan["source_pages"] == [2, 3, 4]
-                assert plan["title"] == "Task-owned scene workspace · 90 分钟运行场景"
+                assert plan["title"] == "Task-owned scene workspace · 运行场景"
                 assert plan["premise"] != "client supplied premise must be ignored"
                 assert set(plan["card_ids"]) == {card.id for card in workspace.cards}
 
@@ -126,7 +180,6 @@ async def main() -> None:
                     source_file=source_file,
                     page_range="2-4",
                     profile_id="cthulhu-dark-2e",
-                    session_minutes=90,
                 )
             )
             empty_workspace = ExampleBundle(
@@ -150,7 +203,7 @@ async def main() -> None:
                     f"/api/domain/examples/{empty_workspace.id}/plans/draft"
                 )
                 assert blocked.status_code == 422, blocked.text
-                assert "尚无已批准" in blocked.json()["detail"]
+                assert "当前备团任务范围内没有已批准的可编排产物" in blocked.json()["detail"]
         finally:
             storage.DB_PATH = original_db_path
             storage.UPLOAD_DIR = original_upload_dir

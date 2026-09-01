@@ -148,17 +148,18 @@
   "cards": [
     {
       "id": "card_naimen_juju_scene",
-      "profile_id": "cthulhu-dark-2e", "type": "scene",
+      "profile_id": "cthulhu-dark-2e", "type": "location",
       "title": "咀咀屋", "subtitle": "艺术品店、院子与地下圣所",
       "fact_ids": ["fact_naimen_juju_location","fact_naimen_prior_connections","fact_naimen_neighbor_reports","fact_naimen_trapdoor_route","fact_naimen_ritual_revelation"],
       "edit_state": "approved",
       "fields": {
-        "opening_image": "一条堆满杂物的小巷通向封闭小院；非洲面具隔着窗帘隐约可见，废弃当铺的后门正对商店入口。",
-        "immediate_actions": ["向居民打听深夜访客和怪声", "从窗户、当铺或街道盯梢", "营业时进店接触恩科万", "寻找活板门、钥匙或仪式窗口"],
+        "normal_state": "一条堆满杂物的小巷通向封闭小院；非洲面具隔着窗帘隐约可见，废弃当铺的后门正对商店入口。",
+        "arrival_description": "一条堆满杂物的小巷通向封闭小院；非洲面具隔着窗帘隐约可见，废弃当铺的后门正对商店入口。",
+        "relevant_characters": ["塞拉斯·恩科万"],
         "direct_clues": ["居民确认深夜有陌生人和怪声", "账本出现每周支付“W.R.14”的记录", "恩科万脖子上有地下室钥匙"],
         "hidden_clues": ["床下的血舌面具与砍刀", "柜台后的活板门", "仪式祷词中的“奈亚拉托提普”"],
         "gm_moves": ["让一名访客表现出不该被注意的规律", "让门缝后传来脚步或目光", "让恩科万把一次普通提问变成暴露", "让煤油灯亮起，说明今晚有集会"],
-        "risk_if_pressed": "强行开锁、偷钥或监视会被院中人、警察或恩科万察觉；一旦上报姆达里，调查就从取证转入失踪风险。",
+        "consequences": "强行开锁、偷钥或监视会被院中人、警察或恩科万察觉；一旦上报姆达里，调查就从取证转入失踪风险。",
         "exit_conditions": ["带着账本、面具或钱匣证物离开", "确认月朔窗口后撤出并准备突袭", "被识破前切断跟踪并换据点", "把警方线索交给普尔而非罗伯森"]
       }
     },

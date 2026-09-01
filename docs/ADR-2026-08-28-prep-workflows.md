@@ -1,11 +1,11 @@
 # ADR: Prep Workflow Boundaries
 
 Date: 2026-08-28
-Status: accepted for implementation
+Status: superseded by the new-project boundary recorded on 2026-08-30
 
 ## Decisions
 
-- Supplemental location cards are incremental jobs. They append only new, uncovered evidence and never replace the existing board.
+- Historical decision: supplemental location cards were once considered incremental jobs. This path is no longer part of the product.
 - Coverage audit is evidence-based and reports uncovered location facts; it must not invent a linear route.
 - The facts graph is a retrieval and provenance view, not the primary runtime surface.
 - Runtime mode owns current scene, revealed clues, and exploratory locations. Scene assembly is rebuildable by deleting the assembled plan.
@@ -28,14 +28,14 @@ Status: accepted for implementation
 - A card's `fact_ids` form its fact closure; field sources may not cite facts outside that closure.
 - Coverage has deterministic and review-required layers; model-discovered locations do not enter the runtime package automatically.
 - The bookshelf-to-runtime path is primary. The facts graph remains a secondary retrieval and provenance surface.
-- Supplemental generation appends reviewable cards only. It never silently regenerates the full board.
+- The current workflow generates one complete board for the selected preparation task. It never silently appends or partially regenerates cards.
 - Runtime navigation supports a non-linear location network. A started scene owns a runtime snapshot; deleting the assembled scene is the rebuild path.
 
 ## Additional Clarifications (2026-08-29)
 
 - The complete single-chapter runtime acceptance gate is specific to the reality-horror board. Fantasy/adventure and general-prep boards must not inherit that gate without their own decision.
 - Location coverage is narrative and operational, not merely evidentiary. A place where players may investigate, return, seek help, or create a consequential follow-up should be independently visible in runtime mode. Small evidence-oriented places may use a compact scene treatment, but must not disappear into an off-screen fact list.
-- A unified task-center model is part of the product direction: analysis, review, artifact, and supplemental jobs should share observable lifecycle semantics.
+- A unified task-center model is part of the product direction: analysis, review, and full artifact jobs should share observable lifecycle semantics.
 - Deleting legacy data remains an unresolved migration decision; no destructive cleanup is authorized by this clarification alone.
 
 ## Board-Specific Clarification (2026-08-29)
@@ -60,3 +60,10 @@ Status: accepted for implementation
 - Source statistics remain cited source material. Conversions across boards are GM-reviewable suggestions and never automatic rewrites.
 - Seed cleanup is limited to explicit fixture IDs in formal user data. Repository fixtures and user-owned historical versions are preserved.
 - The task center is a shared user-facing surface with durable lifecycle and impact semantics.
+
+## New-project boundary (2026-08-30)
+
+- The new project workflow is authoritative. Historical projects and their artifacts, jobs, and untyped links are not migrated, rewritten, or given compatibility-only controls.
+- The supplemental/"补卡" workflow is deleted. Coverage is an inline warning; a GM corrects scope by creating or re-running an explicit preparation task, and the system does not enqueue supplemental jobs.
+- Display materials are source-page records, not generated player-text cards. They can be associated with many scenes/beats, retain source page ranges and GM notes, and are viewed in an external PDF tool. The web workbench provides no crop, crop upload, or crop storage.
+- The facts graph is read-only and secondary. Its typed relationships are evidence-backed, locally focused, progressively expandable, and mirrored by an accessible list/details fallback. Runtime uses only confirmed associations and never forces a linear route.

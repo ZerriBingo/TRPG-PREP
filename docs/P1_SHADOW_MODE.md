@@ -84,9 +84,9 @@ python scripts/test_shadow_candidate_diff.py
 
 ## P1.3 候选复核 API 与工作台
 
-工作台的“候选复核”页按任务、复核状态和来源页筛选候选。GM 可以查看候选关联的原文页预览，保留原始模型文本并单独编辑复核稿，随后接受、拒绝或退回复核；多条候选也可以批量标记并附共同说明。界面始终同时显示“模型候选”与当前复核状态，证据等级不只依赖颜色表达。
+工作台的“候选复核”页按任务、复核状态和来源页筛选候选。GM 可以查看候选关联的原文页预览，直接编辑当前候选内容，随后接受、拒绝或退回复核；多条候选也可以批量标记并附共同说明。界面始终同时显示“模型候选”与当前复核状态，证据等级不只依赖颜色表达。
 
-单条复核请求接受 `review_state`，并可附带 `reviewed_text` 与 `review_note`：
+单条复核请求接受 `review_state`，并可附带当前 `text`、`content_basis` 与 `review_note`：
 
 ```text
 POST /api/domain/shadow/candidates/{candidate_id}/review
@@ -104,7 +104,7 @@ POST /api/domain/shadow/review/batch
 GET /api/domain/shadow/review-queue?task_id=shadow_task_example&review_state=all
 ```
 
-原始 `text` 永不被复核操作覆盖。编辑内容保存在 `reviewed_text`，每次单条或批量状态变化都会追加一条包含状态、复核稿、说明和时间戳的 `review_history` 记录；刷新或重新打开队列后会从 SQLite 的独立 `shadow_candidates` 表恢复。即使状态为 `accepted`，候选仍是 `model_candidate`，不会自动写入任何运行资产。GM 必须再明确选择 `source_fact` 或 `inference` 执行 promotion；未提升候选仍不能被卡片或场景计划引用。
+候选是当前记录：编辑会覆盖 `text`、来源和相关字段，并将状态退回 `needs_review`。复核历史只记录动作、说明、字段/来源变化、关联 ID 和时间，不保存旧正文或旧字段。拆分/合并直接替换当前候选集合，结果重新待复核。刷新或重新打开队列后会从 SQLite 的独立 `shadow_candidates` 表恢复。即使状态为 `accepted`，候选仍是 `model_candidate`，不会自动写入任何运行资产。GM 必须再明确选择 `source_fact`、`inference` 或 `gm_authored` 执行 promotion；未提升候选仍不能被卡片或场景计划引用。
 
 离线回归：
 
@@ -114,4 +114,4 @@ python scripts/test_shadow_review.py
 
 ## 下一步
 
-不再继续独立扩展复核页。R1 与 R2 promotion 主链已接通；下一步补齐多来源编辑、实体/场景聚类、候选拆分/合并与冲突标记，然后才进入已批准事实到备团产物草案。仍不能跳过事实质量控制去扩展规则档案。
+复核页的当前记录编辑、拆分/合并和显式 promotion 主链已接通。后续仍可补齐实体/场景聚类与冲突标记，但不得重新引入旧的双正文候选版本模型，也不能跳过事实质量控制去扩展规则档案。

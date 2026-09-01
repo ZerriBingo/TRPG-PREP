@@ -60,7 +60,6 @@ def verify(workspace_id: str | None, fact_limit: int) -> dict:
         job.id,
         workspace_id=selected_workspace,
         profile_id=prep_job.scope.profile_id,
-        session_minutes=prep_job.scope.session_minutes,
     )
     completed = artifacts.get_artifact_job(job.id)
     steps = storage.list_artifact_job_steps(job.id)

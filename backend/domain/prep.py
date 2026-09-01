@@ -6,12 +6,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 PrepJobStatus = Literal["queued", "running", "completed", "partial", "failed", "cancelled"]
 PrepWindowStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 WindowBoundaryBasis = Literal[
     "legacy",
     "scope_end",
+    "semantic",
     "heading",
     "sentence_end",
     "continuation",
@@ -19,6 +19,15 @@ WindowBoundaryBasis = Literal[
     "char_budget",
 ]
 WindowBoundarySignal = Literal["possible_heading", "possible_continuation", "sentence_end"]
+SegmentationStatus = Literal["pending", "succeeded", "fallback"]
+SegmentationStrategy = Literal["semantic-v1", "mechanical-v3"]
+PrepErrorKind = Literal[
+    "model_format",
+    "upstream_unavailable",
+    "input_config",
+    "worker",
+    "cancelled",
+]
 
 
 class PageSpan(BaseModel):
@@ -95,7 +104,6 @@ class PrepScope(BaseModel):
     source_version: str = Field(min_length=1, max_length=160)
     page_spans: list[PageSpan] = Field(min_length=1, max_length=24)
     profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
-    session_minutes: int = Field(default=120, ge=30, le=480)
     objective: str = Field(min_length=1, max_length=2000)
     notes: str | None = Field(default=None, max_length=4000)
 
@@ -122,7 +130,6 @@ class PrepJobCreate(BaseModel):
     source_file: str = Field(min_length=1, max_length=500)
     page_range: str = Field(min_length=1, max_length=500)
     profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
-    session_minutes: int = Field(default=120, ge=30, le=480)
 
     @field_validator("source_file", "page_range", "profile_id")
     @classmethod
@@ -153,6 +160,7 @@ class ExtractionWindow(BaseModel):
     candidate_count: int = Field(default=0, ge=0)
     input_chars: int = Field(default=0, ge=0)
     error: str | None = Field(default=None, max_length=2000)
+    error_kind: PrepErrorKind | None = None
 
     @field_validator("error")
     @classmethod
@@ -201,6 +209,12 @@ class PrepJob(BaseModel):
     window_strategy: Literal["legacy-overlap-v1", "core-context-v2", "core-context-v3"] = (
         "legacy-overlap-v1"
     )
+    # Semantic segmentation is a planning hint over page ownership. The
+    # mechanical core/context builder remains the deterministic fallback.
+    segmentation_strategy: SegmentationStrategy = "mechanical-v3"
+    segmentation_status: SegmentationStatus = "fallback"
+    segmentation_error: str | None = Field(default=None, max_length=2000)
+    semantic_segments: list[PageSpan] = Field(default_factory=list, max_length=120)
     workspace_id: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9_-]*$"
     )
@@ -213,3 +227,24 @@ class PrepJob(BaseModel):
     promoted_count: int = Field(default=0, ge=0)
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)
+
+    @field_validator("segmentation_error")
+    @classmethod
+    def strip_segmentation_error(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def semantic_segments_are_bounded(self) -> "PrepJob":
+        if self.segmentation_strategy == "mechanical-v3":
+            return self
+        scope_pages = {
+            page for span in self.scope.page_spans for page in span.pages()
+        }
+        segment_pages = [
+            page for span in self.semantic_segments for page in span.pages()
+        ]
+        if len(segment_pages) != len(set(segment_pages)):
+            raise ValueError("semantic segments cannot overlap")
+        if any(page not in scope_pages for page in segment_pages):
+            raise ValueError("semantic segments must stay inside the prep scope")
+        return self

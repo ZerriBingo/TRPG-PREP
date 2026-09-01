@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from ..domain import (
     ExampleBundle,
+    DisplayMaterial,
     ExtractionWindow,
     FactProvenance,
     PageSpan,
@@ -23,18 +24,21 @@ from ..domain import (
     ShadowCandidate,
     ShadowTaskSpec,
     SourceFact,
+    SourceRef,
     load_profiles,
     parse_page_spans,
     validate_bundle,
 )
 from . import shadow, storage
-from .llm import make_client
+from .llm import make_client, parse_json
 
 
 MAX_CORE_PAGE_COUNT = 3
 WINDOW_CONTEXT_PAGE_COUNT = 1
 MAX_REFERENCE_PAGE_COUNT = 8
 MAX_WINDOW_INPUT_CHARS = 14000
+MAX_SEMANTIC_PAGE_SIGNATURE_CHARS = 220
+MAX_SEMANTIC_INPUT_CHARS = 18000
 PROMPT_VERSION = "prep-fact-extract-v3"
 SCHEMA_VERSION = "shadow-candidate-v1"
 
@@ -59,6 +63,12 @@ KIND_ALIASES = {
     "角色": "npc",
     "地点": "location",
     "场景": "location",
+    "展示材料": "handout",
+    "玩家展示材料": "handout",
+    "地图": "handout",
+    "信件": "handout",
+    "照片": "handout",
+    "报纸": "handout",
     "事件": "event",
     "威胁": "threat",
     "利害": "stakes",
@@ -92,6 +102,20 @@ class PrepSourceError(PrepError):
 
 class PrepPromotionConflictError(PrepError):
     pass
+
+
+def _prep_error_kind(error: object) -> str:
+    """Map an extraction failure to a stable UI category."""
+    text = str(error or "").casefold()
+    if "cancel" in text or "取消" in text:
+        return "cancelled"
+    if any(token in text for token in ("json", "validation", "schema", "字段", "格式", "candidate")):
+        return "model_format"
+    if any(token in text for token in ("api key", "配置", "密钥", "source pdf", "source file", "输入")):
+        return "input_config"
+    if any(token in text for token in ("worker", "子进程")):
+        return "worker"
+    return "upstream_unavailable"
 
 
 def _source_path(file_name: str) -> Path:
@@ -188,7 +212,11 @@ def _estimated_window_chars(
 
 
 def _build_windows(
-    path: Path, spans: list[PageSpan], job_token: str
+    path: Path,
+    spans: list[PageSpan],
+    job_token: str,
+    *,
+    semantic_boundaries: bool = False,
 ) -> list[ExtractionWindow]:
     """Build non-overlapping ownership cores with repeated boundary context."""
     page_texts = _page_texts(path, spans)
@@ -197,7 +225,14 @@ def _build_windows(
     for span in spans:
         core_start = span.start
         while core_start <= span.end:
-            max_end = min(core_start + MAX_CORE_PAGE_COUNT - 1, span.end)
+            # A semantic unit owns as many adjacent pages as the transport
+            # budget permits. Mechanical windows retain the conservative
+            # three-page cap as their deterministic fallback.
+            max_end = (
+                span.end
+                if semantic_boundaries
+                else min(core_start + MAX_CORE_PAGE_COUNT - 1, span.end)
+            )
             feasible_ends = [
                 end
                 for end in range(core_start, max_end + 1)
@@ -220,7 +255,7 @@ def _build_windows(
             ]
 
             if core_end == span.end:
-                boundary_basis = "scope_end"
+                boundary_basis = "semantic" if semantic_boundaries else "scope_end"
                 boundary_pages: list[int] = []
                 boundary_signals: list[str] = []
             else:
@@ -250,6 +285,133 @@ def _build_windows(
             window_index += 1
             core_start = core_end + 1
     return windows
+
+
+def _semantic_page_signatures(path: Path, spans: list[PageSpan]) -> list[dict[str, Any]]:
+    """Build a bounded page map for the semantic planner, not the extractor."""
+    page_texts = _page_texts(path, spans)
+    signatures: list[dict[str, Any]] = []
+    for span in spans:
+        for page in span.pages():
+            lines = [line.strip() for line in page_texts.get(page, "").splitlines() if line.strip()]
+            snippet = " ".join(lines)
+            if len(snippet) > MAX_SEMANTIC_PAGE_SIGNATURE_CHARS:
+                snippet = snippet[:MAX_SEMANTIC_PAGE_SIGNATURE_CHARS - 1].rstrip() + "…"
+            signatures.append({"page": page, "text": snippet})
+    encoded = json.dumps(signatures, ensure_ascii=False)
+    if len(encoded) > MAX_SEMANTIC_INPUT_CHARS:
+        # Every page remains represented by its number; text is reduced in a
+        # deterministic second pass before giving up to mechanical paging.
+        compact = [
+            {"page": item["page"], "text": str(item["text"])[:80]}
+            for item in signatures
+        ]
+        signatures = compact
+        if len(json.dumps(signatures, ensure_ascii=False)) > MAX_SEMANTIC_INPUT_CHARS:
+            raise PrepSourceError("selected page scope is too large for semantic planning")
+    return signatures
+
+
+def _semantic_prompt_messages(job: PrepJob, signatures: list[dict[str, Any]]) -> list[dict[str, str]]:
+    pages = [item["page"] for item in signatures]
+    system = (
+        "You are a page-boundary planner for a source-backed TRPG preparation task. "
+        "Return exactly one JSON object with a segments array. Group adjacent selected "
+        "PDF pages that belong to the same semantic unit such as a location, event, "
+        "character, clue chain, or transition. Preserve every selected page exactly "
+        "once; never include an unselected page; never overlap segments. A segment "
+        "must be an object {start, end, label}. Labels are short GM-facing descriptions, "
+        "not rules or invented content. This is only a planning hint: do not extract facts."
+    )
+    user = (
+        "[TASK:prep:segment]\n"
+        f"SOURCE_FILE_JSON={json.dumps(job.scope.source_file, ensure_ascii=False)}\n"
+        f"SELECTED_PAGES_JSON={json.dumps(pages)}\n"
+        f"PAGE_SIGNATURES_JSON={json.dumps(signatures, ensure_ascii=False)}\n"
+        "Return {\"segments\":[{\"start\":1,\"end\":2,\"label\":\"...\"}]} and no markdown."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _normalize_semantic_segments(parsed: Any, scope_spans: list[PageSpan]) -> list[PageSpan]:
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("segments"), list):
+        raise PrepSourceError("semantic planner returned no segments array")
+    raw_segments = parsed["segments"]
+    if not raw_segments or len(raw_segments) > 120:
+        raise PrepSourceError("semantic planner returned an invalid segment count")
+    normalized: list[PageSpan] = []
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            raise PrepSourceError("semantic planner returned an invalid segment")
+        start, end = raw.get("start"), raw.get("end")
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
+            raise PrepSourceError("semantic segment bounds must be integers")
+        label = raw.get("label")
+        if label is not None and not isinstance(label, str):
+            raise PrepSourceError("semantic segment label must be text")
+        owner = next(
+            (span for span in scope_spans if span.start <= start <= end <= span.end),
+            None,
+        )
+        if owner is None or end < start:
+            raise PrepSourceError("semantic segment falls outside the selected scope")
+        normalized.append(PageSpan(start=start, end=end, label=(label or None)))
+    normalized.sort(key=lambda span: (span.start, span.end))
+    # The planner is a partitioner, not a filter. Require exact coverage of
+    # every selected span so a bad response cannot silently drop source pages.
+    cursor = 0
+    for scope in sorted(scope_spans, key=lambda span: (span.start, span.end)):
+        segment_group = [item for item in normalized if item.start >= scope.start and item.end <= scope.end]
+        if not segment_group or segment_group[0].start != scope.start:
+            raise PrepSourceError("semantic planner omitted the start of a selected span")
+        expected = scope.start
+        for segment in segment_group:
+            if segment.start != expected:
+                raise PrepSourceError("semantic planner left a page gap or overlap")
+            expected = segment.end + 1
+        if expected != scope.end + 1:
+            raise PrepSourceError("semantic planner omitted the end of a selected span")
+        cursor += len(segment_group)
+    if cursor != len(normalized):
+        raise PrepSourceError("semantic planner returned pages outside the selected spans")
+    return normalized
+
+
+def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
+    """Plan semantic page units once, falling back to persisted mechanical windows."""
+    if job.segmentation_strategy != "semantic-v1" or job.segmentation_status != "pending":
+        return job
+    try:
+        signatures = _semantic_page_signatures(path, job.scope.page_spans)
+        raw = client.chat(
+            _semantic_prompt_messages(job, signatures),
+            temperature=0.0,
+            max_tokens=3000,
+        )
+        segments = _normalize_semantic_segments(
+            parse_json(raw), job.scope.page_spans
+        )
+        windows = _build_windows(
+            path,
+            segments,
+            job.id.removeprefix("prep_job_"),
+            semantic_boundaries=True,
+        )
+        return _save_job(
+            job,
+            segmentation_status="succeeded",
+            semantic_segments=[item.model_dump(mode="json") for item in segments],
+            segmentation_error=None,
+            windows=[item.model_dump(mode="json") for item in windows],
+        )
+    except Exception as error:  # noqa: BLE001
+        # Semantic planning is an enhancement to extraction, never a reason to
+        # lose a whole job. The original deterministic windows remain intact.
+        return _save_job(
+            job,
+            segmentation_status="fallback",
+            segmentation_error=str(error)[:2000],
+        )
 
 
 def _clip_page_text(text: str, limit: int, mode: str) -> tuple[str, bool]:
@@ -306,8 +468,8 @@ def _window_excerpt(path: Path, window: ExtractionWindow) -> tuple[str, list[int
     return excerpt, truncated_pages
 
 
-def _prep_objective(profile_id: str, session_minutes: int) -> str:
-    return f"为约 {session_minutes} 分钟的一次游戏准备。{PROFILE_OBJECTIVES[profile_id]}"
+def _prep_objective(profile_id: str) -> str:
+    return PROFILE_OBJECTIVES[profile_id]
 
 
 def _reference_pages(value: Any) -> list[int] | None:
@@ -472,6 +634,7 @@ def _recover_interrupted_jobs() -> None:
                 data.update(
                     status="failed",
                     error="generation was interrupted before completion",
+                    error_kind="worker",
                 )
             windows.append(data)
         succeeded = any(item["status"] == "succeeded" for item in windows)
@@ -511,8 +674,7 @@ def create_prep_job(
         source_version=_source_version(path),
         page_spans=spans,
         profile_id=spec.profile_id,
-        session_minutes=spec.session_minutes,
-        objective=_prep_objective(spec.profile_id, spec.session_minutes),
+        objective=_prep_objective(spec.profile_id),
         notes=None,
     )
     windows = _build_windows(path, scope.page_spans, job_token)
@@ -525,6 +687,9 @@ def create_prep_job(
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
         window_strategy="core-context-v3",
+        segmentation_strategy="semantic-v1",
+        segmentation_status="pending",
+        semantic_segments=[],
         workspace_id=workspace_id or job_id,
         analysis_version=analysis_version,
         previous_job_id=previous_job_id,
@@ -560,7 +725,6 @@ def rebuild_prep_job(job_id: str) -> PrepJob:
             source_file=job.scope.source_file,
             page_range=page_range,
             profile_id=job.scope.profile_id,
-            session_minutes=job.scope.session_minutes,
         ),
         workspace_id=workspace_id,
         analysis_version=next_version,
@@ -603,7 +767,12 @@ def job_needs_rebuild(job: PrepJob) -> bool:
         # A missing or unreadable source cannot be rebuilt from the UI yet.
         return False
 
-    if job.window_strategy != "core-context-v3":
+    if job.segmentation_strategy == "semantic-v1":
+        # Semantic boundaries depend on the model and page signatures. They
+        # are durable for this job; a new explicit rebuild creates a fresh
+        # planning request instead of silently re-slicing an existing queue.
+        result = False
+    elif job.window_strategy != "core-context-v3":
         result = True
     else:
         try:
@@ -673,20 +842,40 @@ def list_prep_jobs_by_workspace(workspace_id: str) -> list[PrepJob]:
     )
 
 
-def start_prep_job(job_id: str) -> PrepJob:
+def start_prep_job(
+    job_id: str,
+    *,
+    model_id: str | None = None,
+    fake_model: bool | None = None,
+) -> PrepJob:
+    """Queue a retry, optionally refreshing the model snapshot.
+
+    A failed or cancelled task may be retried after the GM changes the model
+    configuration.  Succeeded windows remain cached; only windows that need
+    work use the refreshed snapshot.
+    """
     job = _job_from_store(job_id)
     if job.status == "running":
         raise PrepJobConflictError("prep job is already running")
     if job.status == "completed":
         raise PrepJobConflictError("completed prep jobs do not need another run")
 
+    updates: dict[str, Any] = {}
+    if model_id is not None:
+        model_id = model_id.strip()
+        if not model_id:
+            raise PrepError("model id cannot be empty")
+        updates["model_id"] = model_id
+    if fake_model is not None:
+        updates["fake_model"] = bool(fake_model)
+
     windows = []
     for window in job.windows:
         data = window.model_dump(mode="json")
         if window.status in {"failed", "cancelled"}:
-            data.update(status="queued", error=None)
+            data.update(status="queued", error=None, error_kind=None)
         windows.append(data)
-    job = _save_job(job, status="running", windows=windows)
+    job = _save_job(job, status="running", windows=windows, **updates)
     with _active_jobs_lock:
         _active_jobs.add(job.id)
     return job
@@ -740,6 +929,118 @@ def _workspace_name(job: PrepJob) -> str:
     return f"{source_name} · {ranges}"
 
 
+_DISPLAY_MATERIAL_LABEL = re.compile(
+    r"(?:^|\b)(?:材料|展示材料|玩家材料|handout|document)\s*[：:#]\s*(.{1,120})",
+    re.IGNORECASE,
+)
+def _page_visual_region(page: fitz.Page, label_rect: fitz.Rect) -> str | None:
+    """Return nearest sizable embedded-image bounds as metadata, never a crop."""
+    candidates: list[fitz.Rect] = []
+    for image in page.get_images(full=True):
+        for rect in page.get_image_rects(image[0]):
+            if rect.width * rect.height >= 12_000:
+                candidates.append(rect)
+    if not candidates:
+        return None
+    nearest = min(
+        candidates,
+        key=lambda rect: abs(rect.x0 - label_rect.x0) + abs(rect.y0 - label_rect.y0),
+    )
+    return f"visual-candidate:{nearest.x0:.0f},{nearest.y0:.0f},{nearest.x1:.0f},{nearest.y1:.0f}"
+
+
+def _ensure_labeled_display_materials(bundle: ExampleBundle, job: PrepJob) -> None:
+    """Add only strong text-labelled player materials; unlabeled images stay metadata."""
+    if any("auto-labelled" in fact.tags for fact in bundle.facts):
+        return
+    existing_titles = {item.title.casefold() for item in bundle.display_materials}
+    try:
+        document = fitz.open(_source_path(job.scope.source_file))
+    except Exception:
+        return
+    try:
+        for span in job.scope.page_spans:
+            for page_number in span.pages():
+                page = document[page_number - 1]
+                for block in page.get_text("blocks"):
+                    text = " ".join(str(block[4]).split())
+                    if not text:
+                        continue
+                    match = _DISPLAY_MATERIAL_LABEL.search(text)
+                    # Only an explicit source label can create a formal
+                    # display material. Generic text blocks and nearby image
+                    # captions are visual candidates, not handout facts.
+                    title = (match.group(1) if match else "").strip()
+                    if not title or title.casefold() in existing_titles:
+                        continue
+                    digest = hashlib.sha256(
+                        f"{job.scope.source_file}:{page_number}:{title}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    fact_id = f"fact_handout_{digest}"
+                    if any(fact.id == fact_id for fact in bundle.facts):
+                        continue
+                    region = _page_visual_region(
+                        page, fitz.Rect(float(block[0]), float(block[1]), float(block[2]), float(block[3]))
+                    )
+                    source_ref = SourceRef(
+                        file=job.scope.source_file,
+                        page=page_number,
+                        excerpt=text[:1200],
+                        region=region,
+                        source_version=job.scope.source_version,
+                    )
+                    bundle.facts.append(SourceFact(
+                        id=fact_id,
+                        source_refs=[source_ref],
+                        evidence_status="source_fact",
+                        text=title,
+                        kind="handout",
+                        # "handout" is the fact kind, not a valid visibility
+                        # value. Display-material facts are source-backed and
+                        # therefore explicit like other extracted facts.
+                        visibility="explicit",
+                        tags=["display-material", "auto-labelled"],
+                        notes="从 PDF 的展示材料标签自动识别。",
+                    ))
+                    bundle.display_materials.append(DisplayMaterial(
+                        id=f"material_m_{digest}",
+                        title=title,
+                        source_fact_ids=[fact_id],
+                        source_refs=[source_ref],
+                        gm_notes="原文展示材料；请按来源页自行准备展示。",
+                        links=[],
+                    ))
+                    existing_titles.add(title.casefold())
+    finally:
+        document.close()
+
+
+def display_material_source_pages(job: PrepJob) -> list[int]:
+    """Return source-page hints without creating facts or display materials."""
+    try:
+        document = fitz.open(_source_path(job.scope.source_file))
+    except Exception:
+        return []
+    pages: set[int] = set()
+    try:
+        for span in job.scope.page_spans:
+            for page_number in span.pages():
+                page = document[page_number - 1]
+                texts = [" ".join(str(block[4]).split()) for block in page.get_text("blocks")]
+                if any(_DISPLAY_MATERIAL_LABEL.search(text) for text in texts):
+                    pages.add(page_number)
+                    continue
+                page_area = max(float(page.rect.width * page.rect.height), 1.0)
+                for image in page.get_images(full=True):
+                    if any(0.03 <= (rect.width * rect.height) / page_area <= 0.85
+                           for rect in page.get_image_rects(image[0])):
+                        pages.add(page_number)
+                        break
+    finally:
+        document.close()
+    return sorted(pages)
+
+
 def _load_or_create_workspace(job: PrepJob) -> ExampleBundle:
     workspace_id = job.workspace_id or job.id
     saved = storage.load_domain_bundle(workspace_id)
@@ -762,7 +1063,7 @@ def _load_or_create_workspace(job: PrepJob) -> ExampleBundle:
 def promote_shadow_candidate(
     candidate_id: str, *, evidence_status: str
 ) -> tuple[SourceFact, str, bool]:
-    if evidence_status not in {"source_fact", "inference"}:
+    if evidence_status not in {"source_fact", "inference", "gm_authored"}:
         raise PrepPromotionConflictError("promotion evidence status is invalid")
 
     existing = storage.load_candidate_promotion(candidate_id)
@@ -795,23 +1096,56 @@ def promote_shadow_candidate(
     review = candidate.review_history[-1]
     if review.review_state != "accepted":
         raise PrepPromotionConflictError("latest candidate review is not accepted")
+    if evidence_status == "source_fact" and candidate.content_basis in {
+        "inference",
+        "gm_authored",
+    }:
+        raise PrepPromotionConflictError(
+            "edited candidate content must be promoted as inference or GM-authored"
+        )
+    if evidence_status == "inference" and candidate.content_basis == "gm_authored":
+        raise PrepPromotionConflictError(
+            "GM-authored candidate content must be promoted as GM-authored"
+        )
 
-    job = _job_for_shadow_task(candidate.task_id)
-    workspace_id = job.workspace_id or job.id
-    if job.workspace_id != workspace_id:
-        job = _save_job(job, workspace_id=workspace_id)
-    bundle = _load_or_create_workspace(job)
+    # Normal analysis candidates are attached to a preparation job.  Keep the
+    # standalone shadow seam usable for isolated review fixtures as well, but
+    # only when an explicit domain bundle already exists under that task id;
+    # never create a new bookshelf project implicitly from a loose candidate.
+    try:
+        job = _job_for_shadow_task(candidate.task_id)
+    except PrepPromotionConflictError:
+        saved = storage.load_domain_bundle(candidate.task_id)
+        if not saved:
+            raise
+        workspace_id = candidate.task_id
+        bundle = ExampleBundle.model_validate(saved[0])
+        profiles = load_profiles(storage.PROJECT_ROOT / "backend" / "domain" / "profiles")
+        validate_bundle(bundle, profiles)
+        job = None
+    else:
+        workspace_id = job.workspace_id or job.id
+        if job.workspace_id != workspace_id:
+            job = _save_job(job, workspace_id=workspace_id)
+        bundle = _load_or_create_workspace(job)
     fact_id = f"fact_promoted_{hashlib.sha256(candidate.id.encode('utf-8')).hexdigest()[:16]}"
     promoted_at = storage.now()
     fact = SourceFact(
         id=fact_id,
         source_refs=candidate.source_refs,
         evidence_status=evidence_status,
-        text=candidate.reviewed_text or candidate.text,
+        text=candidate.text,
         kind=candidate.kind,
-        visibility="explicit" if evidence_status == "source_fact" else "inferred",
+        visibility=(
+            "explicit"
+            if evidence_status == "source_fact"
+            else "inferred"
+            if evidence_status == "inference"
+            else "gm_suggestion"
+        ),
         links=[],
-        tags=["reviewed-candidate", f"prep-{job.scope.profile_id}"],
+        # Keep internal profile identifiers out of user-facing, copyable fact tags.
+        tags=["reviewed-candidate"],
         notes=candidate.review_note,
         provenance=FactProvenance(
             candidate_id=candidate.id,
@@ -851,8 +1185,8 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
         system = (
             "You extract source-bound TRPG preparation facts. Return only one JSON object "
             'with shape {"candidates": [...]}. Each candidate must contain text, kind, '
-            "source_refs, confidence, possible_links, and open_questions. kind must be one "
-            "of clue, npc, location, event, threat, stakes, obstacle, timeline, resource. "
+            "source_refs, confidence, and open_questions. kind must be one "
+            "of clue, npc, location, handout, event, threat, stakes, obstacle, timeline, resource. "
             "Use only the supplied PDF pages. A fact that depends on more than one page "
             "must cite multiple source_refs. Do not invent rules, motives, links, or outcomes. "
             "Return an empty candidates array when the pages do not support a useful fact."
@@ -862,12 +1196,15 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
             "You extract source-bound TRPG preparation facts. Return only one JSON object "
             'with shape {"candidates":[{"text":"...","kind":"clue",'
             '"source_refs":[{"file":"exact source file","page":5,"locator":null}],'
-            '"confidence":0.75,"possible_links":[],"open_questions":[]}]}. '
+            '"confidence":0.75,"open_questions":[]}]}. '
             "Every source_refs item must be an object; file must exactly equal SOURCE_FILE_JSON; "
             "page must be an integer from SOURCE_PAGES_JSON. confidence must be a JSON number "
             "from 0 to 1 or null, never words such as high or 高. kind must be one of clue, npc, "
-            "location, event, threat, stakes, obstacle, timeline, resource. Use only supplied "
-            "pages. Cite every supporting page for a cross-page fact. Do not invent rules, "
+            "location, handout, event, threat, stakes, obstacle, timeline, resource. Use only supplied "
+            "pages. Cite every supporting page for a cross-page fact. Classify a map, letter, newspaper, "
+            "photo, log, record, or other material intended to be shown/read by players as handout, "
+            "even when it mentions a place. Only classify a place as location when it is a playable, "
+            "returnable investigation site. Do not invent rules, "
             "motives, links, or outcomes. Context pages only complete facts crossing a window "
             "boundary. The earliest cited page is the candidate anchor: return a candidate only "
             "when that anchor is listed in CORE_PAGES_JSON. Return an empty candidates array "
@@ -881,7 +1218,6 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
         f"CONTEXT_PAGES_JSON={json.dumps(window.context_pages)}\n"
         f"BOUNDARY_PAGES_JSON={json.dumps(window.boundary_pages)}\n"
         f"TARGET_PROFILE_JSON={json.dumps(job.scope.profile_id)}\n"
-        f"SESSION_MINUTES={job.scope.session_minutes}\n"
         f"PREP_DIRECTIVE_JSON={json.dumps(job.scope.objective, ensure_ascii=False)}\n"
         "SOURCE_TEXT_START\n"
         f"{excerpt}\n"
@@ -897,7 +1233,8 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
     excerpt, truncated_pages = _window_excerpt(path, window)
     task_spec = ShadowTaskSpec(
         idempotency_key=(
-            f"{job.id}:{window.id}:{job.prompt_version}:{job.schema_version}"
+            f"{job.id}:{window.id}:{job.prompt_version}:{job.schema_version}:"
+            f"{hashlib.sha256(f'{job.model_id}:{job.fake_model}'.encode('utf-8')).hexdigest()[:16]}"
         ),
         source_file=job.scope.source_file,
         source_version=job.scope.source_version,
@@ -918,6 +1255,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
         input_chars=len(excerpt),
         truncated_pages=truncated_pages,
         error=None,
+        error_kind=None,
     )
 
     if task.status == "completed":
@@ -928,6 +1266,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
             status="succeeded",
             candidate_count=len(candidates),
             error=None,
+            error_kind=None,
         )
         return
 
@@ -947,6 +1286,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
             window.id,
             status="failed",
             error=run.transport_error or "model transport failed",
+            error_kind=run.error_kind or _prep_error_kind(run.transport_error),
         )
         return
 
@@ -961,6 +1301,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
             window.id,
             status="cancelled",
             error="cancelled while the model request was running",
+            error_kind="cancelled",
         )
         return
 
@@ -981,6 +1322,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
             status="succeeded",
             candidate_count=len(candidates),
             error=None,
+            error_kind=None,
         )
     else:
         _replace_window(
@@ -988,6 +1330,7 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
             window.id,
             status="failed",
             error=run.parse_error or "model output validation failed",
+            error_kind=run.error_kind or "model_format",
         )
 
 
@@ -998,6 +1341,7 @@ def execute_prep_job(job_id: str) -> None:
         if _source_version(path) != job.scope.source_version:
             raise PrepSourceError("source PDF changed after the prep job was created")
         client = make_client(model_id=job.model_id, force_fake=job.fake_model)
+        job = _prepare_semantic_windows(job, path, client)
 
         for window in job.windows:
             current = _job_from_store(job_id)
@@ -1029,7 +1373,11 @@ def execute_prep_job(job_id: str) -> None:
                 for window in job.windows:
                     data = window.model_dump(mode="json")
                     if window.status in {"queued", "running"}:
-                        data.update(status="failed", error=str(error)[:2000])
+                        data.update(
+                            status="failed",
+                            error=str(error)[:2000],
+                            error_kind=_prep_error_kind(error),
+                        )
                     windows.append(data)
                 _save_job(job, status="failed", windows=windows)
         except Exception:

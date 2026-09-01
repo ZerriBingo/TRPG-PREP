@@ -5,11 +5,18 @@
   "summary": "以调查、压力、洞察和不可逆代价为核心的叙事恐怖规则档案。",
   "card_definitions": [
     {
-      "type": "scene",
-      "display_name": "场景卡",
-      "description": "把地点、现场入口、线索和压力组织成一屏可运行场景；入口供 GM 调度，不是念给玩家的行动菜单。",
-      "required_fields": ["opening_image", "immediate_actions", "direct_clues", "hidden_clues", "gm_moves", "risk_if_pressed", "exit_conditions"],
-      "optional_fields": ["npc_hooks", "clock_links"]
+      "type": "location",
+      "display_name": "地点卡",
+      "description": "整理可访问、可折返地点的常态、抵达描述、人物、线索、触发内容与回访变化。",
+      "required_fields": ["normal_state", "arrival_description"],
+      "optional_fields": ["direct_clues", "relevant_characters", "hidden_clues", "gm_moves", "return_changes", "first_triggers", "consequences", "display_materials", "exit_conditions"]
+    },
+    {
+      "type": "chapter_overview",
+      "display_name": "章节总览卡",
+      "description": "承载跨地点背景、真相、阴谋、结局与全章后果。",
+      "required_fields": ["situation", "truth", "major_threads", "endings"],
+      "optional_fields": ["key_people", "cross_location_clues", "display_materials"]
     },
     {
       "type": "npc",

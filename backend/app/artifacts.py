@@ -23,6 +23,7 @@ from ..domain.models import (
 
 
 PROMPT_VERSION = "prep-artifact-draft-v2"
+GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v3"
 MAX_FACT_INPUT_CHARS = 120_000
 # Keep individual model requests comfortably below the hard input ceiling.  A
 # single artifact job may contain several of these batches; the final cards are
@@ -58,8 +59,16 @@ LIST_FIELDS = {
     "entry_points",
     "discoveries",
     "relevant_characters",
+    "major_threads",
+    "endings",
+    "key_people",
+    "cross_location_clues",
+    "first_triggers",
+    "consequences",
+    "display_materials",
+    "return_changes",
 }
-RUNTIME_ANCHOR_TYPES = {"scene", "investigation_site", "environment"}
+RUNTIME_ANCHOR_TYPES = {"location", "environment"}
 
 _active_jobs: set[str] = set()
 _active_jobs_lock = threading.Lock()
@@ -67,6 +76,10 @@ _active_jobs_lock = threading.Lock()
 
 class ArtifactGenerationError(ValueError):
     """Raised when facts or model output cannot produce a valid artifact set."""
+
+
+class ArtifactJobConflictError(RuntimeError):
+    """Raised when another incompatible artifact job is already active."""
 
 
 def _stable_hash(value: Any) -> str:
@@ -104,7 +117,16 @@ def _run_json_step(
     validator: Callable[[Any], dict[str, Any]],
 ) -> dict[str, Any]:
     """Run or resume one validated LLM step while preserving every attempt."""
-    input_hash = _stable_hash(input_payload)
+    # A model switch is a new generation attempt, even when the source facts
+    # and stage inputs are identical.  Include the effective client identity
+    # in the step key so a retry cannot silently reuse a successful response
+    # produced by the model that just failed or was rate-limited.
+    step_input = {
+        **input_payload,
+        "_model_id": job.model_id,
+        "_fake_model": job.fake_model,
+    }
+    input_hash = _stable_hash(step_input)
     existing = storage.load_artifact_job_step(job.id, stage, step_index, input_hash)
     if existing and existing.get("status") == "succeeded" and existing.get("output"):
         return existing["output"]
@@ -116,7 +138,11 @@ def _run_json_step(
         "stage": stage,
         "step_index": step_index,
         "input_hash": input_hash,
-        "input_refs": input_refs,
+        "input_refs": {
+            **input_refs,
+            "model_id": job.model_id,
+            "fake_model": job.fake_model,
+        },
         "attempts": [],
         "created_at": timestamp,
     }
@@ -144,6 +170,8 @@ def _run_json_step(
                 {
                     "attempt": attempt_number,
                     "status": "failed",
+                    "model_id": job.model_id,
+                    "fake_model": job.fake_model,
                     "started_at": started_at,
                     "finished_at": storage.now(),
                     "response": raw,
@@ -179,6 +207,8 @@ def _run_json_step(
             {
                 "attempt": attempt_number,
                 "status": "succeeded",
+                "model_id": job.model_id,
+                "fake_model": job.fake_model,
                 "started_at": started_at,
                 "finished_at": storage.now(),
                 "response": raw,
@@ -225,21 +255,85 @@ def _job_from_store(job_id: str) -> ArtifactDraftJob:
     if raw is None:
         raise ArtifactGenerationError(f"unknown artifact generation job: {job_id}")
     try:
-        return ArtifactDraftJob.model_validate(raw)
+        job = ArtifactDraftJob.model_validate(raw)
     except ValidationError as error:
         raise ArtifactGenerationError(
             f"stored artifact generation job {job_id} is invalid: {error}"
         ) from error
+    return job
 
 
-def latest_artifact_job(workspace_id: str) -> ArtifactDraftJob | None:
-    jobs = storage.list_artifact_jobs(workspace_id)
+def latest_artifact_job(
+    workspace_id: str,
+    *,
+    profile_id: str | None = None,
+    model_id: str | None = None,
+    fake_model: bool | None = None,
+    status: str | None = None,
+) -> ArtifactDraftJob | None:
+    """Return the newest valid job matching the supplied lifecycle filters."""
+    for job in list_artifact_jobs(
+        workspace_id,
+        profile_id=profile_id,
+        model_id=model_id,
+        fake_model=fake_model,
+        status=status,
+    ):
+        return job
+    return None
+
+
+def list_artifact_jobs(
+    workspace_id: str,
+    *,
+    profile_id: str | None = None,
+    model_id: str | None = None,
+    fake_model: bool | None = None,
+    status: str | None = None,
+) -> list[ArtifactDraftJob]:
+    """Return all valid durable full-board jobs matching lifecycle filters."""
+    jobs: list[ArtifactDraftJob] = []
+    for raw in storage.list_artifact_jobs(workspace_id):
+        try:
+            job = ArtifactDraftJob.model_validate(raw)
+        except ValidationError:
+            continue
+        if profile_id is not None and job.profile_id != profile_id:
+            continue
+        if model_id is not None and job.model_id != model_id:
+            continue
+        if fake_model is not None and job.fake_model != fake_model:
+            continue
+        if status is not None and job.status != status:
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def select_artifact_job(
+    jobs: list[ArtifactDraftJob],
+    *,
+    profile_id: str | None = None,
+) -> ArtifactDraftJob | None:
+    """Choose the job the workbench should foreground without losing history.
+
+    Active work wins, then failed work, then the newest completed record. A
+    preferred profile breaks ties so a stale job from another board does not
+    take over a current shelf while the complete list remains available to the
+    UI.
+    """
     if not jobs:
         return None
-    try:
-        return ArtifactDraftJob.model_validate(jobs[0])
-    except ValidationError:
-        return None
+    status_rank = {"running": 0, "queued": 1, "failed": 2, "completed": 3}
+    profile_rank = lambda job: 0 if profile_id is None or job.profile_id == profile_id else 1
+    return min(
+        enumerate(jobs),
+        key=lambda pair: (
+            status_rank.get(pair[1].status, 9),
+            profile_rank(pair[1]),
+            pair[0],
+        ),
+    )[1]
 
 
 def create_artifact_job(
@@ -248,27 +342,37 @@ def create_artifact_job(
     *,
     model_id: str,
     fake_model: bool,
-    fact_ids: list[str] | None = None,
 ) -> tuple[ArtifactDraftJob, bool]:
-    """Create one durable request, reusing a queued/running request if present."""
+    """Create one durable, full-scope artifact request."""
     with _active_jobs_lock:
-        existing = latest_artifact_job(workspace_id)
-        if existing is not None and existing.status in {"queued", "running"}:
-            return existing, False
-        if (
-            existing is not None
-            and existing.status == "failed"
-            and existing.profile_id == profile_id
-            and existing.model_id == model_id
-            and existing.fake_model == fake_model
-        ):
-            return _save_job(
-                existing,
-                status="queued",
-                phase="queued",
-                error=None,
-                fact_ids=list(fact_ids or existing.fact_ids),
-            ), True
+        # A failed build is the current queue's retryable state, not a reason
+        # to create another parallel queue. Explicit retry reuses its job id.
+        failed = [
+            job
+            for job in list_artifact_jobs(workspace_id)
+            if job.profile_id == profile_id and job.status == "failed"
+        ]
+        if failed:
+            return max(failed, key=lambda item: item.updated_at), False
+        active = next(
+            (
+                job
+                for job in list_artifact_jobs(workspace_id)
+                if job.status in {"queued", "running"}
+            ),
+            None,
+        )
+        if active is not None:
+            same_request = (
+                active.profile_id == profile_id
+                and active.model_id == model_id
+                and active.fake_model == fake_model
+            )
+            if same_request:
+                return active, False
+            raise ArtifactJobConflictError(
+                "当前已有整板生成任务在运行，请等待该任务完成后再试"
+            )
         timestamp = storage.now()
         job = ArtifactDraftJob(
             id=f"artifact_job_{uuid.uuid4().hex}",
@@ -276,13 +380,58 @@ def create_artifact_job(
             profile_id=profile_id,
             model_id=model_id,
             fake_model=fake_model,
-            fact_ids=list(fact_ids or []),
             status="queued",
             created_at=timestamp,
             updated_at=timestamp,
         )
         storage.create_artifact_job(job.model_dump(mode="json"))
         return job, True
+
+
+def retry_artifact_job(
+    job_id: str,
+    *,
+    model_id: str | None = None,
+    fake_model: bool | None = None,
+) -> tuple[ArtifactDraftJob, bool]:
+    """Requeue one failed job with the currently selected model.
+
+    The request scope and durable job ID remain stable, while the model mode is
+    refreshed at the retry boundary.  Callers may pass an explicit config
+    snapshot; when omitted, the persisted application config is used.
+    """
+    with _active_jobs_lock:
+        job = _job_from_store(job_id)
+        if job.status != "failed":
+            return job, False
+        active = next(
+            (
+                candidate
+                for candidate in list_artifact_jobs(job.workspace_id)
+                if candidate.status in {"queued", "running"}
+            ),
+            None,
+        )
+        if active is not None:
+            raise ArtifactJobConflictError(
+                "当前已有整板生成任务在运行，暂不能重试；请等待该任务完成后再试"
+            )
+        config = storage.get_config()
+        retry_model_id = model_id if model_id is not None else config["model"]
+        retry_fake_model = fake_model if fake_model is not None else config["fake"]
+        return _save_job(
+            job,
+            status="queued",
+            phase="queued",
+            error=None,
+            model_id=retry_model_id,
+            fake_model=retry_fake_model,
+        ), True
+
+
+def has_profile_artifacts(bundle: ExampleBundle, profile_id: str) -> bool:
+    """Return whether a bookshelf already contains cards for one profile."""
+    return any(card.profile_id == profile_id for card in bundle.cards)
 
 
 def get_artifact_job(job_id: str) -> ArtifactDraftJob:
@@ -303,8 +452,6 @@ def execute_artifact_job(
     *,
     workspace_id: str,
     profile_id: str,
-    session_minutes: int | None,
-    fact_ids: list[str] | None = None,
 ) -> None:
     """Run a queued request outside the HTTP request and persist its final state."""
     with _active_jobs_lock:
@@ -325,18 +472,12 @@ def execute_artifact_job(
         profile = profiles.get(profile_id)
         if profile is None:
             raise ArtifactGenerationError("当前书架没有可用的备团板块")
-        # Supplemental jobs intentionally append cards to an existing runtime
-        # board; only a full-board generation must be blocked as duplicate.
-        if not (fact_ids or job.fact_ids) and any(card.profile_id == profile_id for card in bundle.cards):
+        if has_profile_artifacts(bundle, profile_id):
             raise ArtifactGenerationError(
                 "当前板块已经有备团产物；请先完成现有草案的复核，不重复生成一套平行卡片"
             )
         client = make_client(model_id=job.model_id, force_fake=job.fake_model)
         scoped_facts = _facts_for_workspace(bundle, workspace_id)
-        selected_fact_ids = fact_ids if fact_ids is not None else job.fact_ids
-        if selected_fact_ids:
-            wanted = set(selected_fact_ids)
-            scoped_facts = [fact for fact in scoped_facts if fact.id in wanted]
         if not scoped_facts:
             raise ArtifactGenerationError("书架没有可用于生成产物的已提升事实")
         batches = _fact_batches(scoped_facts)
@@ -362,7 +503,10 @@ def execute_artifact_job(
             open_questions=[],
         )
 
-        if len(batches) == 1:
+        # Runtime boards always pass through the planner so location coverage
+        # and chapter-overview requirements are checked before materializing
+        # cards. The compact direct path is reserved for non-runtime boards.
+        if len(batches) == 1 and profile.profile_kind != "runtime":
             job = _save_job(job, phase="direct_generation")
             generated_cards, open_questions = _generate_direct_step(
                 job,
@@ -370,7 +514,6 @@ def execute_artifact_job(
                 profile,
                 client,
                 scoped_facts,
-                session_minutes=session_minutes,
             )
             job = _save_job(
                 _job_from_store(job_id),
@@ -388,7 +531,6 @@ def execute_artifact_job(
                 client,
                 scoped_facts,
                 batches,
-                session_minutes=session_minutes,
             )
 
         if not generated_cards:
@@ -409,7 +551,7 @@ def execute_artifact_job(
             raise ArtifactGenerationError("书架工作区在生成期间被删除")
         bundle = ExampleBundle.model_validate(latest[0])
         validate_bundle(bundle, profiles)
-        if not (fact_ids or job.fact_ids) and any(card.profile_id == profile_id for card in bundle.cards):
+        if has_profile_artifacts(bundle, profile_id):
             raise ArtifactGenerationError(
                 "生成期间已有同一板块的备团产物，请刷新书架后继续复核"
             )
@@ -595,10 +737,6 @@ def _nonempty(value: Any) -> bool:
     return True
 
 
-def _fact_payload(bundle: ExampleBundle) -> list[dict[str, Any]]:
-    return _fact_payload_from_facts(bundle.facts)
-
-
 def _fact_payload_from_facts(facts: list[Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -619,7 +757,13 @@ def _fact_payload_from_facts(facts: list[Any]) -> list[dict[str, Any]]:
 def _facts_for_workspace(bundle: ExampleBundle, workspace_id: str) -> list[Any]:
     """Limit task-owned shelves to the source file and selected page scope."""
     task = prep.find_prep_job_by_workspace(workspace_id)
-    usable = [fact for fact in bundle.facts if fact.evidence_status != "model_candidate"]
+    # Display materials are source assets, not GM-facing artifact input. They
+    # are created and associated separately after the board build.
+    usable = [
+        fact
+        for fact in bundle.facts
+        if fact.evidence_status != "model_candidate" and fact.kind != "handout"
+    ]
     if task is None:
         return sorted(usable, key=lambda fact: _fact_source_sort_key(fact, None))
     allowed_pages = {
@@ -697,6 +841,10 @@ def _local_digest_messages(
         "facts. Cover every supplied fact_id in at least one unit. Group facts into useful local "
         "material such as background, scenes, locations, NPCs, clue clusters, threats, timelines, "
         "outcomes, or resources. Preserve actionable details and uncertainty, but do not write final "
+        "cards. For location material, create one location unit per distinct place that players can "
+        "enter, search, revisit, seek help at, or trigger an event in. Put that place's canonical name "
+        "in entity_keys; do not combine a dock, house, generator shed, workshop, searchable room, or "
+        "other actionable sublocation merely because they share an island or building. "
         "cards and do not invent cross-batch relationships. All user-facing text must be Chinese."
     )
     user = (
@@ -717,6 +865,9 @@ def _validate_local_digest(
     *,
     batch_index: int,
 ) -> dict[str, Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("open_questions"), list):
+        raw = dict(raw)
+        raw["open_questions"] = raw["open_questions"][:50]
     try:
         payload = LocalDigestResponsePayload.model_validate(raw)
     except ValidationError as error:
@@ -792,9 +943,8 @@ def _global_plan_messages(
     units: list[dict[str, Any]],
     fact_sizes: dict[str, int],
     fact_tokens: dict[str, int],
-    session_minutes: int | None,
 ) -> list[dict[str, str]]:
-    definitions = [item.model_dump(mode="json") for item in profile.card_definitions]
+    planning_units = _compact_global_units(units)
     system = (
         "You are the global planning stage for a TRPG preparation workspace. Return only one JSON "
         "object with keys cards and open_questions. Each planned card must contain type, title, "
@@ -804,23 +954,26 @@ def _global_plan_messages(
         "new source. Each card will later reread the original fact_ids you select. Use only listed "
         "fact_ids, avoid duplicate cards, preserve conflicts as open questions, and keep each card's "
         "estimated original-fact input within the supplied character budget. For runtime profiles, "
-        "every important explorable location present in the local units must receive its own scene, "
-        "investigation_site, or environment card; do not collapse places such as a police station, "
+        "every named explorable, returnable, investigable, or help-providing place present in the local units must receive its own location "
+        "or environment card; do not collapse places such as a police station, "
         "funeral, publisher, residence, or office into one generic scene. If a place is only a minor "
-        "mention, leave it in open_questions rather than inventing a card. All user-facing text "
+        "mention with no possible player action, leave it in open_questions rather than inventing a card. "
+        "When one source passage names several rooms or sublocations, create separate cards for each room "
+        "that can be entered, searched, revisited, used for help, or contain a clue/event; never represent "
+        "the whole building as one card merely because the rooms share a parent location. Player-facing source assets "
+        "such as maps, letters, photos, newspapers, logs, and records are tracked separately and must "
+        "not become artifact cards. All user-facing text "
         "must be Chinese."
     )
     user = (
         "[TASK:prep:artifact_global_plan]\n"
-        f"PROMPT_VERSION_JSON={json.dumps(PROMPT_VERSION)}\n"
-        f"SESSION_MINUTES_JSON={json.dumps(session_minutes)}\n"
+        f"PROMPT_VERSION_JSON={json.dumps(GLOBAL_PLAN_PROMPT_VERSION)}\n"
         f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
-        f"ALLOWED_CARD_DEFINITIONS_JSON={json.dumps(definitions, ensure_ascii=False)}\n"
         f"MAX_CARD_FACT_INPUT_CHARS_JSON={MAX_CARD_FACT_INPUT_CHARS}\n"
         f"MAX_CARD_FACT_INPUT_TOKENS_JSON={MAX_CARD_FACT_INPUT_TOKENS}\n"
         f"FACT_INPUT_CHARS_JSON={json.dumps(fact_sizes, ensure_ascii=False)}\n"
         f"FACT_INPUT_TOKENS_JSON={json.dumps(fact_tokens, ensure_ascii=False)}\n"
-        f"GLOBAL_UNITS_JSON={json.dumps(units, ensure_ascii=False)}"
+        f"GLOBAL_UNITS_JSON={json.dumps(planning_units, ensure_ascii=False)}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -883,6 +1036,11 @@ def _validate_global_plan(
         )
         used_fact_ids.update(card.fact_ids)
 
+    requires_overview = any(
+        definition.type == "chapter_overview" for definition in profile.card_definitions
+    )
+    if requires_overview and not any(card["type"] == "chapter_overview" for card in planned):
+        raise ArtifactGenerationError("全局计划缺少章节总览卡")
     if profile.profile_kind == "runtime" and not any(
         card["type"] in RUNTIME_ANCHOR_TYPES for card in planned
     ):
@@ -895,16 +1053,36 @@ def _validate_global_plan(
     }
 
 
+def _compact_global_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove provenance already recoverable from fact IDs before global planning."""
+    keys = (
+        "id",
+        "kind",
+        "title",
+        "summary",
+        "fact_ids",
+        "entity_keys",
+        "relationship_hints",
+        "open_questions",
+    )
+    return [{key: unit.get(key) for key in keys} for unit in units]
+
+
 def _materialization_messages(
     profile: RuleProfile,
     plan: dict[str, Any],
     facts: list[dict[str, Any]],
-    session_minutes: int | None,
 ) -> list[dict[str, str]]:
-    definition = next(item for item in profile.card_definitions if item.type == plan["type"])
+    definition = next(
+        item for item in profile.card_definitions if item.type == plan["type"]
+    )
     list_fields = sorted(
         LIST_FIELDS & set([*definition.required_fields, *definition.optional_fields])
     )
+    required_shapes = {
+        field: ("array of concise strings" if field in LIST_FIELDS else "concise string")
+        for field in definition.required_fields
+    }
     system = (
         "You materialize exactly one planned TRPG preparation card by rereading its original reviewed "
         "facts. Return only one JSON object with keys cards and open_questions; cards must contain "
@@ -912,12 +1090,20 @@ def _materialization_messages(
         "subtitle, fact_ids, fields, field_sources, and open_questions. Use only supplied original "
         "facts. Every factual field must cite one or more fact_ids from that card, and every populated "
         "field must have field_sources. Do not fill gaps from the planning summary; record an open "
-        "question instead. All user-facing text must be Chinese."
+        "question instead. Every required field listed below MUST be present and non-empty. "
+        "Before returning, check the fields object key by key against REQUIRED_FIELD_SHAPES_JSON; "
+        "array-shaped fields must be JSON arrays, never scalar strings. "
+        "For every optional field, actively inspect the supplied facts and include it whenever the "
+        "facts support useful table-side content; omit it only when no useful content exists. In "
+        "particular, check relevant_characters, hidden_clues, and return_changes separately. "
+        "gm_moves may be concise GM-authored pressure or opportunity prompts grounded in the "
+        "location's fiction; mark them with no field_sources unless the source explicitly supports one. "
+        f"REQUIRED_FIELD_SHAPES_JSON={json.dumps(required_shapes, ensure_ascii=False)} "
+        "All user-facing text must be Chinese."
     )
     user = (
         "[TASK:prep:artifact_materialize]\n"
         f"PROMPT_VERSION_JSON={json.dumps(PROMPT_VERSION)}\n"
-        f"SESSION_MINUTES_JSON={json.dumps(session_minutes)}\n"
         f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"CARD_DEFINITION_JSON={json.dumps(definition.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"LIST_FIELDS_JSON={json.dumps(list_fields, ensure_ascii=False)}\n"
@@ -982,12 +1168,15 @@ def _generate_direct_step(
     profile: RuleProfile,
     client: Any,
     facts: list[Any],
-    *,
-    session_minutes: int | None,
 ) -> tuple[list[DerivedCard], list[str]]:
     fact_payload = _fact_payload_from_facts(facts)
     direct_bundle = bundle.model_copy(update={"facts": facts, "cards": [], "plans": []})
-    messages = _prompt_messages(direct_bundle, profile, fact_payload, session_minutes)
+    messages = _prompt_messages(
+        direct_bundle,
+        profile,
+        fact_payload,
+        require_runtime_anchor=True,
+    )
     output = _run_json_step(
         job,
         stage="direct_generation",
@@ -995,7 +1184,6 @@ def _generate_direct_step(
         input_payload={
             "prompt_version": PROMPT_VERSION,
             "profile": profile.model_dump(mode="json"),
-            "session_minutes": session_minutes,
             "facts": fact_payload,
         },
         input_refs={"fact_ids": [fact.id for fact in facts]},
@@ -1007,6 +1195,7 @@ def _generate_direct_step(
             direct_bundle,
             profile,
             model_id=getattr(client, "model", "configured-model"),
+            require_runtime_anchor=True,
         ),
     )
     return (
@@ -1022,8 +1211,6 @@ def _generate_hierarchical_artifacts(
     client: Any,
     scoped_facts: list[Any],
     batches: list[list[Any]],
-    *,
-    session_minutes: int | None,
 ) -> tuple[list[DerivedCard], list[str], ArtifactDraftJob]:
     job = _save_job(job, phase="local_digest")
     local_units: list[dict[str, Any]] = []
@@ -1090,31 +1277,41 @@ def _generate_hierarchical_artifacts(
         for fact in scoped_facts
     }
     job = _save_job(_job_from_store(job.id), phase="global_plan")
-    plan_output = _run_json_step(
-        job,
-        stage="global_plan",
-        step_index=1,
-        input_payload={
-            "prompt_version": PROMPT_VERSION,
-            "profile": profile.model_dump(mode="json"),
-            "session_minutes": session_minutes,
-            "units": local_units,
-            "fact_sizes": fact_sizes,
-            "fact_tokens": fact_tokens,
-        },
-        input_refs={
-            "unit_ids": [unit["id"] for unit in local_units],
-            "fact_ids": list(facts_by_id),
-        },
-        messages=_global_plan_messages(
-            profile, local_units, fact_sizes, fact_tokens, session_minutes
-        ),
-        client=client,
-        max_tokens=GLOBAL_PLAN_MAX_TOKENS,
-        validator=lambda raw: _validate_global_plan(
-            raw, local_units, scoped_facts, profile
-        ),
-    )
+    try:
+        plan_output = _run_json_step(
+            job,
+            stage="global_plan",
+            step_index=1,
+            input_payload={
+                "prompt_version": GLOBAL_PLAN_PROMPT_VERSION,
+                "profile": profile.model_dump(mode="json"),
+                "units": _compact_global_units(local_units),
+                "fact_sizes": fact_sizes,
+                "fact_tokens": fact_tokens,
+            },
+            input_refs={
+                "unit_ids": [unit["id"] for unit in local_units],
+                "fact_ids": list(facts_by_id),
+            },
+            messages=_global_plan_messages(
+                profile,
+                local_units,
+                fact_sizes,
+                fact_tokens,
+            ),
+            client=client,
+            max_tokens=GLOBAL_PLAN_MAX_TOKENS,
+            validator=lambda raw: _validate_global_plan(
+                raw, local_units, scoped_facts, profile
+            ),
+        )
+    except Exception as error:  # noqa: BLE001
+        if "API 请求超时" in str(error):
+            raise ArtifactGenerationError(
+                "全局规划单次请求超过 300 秒，上游未返回。请使用主按钮重试失败项；"
+                "已完成的局部整理会复用。\n" + str(error)
+            ) from error
+        raise ArtifactGenerationError(f"全局规划失败：{error}") from error
     plans = plan_output["cards"]
     open_questions = _merge_questions(
         open_questions, list(plan_output.get("open_questions") or [])
@@ -1134,6 +1331,7 @@ def _generate_hierarchical_artifacts(
     )
 
     generated_cards: list[DerivedCard] = []
+    failed_cards: list[str] = []
     for card_index, plan in enumerate(plans, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
@@ -1151,7 +1349,6 @@ def _generate_hierarchical_artifacts(
                 input_payload={
                     "prompt_version": PROMPT_VERSION,
                     "profile_id": profile.id,
-                    "session_minutes": session_minutes,
                     "plan": plan,
                     "facts": fact_payload,
                 },
@@ -1160,7 +1357,7 @@ def _generate_hierarchical_artifacts(
                     "fact_ids": plan["fact_ids"],
                 },
                 messages=_materialization_messages(
-                    profile, plan, fact_payload, session_minutes
+                    profile, plan, fact_payload
                 ),
                 client=client,
                 max_tokens=ARTIFACT_MAX_TOKENS,
@@ -1173,9 +1370,16 @@ def _generate_hierarchical_artifacts(
                 ),
             )
         except Exception as error:  # noqa: BLE001
-            raise ArtifactGenerationError(
-                f"第 {card_index}/{len(plans)} 张计划卡落地失败（{plan['title']}）：{error}"
-            ) from error
+            failed_cards.append(
+                f"第 {card_index}/{len(plans)} 张计划卡（{plan['title']}）：{error}"
+            )
+            job = _save_job(
+                _job_from_store(job.id),
+                completed_cards=card_index,
+                card_count=len(generated_cards),
+                open_questions=open_questions,
+            )
+            continue
         generated_cards.extend(
             DerivedCard.model_validate(card) for card in output["cards"]
         )
@@ -1188,6 +1392,14 @@ def _generate_hierarchical_artifacts(
             card_count=len(generated_cards),
             open_questions=open_questions,
         )
+    if failed_cards:
+        preview = "；".join(failed_cards[:5])
+        if len(failed_cards) > 5:
+            preview += f"；另有 {len(failed_cards) - 5} 项失败"
+        raise ArtifactGenerationError(
+            f"本轮 {len(plans)} 张计划卡已全部尝试，其中 {len(failed_cards)} 项失败。"
+            f"请使用‘重试失败项’；已成功步骤会复用。{preview}"
+        )
     return generated_cards, open_questions, job
 
 
@@ -1195,44 +1407,10 @@ def _merge_questions(existing: list[str], incoming: list[str]) -> list[str]:
     return list(dict.fromkeys([*existing, *incoming]))[:50]
 
 
-def _merge_cards(existing: list[DerivedCard], incoming: list[DerivedCard]) -> list[DerivedCard]:
-    """Merge exact repeated cards; preserve same-title conflicts for GM review."""
-    merged = list(existing)
-    by_key = {(card.type, card.title.casefold()): index for index, card in enumerate(merged)}
-    for card in incoming:
-        key = (card.type, card.title.casefold())
-        index = by_key.get(key)
-        if index is None:
-            by_key[key] = len(merged)
-            merged.append(card)
-            continue
-        previous = merged[index]
-        if previous.fields != card.fields:
-            merged.append(card)
-            continue
-        field_sources = {
-            field: list(dict.fromkeys([
-                *previous.field_sources.get(field, []),
-                *card.field_sources.get(field, []),
-            ]))
-            for field in set(previous.field_sources) | set(card.field_sources)
-        }
-        merged[index] = previous.model_copy(update={
-            "fact_ids": list(dict.fromkeys([*previous.fact_ids, *card.fact_ids])),
-            "field_sources": field_sources,
-            "open_questions": list(dict.fromkeys([
-                *previous.open_questions,
-                *card.open_questions,
-            ])),
-        })
-    return merged
-
-
 def _prompt_messages(
     bundle: ExampleBundle,
     profile: RuleProfile,
     facts: list[dict[str, Any]],
-    session_minutes: int | None,
     *,
     require_runtime_anchor: bool = True,
     batch_index: int | None = None,
@@ -1255,15 +1433,18 @@ def _prompt_messages(
         "Return only one JSON object with keys cards and open_questions. Each card must have "
         "type, title, subtitle, fact_ids, fields, field_sources, and open_questions. Use only "
         "the supplied facts. Every factual claim and every field_sources id must be supported "
-        "by fact_ids. Never invent a rule stat, hidden motive, causal link, fixed player route, "
-        "player dialogue, or outcome. Operational reframing is allowed only when it remains a "
-        "faithful, reversible summary of cited facts. If support is missing, record a short open "
-        "question instead of filling the gap. Generate a coherent one-session working set, not "
+        "by fact_ids. Never invent a rule stat, fixed player route, or player dialogue. "
+        "Operational reframing is allowed when it helps a modern narrative engine run older source "
+        "material. For clock cards, you may create a concise situation track with a starting state, "
+        "progression stages, advancement conditions, visible changes, and an endpoint consequence; "
+        "do not model it as attack counts or numbered actions. Any named source fact still belongs "
+        "in fact_ids, while the clock structure itself may be a GM-facing transformation. If support "
+        "is missing for a factual claim, record a short open question instead of asserting it. Generate a coherent one-session working set, not "
         "one card per fact. Repeating a card type is allowed when the material has multiple "
         "scenes, people, threats, or clocks. All user-facing text must be Chinese."
     )
     anchor_instruction = (
-        "A runtime profile must include at least one scene, investigation_site, or environment card. "
+        "A runtime profile must include at least one location or environment card. "
         if require_runtime_anchor
         else "This is one partial fact batch; do not invent missing context or assume it is the complete chapter. "
     )
@@ -1277,7 +1458,6 @@ def _prompt_messages(
         "[TASK:prep:artifact_draft]\n"
         f"WORKSPACE_ID_JSON={json.dumps(bundle.id, ensure_ascii=False)}\n"
         f"WORKSPACE_NAME_JSON={json.dumps(bundle.name, ensure_ascii=False)}\n"
-        f"SESSION_MINUTES_JSON={json.dumps(session_minutes)}\n"
         f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"ALLOWED_CARD_DEFINITIONS_JSON={json.dumps(definitions, ensure_ascii=False)}\n"
         f"LIST_FIELD_SHAPES_JSON={json.dumps(field_shapes, ensure_ascii=False)}\n"
@@ -1378,15 +1558,36 @@ def _validate_and_build(
                     f"产物 {draft.title} 的 {field_name} 必须是数组"
                 )
 
+        # Some upstreams correctly cite a fact in `field_sources` but omit the
+        # same id from the card-level closure.  When that fact is part of this
+        # request, repair the declaration deterministically; only references
+        # outside the supplied input remain a hard validation error.
         field_sources: dict[str, list[str]] = {}
+        closure = list(draft.fact_ids)
         for field_name in draft.fields:
-            refs = draft.field_sources.get(field_name) or list(draft.fact_ids)
-            outside_card = [item for item in refs if item not in draft.fact_ids]
-            if outside_card:
-                raise ArtifactGenerationError(
-                    f"产物 {draft.title} 的字段 {field_name} 引用了卡外事实: {outside_card}"
+            if field_name == "gm_moves" and not draft.field_sources.get(field_name):
+                # GM moves are explicitly allowed to be authored operating prompts.
+                # They must never silently claim source provenance.
+                field_sources[field_name] = []
+                continue
+            refs = list(
+                dict.fromkeys(
+                    draft.field_sources.get(field_name) or list(draft.fact_ids)
                 )
+            )
+            unknown_refs = [item for item in refs if item not in allowed_facts]
+            if unknown_refs:
+                raise ArtifactGenerationError(
+                    f"产物 {draft.title} 的字段 {field_name} 引用了未提升或不存在的事实: {unknown_refs}"
+                )
+            for fact_id in refs:
+                if fact_id not in closure:
+                    closure.append(fact_id)
             field_sources[field_name] = refs
+        if len(closure) > 100:
+            raise ArtifactGenerationError(
+                f"产物 {draft.title} 的事实闭包超过允许上限"
+            )
 
         cards.append(
             DerivedCard(
@@ -1395,7 +1596,7 @@ def _validate_and_build(
                 type=draft.type,
                 title=draft.title,
                 subtitle=draft.subtitle,
-                fact_ids=draft.fact_ids,
+                fact_ids=closure,
                 fields=draft.fields,
                 field_sources=field_sources,
                 open_questions=draft.open_questions,
@@ -1413,70 +1614,3 @@ def _validate_and_build(
     ):
         raise ArtifactGenerationError("运行板块的产物缺少场景或环境卡")
     return cards, payload.open_questions
-
-
-def generate_artifact_cards(
-    bundle: ExampleBundle,
-    profile: RuleProfile,
-    client,
-    *,
-    session_minutes: int | None = None,
-    request_timeout: int | float | None = None,
-    require_runtime_anchor: bool = True,
-    batch_index: int | None = None,
-    batch_count: int | None = None,
-) -> tuple[list[DerivedCard], list[str]]:
-    facts = _fact_payload(bundle)
-    if not facts:
-        raise ArtifactGenerationError("书架没有可用于生成产物的已提升事实")
-    serialized_facts = json.dumps(facts, ensure_ascii=False)
-    if len(serialized_facts) > MAX_FACT_INPUT_CHARS:
-        raise ArtifactGenerationError(
-            "当前事实范围过大，不能使用单次直出；请通过后台分层生成任务处理"
-        )
-
-    messages = _prompt_messages(
-        bundle,
-        profile,
-        facts,
-        session_minutes,
-        require_runtime_anchor=require_runtime_anchor,
-        batch_index=batch_index,
-        batch_count=batch_count,
-    )
-    last_error: ArtifactGenerationError | None = None
-    for attempt in range(2):
-        request_options = {
-            "temperature": 0.15,
-            "max_tokens": ARTIFACT_MAX_TOKENS,
-        }
-        if request_timeout is not None:
-            request_options["request_timeout"] = request_timeout
-        raw = client.chat_json(messages, **request_options)
-        try:
-            return _validate_and_build(
-                raw,
-                bundle,
-                profile,
-                model_id=getattr(client, "model", "configured-model"),
-                require_runtime_anchor=require_runtime_anchor,
-            )
-        except ArtifactGenerationError as error:
-            last_error = error
-            if attempt == 0:
-                messages.extend(
-                    [
-                        {
-                            "role": "assistant",
-                            "content": json.dumps(raw, ensure_ascii=False),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "The JSON was rejected by deterministic validation: "
-                                f"{error}. Return the complete corrected JSON object only."
-                            ),
-                        },
-                    ]
-                )
-    raise last_error or ArtifactGenerationError("备团产物生成失败")

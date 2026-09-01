@@ -12,8 +12,9 @@ const state = {
   savedState: "seed",
   editingFactId: null,
   editingCardId: null,
-  editingPlanId: null,
+  editingDisplayMaterialId: null,
   factSearch: "",
+  factSourcePage: "",
   factKind: "all",
   factVisibility: "all",
   cardProfile: "all",
@@ -28,19 +29,19 @@ const state = {
     job: null,
     pollTimer: null
   },
-  runtimeProfileId: "cthulhu-dark-2e",
+  runtimeProfileId: null,
   session: null,
   sessionUpdatedAt: null,
   sessionState: "new",
   sessionSaving: false,
   sessionDirty: false,
-  sourcePrep: {file: "", page: 1, start: 1, end: 1, pageCount: null, loadedFile: "", loadedPage: null},
   sourceFiles: [],
   prep: {
     jobs: [],
     config: null,
     models: [],
     uploads: [],
+    uploadItems: [],
     loading: false,
     uploading: false,
     submitting: false,
@@ -57,11 +58,15 @@ const state = {
     sourcePage: "",
     selectedCandidateId: null,
     selectedIds: new Set(),
+    page: 1,
+    pageSize: 50,
     loading: false,
     saving: false,
     error: "",
     notice: ""
-  }
+  },
+  workbenchRefreshToken: 0,
+  workbenchLoading: false
 };
 
 const $ = (id) => document.getElementById(id);
@@ -88,10 +93,25 @@ function formatApiError(payload, fallback = "请求失败") {
   return fallback;
 }
 
+// Errors can contain durable IDs because they are useful to logs and retry
+// diagnostics.  Keep those details out of the GM-facing workbench while
+// preserving the original error object for callers that need it.
+function userFacingError(error, fallback = "请求失败") {
+  const raw = error instanceof Error ? error.message : String(error || "");
+  if (!raw.trim()) return fallback;
+  if (/candidate|候选|fact|事实|card|卡片|plan|场景|workspace|工作区|task|任务|job|作业/i.test(raw)) {
+    if (/rate.?limit|429|temporarily unavailable|上游|限流/i.test(raw)) return "上游服务暂时不可用，请稍后重试。";
+    if (/not found|不存在|missing|缺少|unknown|未知|不属于|invalid|无效/i.test(raw)) return "所选内容已变化，请刷新后重试。";
+    if (/validation|字段|格式|schema/i.test(raw)) return "返回内容格式不完整，请重试该步骤。";
+    return fallback;
+  }
+  return raw.length > 180 ? raw.slice(0, 177) + "..." : raw;
+}
+
 const kindLabels = {
   clue: "线索", npc: "人物", location: "地点", event: "事件",
   threat: "威胁", stakes: "利害", obstacle: "障碍",
-  timeline: "时间线", resource: "资源"
+  timeline: "时间线", resource: "资源", handout: "展示材料"
 };
 const visibilityLabels = {
   explicit: "明示", hidden: "隐藏", inferred: "推断", gm_suggestion: "GM 建议"
@@ -137,6 +157,11 @@ const prepProfileLabels = {
   daggerheart: "奇幻冒险",
   "module-prep": "通用备团"
 };
+const publicProfileIds = {
+  "cthulhu-dark-2e": "reality-horror",
+  daggerheart: "fantasy-adventure",
+  "module-prep": "general-prep"
+};
 const prepProfileDescriptions = {
   "cthulhu-dark-2e": "线索、调查压力、恐怖递进与不可逆代价",
   daggerheart: "场景、环境、意图、压力与动态后果",
@@ -164,6 +189,11 @@ const sessionLogLabels = {
   field_edited: "字段改写"
 };
 const fieldLabels = {
+  normal_state: "地点常态", arrival_description: "抵达描述", relevant_characters: "相关人物",
+  first_triggers: "首次触发", consequences: "后果", display_materials: "展示材料",
+  return_changes: "回访变化", situation: "当前情势", truth: "真相",
+  major_threads: "主要线索链", endings: "结局", key_people: "重要人物",
+  cross_location_clues: "跨地点线索",
   opening_image: "开场画面", immediate_actions: "现场入口（GM 内部）", direct_clues: "直接线索",
   hidden_clues: "隐藏线索", gm_moves: "GM 移动", risk_if_pressed: "施压风险",
   exit_conditions: "退场条件", role: "身份", wants: "想要", offers: "能给什么",
@@ -219,6 +249,15 @@ function factEvidenceStatus(fact) {
   return "source_fact";
 }
 
+function isHandoutFact(fact) {
+  const ids = state.data?.handout_fact_ids || [];
+  return Boolean(fact && (fact.kind === "handout" || ids.includes(fact.id)));
+}
+
+function factKindLabel(fact) {
+  return isHandoutFact(fact) ? kindLabels.handout : label(fact?.kind || "");
+}
+
 function sourceRefLabel(source) {
   if (!source) return "无原文来源";
   const locator = source.locator ? ` · ${source.locator}` : "";
@@ -235,7 +274,13 @@ function reviewSourceRefs(candidate) {
 }
 
 function reviewDisplayText(candidate) {
-  return candidate?.reviewed_text || candidate?.text || "";
+  return candidate?.text || "";
+}
+
+function reviewDisplaySummary(candidate, limit = 180) {
+  const text = reviewDisplayText(candidate);
+  if (text.length <= limit) return text;
+  return text.slice(0, Math.max(1, limit - 1)).trimEnd() + "…";
 }
 
 function prepSpanLabel(span) {
@@ -263,26 +308,76 @@ function prepReviewJobId(value) {
 
 function reviewTaskLabel(task) {
   const pages = Array.isArray(task.source_pages) ? task.source_pages.join(",") : "";
-  return task.id + " · " + sourceBasename(task.source_file) + (pages ? " · p" + pages : "");
+  return "分析窗口 · " + sourceBasename(task.source_file) + (pages ? " · p" + pages : "");
+}
+
+function prepShadowTaskIds() {
+  return new Set((state.prep.jobs || []).flatMap((job) =>
+    (job.windows || []).map((window) => window.shadow_task_id).filter(Boolean)
+  ));
+}
+
+function prepJobForShadowTask(taskId) {
+  return (state.prep.jobs || []).find((job) =>
+    (job.windows || []).some((window) => window.shadow_task_id === taskId)
+  ) || null;
+}
+
+function reviewCandidateLabel(candidate, index = null) {
+  const refs = reviewSourceRefs(candidate);
+  const pages = [...new Set(refs.map((source) => Number(source.page)).filter(Number.isSafeInteger))]
+    .sort((left, right) => left - right);
+  const pageLabel = pages.length ? " · p" + pages.join(",") : "";
+  const ordinal = index == null ? "" : ` ${index + 1}`;
+  return `候选${ordinal} · ${label(candidate?.kind || "")}${pageLabel}`;
+}
+
+function reviewCandidateHistoryLabel(candidateId) {
+  const candidates = state.review.candidates || [];
+  const index = candidates.findIndex((candidate) => candidate.id === candidateId);
+  if (index < 0) return "已替换候选";
+  return reviewCandidateLabel(candidates[index], index);
 }
 
 function reviewPrepJobLabel(job) {
-  const profileName = prepProfileLabels[job.scope?.profile_id] || job.scope?.profile_id || "备团任务";
+  const profileName = prepProfileLabels[job.scope?.profile_id] || "备团任务";
   return profileName + " · " + sourceBasename(job.scope?.source_file) +
     (prepScopeLabel(job) ? " · " + prepScopeLabel(job) : "");
 }
 
-function prepErrorSummary(value) {
+const prepErrorKindLabels = {
+  model_format: "模型格式",
+  upstream_unavailable: "上游服务",
+  input_config: "输入或配置",
+  worker: "后台任务",
+  cancelled: "已取消"
+};
+
+const prepErrorKindSummaries = {
+  model_format: "模型返回格式不兼容，可重试此页段。",
+  upstream_unavailable: "上游服务暂时不可用，可稍后重试。",
+  input_config: "来源或模型配置有误，请检查后重试。",
+  worker: "后台任务未完成，可重试此页段。",
+  cancelled: "该页段已取消。"
+};
+
+function prepErrorSummary(value, errorKind = "") {
   const error = String(value || "").trim();
+  if (prepErrorKindSummaries[errorKind]) return prepErrorKindSummaries[errorKind];
   if (/validation errors for ShadowResponse|model output validation failed/i.test(error)) {
     return "模型返回格式不兼容；任务已保留，可重试此页段。";
   }
   if (/Model is unavailable/i.test(error)) return "当前模型暂时不可用，可稍后重试。";
   if (/HTTP 429|rate.?limit/i.test(error)) return "上游请求过于频繁，可稍后重试。";
   if (/cancelled/i.test(error)) return "该页段已取消。";
-  const firstLine = error.split(/\r?\n/, 1)[0];
-  return firstLine.length > 180 ? firstLine.slice(0, 177) + "..." : firstLine;
+  return userFacingError(error, "该页段处理失败，请重试。");
 }
+
+const prepSegmentationLabels = {
+  pending: "语义分段准备中",
+  succeeded: "已采用语义分段",
+  fallback: "语义分段失败 · 机械兜底"
+};
 
 function updatePrepModelOptions() {
   const options = new Set(state.prep.models || []);
@@ -330,7 +425,11 @@ function renderPrep() {
     : "尚无任务";
 
   const jobsHtml = jobs.map((job) => {
-    const windowsHtml = (job.windows || []).map((window) => {
+    const segmentationStatus = job.segmentation_status || "fallback";
+    const segmentationText = prepSegmentationLabels[segmentationStatus] || segmentationStatus;
+    const windowsHtml = job.segmentation_status === "pending"
+      ? '<div class="prep-segmentation-pending">语义分段准备中；完成后显示语义窗口。</div>'
+      : (job.windows || []).map((window) => {
       const coreSpan = window.core_span || window.page_span;
       const contextLabel = Array.isArray(window.context_pages) && window.context_pages.length
         ? " · 上下文 " + window.context_pages.map((page) => "p" + page).join(", ")
@@ -342,12 +441,13 @@ function renderPrep() {
         ? "needs_review"
         : "neutral";
       const windowAction = window.shadow_task_id && window.candidate_count
-        ? '<button class="edit-button" type="button" data-prep-review-task="' +
-          esc(window.shadow_task_id) + '">复核</button>'
+        ? '<button class="edit-button" type="button" data-prep-review-job="' +
+          esc(job.id) + '">复核</button>'
         : "";
       const error = window.error
-        ? '<details class="prep-window-error"><summary>' + esc(prepErrorSummary(window.error)) +
-          '</summary><pre>' + esc(window.error) + '</pre></details>'
+        ? '<details class="prep-window-error"><summary>' + esc(prepErrorSummary(window.error, window.error_kind)) +
+          '</summary><p class="muted">错误类别：' + esc(prepErrorKindLabels[window.error_kind] || "未分类") +
+          ' · 可在任务操作中重试失败页段。</p><p class="muted prep-technical-error">' + esc(window.error) + '</p></details>'
         : "";
       return '<div class="prep-window-row">' +
         '<span class="page-ref">负责 ' + esc(prepSpanLabel(coreSpan)) + '</span>' +
@@ -357,7 +457,7 @@ function renderPrep() {
           ' ' + badge(prepBoundaryLabels[window.boundary_basis] || window.boundary_basis, boundaryClass) + '</span>' +
         windowAction + error +
         '</div>';
-    }).join("");
+      }).join("");
     const actions = [];
     if (job.status === "running") {
       actions.push('<button class="edit-button danger" type="button" data-prep-action="cancel" data-prep-job-id="' +
@@ -379,17 +479,17 @@ function renderPrep() {
         esc(job.id) + '">删除任务</button>');
     }
     return '<article class="prep-job-item">' +
-      '<div class="prep-job-head"><div><strong>' + esc(prepProfileLabels[job.scope.profile_id] || job.scope.profile_id) +
+      '<div class="prep-job-head"><div><strong>' + esc(prepProfileLabels[job.scope.profile_id] || "备团任务") +
       '</strong><p class="muted">' + esc(job.scope.source_file) + ' · ' + esc(prepScopeLabel(job)) +
       '</p></div><div class="tag-row">' +
       badge(prepJobStatusLabels[job.status] || job.status, job.status) +
       badge("分析 v" + (job.analysis_version || 1), "neutral") +
-      badge(job.scope.session_minutes + " 分钟", "neutral") +
       badge(job.fake_model ? "FakeLLM" : job.model_id, job.fake_model ? "neutral" : "accent") +
       '</div></div>' +
       '<div class="prep-job-progress"><span>' + job.candidate_count + " 条候选" +
       '</span><span>' + job.windows.filter((item) => item.status === "succeeded").length +
-      "/" + job.windows.length + " 个窗口" + '</span></div>' +
+      "/" + job.windows.length + " 个窗口" + '</span><span class="segmentation-status ' +
+      esc(segmentationStatus) + '" title="语义分段只决定窗口边界；失败时使用机械窗口">' + esc(segmentationText) + '</span></div>' +
       '<div class="prep-window-list">' + windowsHtml + '</div>' +
       '<div class="row-actions">' + actions.join("") + '</div>' +
       '</article>';
@@ -447,7 +547,7 @@ async function savePrepConfig(event) {
     await persistPrepConfig();
     $("prep-config-status").textContent = "已保存";
   } catch (error) {
-    $("prep-config-status").textContent = String(error);
+    $("prep-config-status").textContent = userFacingError(error, "模型配置保存失败");
   } finally {
     state.prep.configSaving = false;
   }
@@ -471,7 +571,7 @@ async function testPrepConfig() {
     }
     updatePrepModelOptions();
   } catch (error) {
-    $("prep-config-status").textContent = String(error);
+    $("prep-config-status").textContent = userFacingError(error, "模型连接失败");
   } finally {
     state.prep.configSaving = false;
   }
@@ -495,7 +595,7 @@ async function loadPrepJobs() {
     state.prep.jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
     state.prep.error = "";
   } catch (error) {
-    state.prep.error = String(error);
+    state.prep.error = userFacingError(error, "备团任务加载失败");
   } finally {
     state.prep.loading = false;
     renderPrep();
@@ -582,15 +682,14 @@ async function submitPrepJob(event) {
       body: JSON.stringify({
         source_file: $("prep-job-source").value,
         page_range: $("prep-job-range").value.trim(),
-        profile_id: $("prep-job-profile").value,
-        session_minutes: Number($("prep-job-minutes").value)
+        profile_id: $("prep-job-profile").value
       })
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "备团任务创建失败"));
     await runPrepJob(payload.job.id);
   } catch (error) {
-    state.prep.error = String(error);
+    state.prep.error = userFacingError(error, "备团任务创建失败");
   } finally {
     state.prep.submitting = false;
     renderPrep();
@@ -630,13 +729,44 @@ function formatReviewPageRanges(value) {
 
 function reviewVisibleCandidates() {
   const pageFilter = parseReviewPageRanges(state.review.sourcePage);
-  if (!pageFilter.ranges.length) return pageFilter.valid ? state.review.candidates : [];
-  return state.review.candidates.filter((candidate) =>
+  if (!pageFilter.valid) return [];
+  const candidates = state.review.candidates;
+  if (!pageFilter.ranges.length) return candidates;
+  return candidates.filter((candidate) =>
     reviewSourceRefs(candidate).some((source) => {
       const page = Number(source.page);
       return Number.isSafeInteger(page) && pageFilter.ranges.some(([start, end]) => page >= start && page <= end);
     })
   );
+}
+
+function reviewPageCandidates(candidates) {
+  const pageSize = state.review.pageSize || 50;
+  const pageCount = Math.max(1, Math.ceil(candidates.length / pageSize));
+  state.review.page = Math.min(Math.max(1, state.review.page || 1), pageCount);
+  const start = (state.review.page - 1) * pageSize;
+  return {
+    pageCount,
+    start,
+    items: candidates.slice(start, start + pageSize)
+  };
+}
+
+function renderReviewPagination(total, pageCount, page) {
+  const host = $("review-pagination");
+  if (!host) return;
+  if (!total) {
+    host.innerHTML = "";
+    return;
+  }
+  const start = (page - 1) * (state.review.pageSize || 50) + 1;
+  const end = Math.min(total, page * (state.review.pageSize || 50));
+  const button = (target, text, disabled = false) =>
+    `<button type="button" class="edit-button" data-review-page="${target}" ${disabled ? "disabled" : ""}>${text}</button>`;
+  host.innerHTML =
+    button(page - 1, "上一页", page <= 1) +
+    `<span class="muted">显示 ${start}-${end} / ${total} · 第 ${page} / ${pageCount} 页</span>` +
+    button(page + 1, "下一页", page >= pageCount);
 }
 
 function selectedReviewCandidate() {
@@ -656,7 +786,13 @@ function nextReviewCandidateId(candidateId, excludedIds = new Set()) {
 
 async function refreshReviewAfterMutation({previousFilter, preferredId, acceptedId = null}) {
   state.review.selectedCandidateId = preferredId;
-  await loadReviewQueue();
+  // A page-load request may still be in flight when the user clicks the
+  // batch action. Wait for that request instead of silently skipping the
+  // post-mutation refresh.
+  await loadReviewQueue({waitForExisting: true});
+  if (state.exampleId) {
+    await refreshWorkbenchData();
+  }
   if (previousFilter !== "needs_review" || state.review.reviewState !== "needs_review") return;
   if (state.review.candidates.length) {
     if (!reviewVisibleCandidates().length && state.review.sourcePage) {
@@ -671,12 +807,34 @@ async function refreshReviewAfterMutation({previousFilter, preferredId, accepted
   state.review.sourcePage = "";
   state.review.selectedIds = new Set();
   state.review.selectedCandidateId = acceptedId;
-  state.review.notice = "待复核候选已全部处理。现在可检查已接受内容并送入书架。";
+  state.review.notice = "待复核候选已全部处理；接受的内容已进入书架。";
   await loadReviewQueue();
 }
 
-async function loadReviewQueue() {
-  if (state.review.loading) return;
+function adoptPromotedWorkspace(promotions) {
+  const workspaceId = (Array.isArray(promotions) ? promotions : [])
+    .map((item) => item?.workspace_id)
+    .find((value) => typeof value === "string" && value.trim());
+  if (!workspaceId) return null;
+  state.exampleId = workspaceId;
+  const params = new URLSearchParams(location.search);
+  params.set("example", workspaceId);
+  if (!params.get("view")) params.set("view", "review");
+  history.replaceState(null, "", location.pathname + "?" + params.toString());
+  updateSessionReviewLinks();
+  return workspaceId;
+}
+
+async function loadReviewQueue({waitForExisting = false} = {}) {
+  if (state.review.loading) {
+    if (!waitForExisting) return;
+    for (let attempt = 0; attempt < 200 && state.review.loading; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (state.review.loading) return;
+  }
+  const owningPrepJob = prepJobForShadowTask(state.review.taskId);
+  if (owningPrepJob) state.review.taskId = prepReviewFilterValue(owningPrepJob.id);
   state.review.loading = true;
   state.review.error = "";
   renderReview();
@@ -715,7 +873,7 @@ async function loadReviewQueue() {
       state.review.selectedCandidateId = state.review.candidates[0]?.id || null;
     }
   } catch (error) {
-    state.review.error = String(error);
+    state.review.error = userFacingError(error, "候选队列加载失败");
   } finally {
     state.review.loading = false;
     renderReview();
@@ -732,21 +890,70 @@ async function submitReviewAction(candidateId, reviewState) {
   const reviewedText = reviewedTextInput ? reviewedTextInput.value.trim() : "";
   const reviewNote = reviewNoteInput ? reviewNoteInput.value.trim() : "";
   const payload = {review_state: reviewState};
-  const currentText = candidate.reviewed_text || candidate.text;
+  const currentText = candidate.text || "";
   const currentNote = candidate.review_note || "";
-  if (reviewedText !== currentText) payload.reviewed_text = reviewedText || null;
+  const contentBasisInput = $("review-content-basis");
+  if (reviewedText !== currentText) {
+    payload.text = reviewedText || null;
+    if (!contentBasisInput || contentBasisInput.value === "model_candidate") {
+      state.review.error = "编辑候选内容后，请选择原文事实、可验证推断或 GM 创作作为内容依据。";
+      state.review.saving = false;
+      renderReview();
+      return;
+    }
+  }
   if (reviewNote !== currentNote) payload.review_note = reviewNote || null;
+  if (contentBasisInput && contentBasisInput.value !== (candidate.content_basis || "model_candidate")) {
+    payload.content_basis = contentBasisInput.value;
+  }
+
+  // Content replacement is a separate current-record edit. It must return to
+  // the review queue before a later click can accept or reject it.
+  if (payload.text !== undefined) {
+    state.review.saving = true;
+    state.review.error = "";
+    renderReview();
+    try {
+      const editPayload = {
+        text: payload.text,
+        content_basis: payload.content_basis,
+        review_note: payload.review_note
+      };
+      Object.keys(editPayload).forEach((key) => editPayload[key] === undefined && delete editPayload[key]);
+      const editResponse = await fetch(
+        "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId),
+        {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(editPayload)}
+      );
+      const editResult = await editResponse.json().catch(() => ({}));
+      if (!editResponse.ok) throw new Error(formatApiError(editResult, "候选编辑保存失败"));
+      state.review.notice = "候选内容已保存并退回复核，请再次确认后接受。";
+      await refreshReviewAfterMutation({previousFilter, preferredId: candidateId, acceptedId: null});
+    } catch (error) {
+      state.review.error = userFacingError(error, "候选编辑保存失败");
+    } finally {
+      state.review.saving = false;
+      renderReview();
+    }
+    return;
+  }
 
   state.review.saving = true;
   state.review.error = "";
   renderReview();
   try {
-    const response = await fetch(
-      "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId) + "/review",
-      {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)}
-    );
+    const prepJobId = prepReviewJobId(state.review.taskId);
+    const reviewUrl = prepJobId
+      ? "/api/domain/prep/jobs/" + encodeURIComponent(prepJobId) + "/candidates/review"
+      : "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId) + "/review";
+    const reviewPayload = prepJobId ? {...payload, candidate_ids: [candidateId]} : payload;
+    const response = await fetch(reviewUrl, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(reviewPayload)
+    });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(result, "候选复核保存失败"));
+    adoptPromotedWorkspace(result.promotions);
     state.review.notice = reviewState === "accepted" ? "已接受，继续下一条。" : "已保存，继续下一条。";
     await refreshReviewAfterMutation({
       previousFilter,
@@ -754,7 +961,7 @@ async function submitReviewAction(candidateId, reviewState) {
       acceptedId: reviewState === "accepted" ? (result.candidate?.id || candidateId) : null
     });
   } catch (error) {
-    state.review.error = String(error);
+    state.review.error = userFacingError(error, "候选复核保存失败");
   } finally {
     state.review.saving = false;
     renderReview();
@@ -778,121 +985,172 @@ async function submitReviewBatch() {
   state.review.error = "";
   renderReview();
   try {
-    const prepJobId = prepReviewJobId(state.review.taskId);
-    const reviewUrl = prepJobId
-      ? "/api/domain/prep/jobs/" + encodeURIComponent(prepJobId) + "/candidates/review"
-      : "/api/domain/shadow/review/batch";
-    const chunks = [];
-    for (let index = 0; index < candidateIds.length; index += 100) {
-      chunks.push(candidateIds.slice(index, index + 100));
+    // A prep review filter already identifies the owning job. Use it directly
+    // so promotion cannot silently fall back to the shadow-only endpoint when
+    // the prep-job list is stale or still loading.
+    const selectedPrepJobId = prepReviewJobId(state.review.taskId);
+    const candidateById = new Map(
+      state.review.candidates.map((candidate) => [candidate.id, candidate])
+    );
+    const requestGroups = new Map();
+    if (selectedPrepJobId) {
+      requestGroups.set(`prep:${selectedPrepJobId}`, candidateIds.slice());
+    } else {
+      // "All tasks" may contain both standalone shadow tasks and prep jobs.
+      // Refresh ownership before grouping; never guess that an unknown prep
+      // candidate is a standalone shadow candidate.
+      const prepResponse = await fetch("/api/domain/prep/jobs", {cache: "no-store"});
+      const prepPayload = await prepResponse.json().catch(() => ({}));
+      if (!prepResponse.ok) throw new Error(formatApiError(prepPayload, "备团任务归属加载失败"));
+      const prepJobs = Array.isArray(prepPayload.jobs) ? prepPayload.jobs : [];
+      state.prep.jobs = prepJobs;
+      const prepByShadowTask = new Map();
+      prepJobs.forEach((job) => (job.windows || []).forEach((window) => {
+        if (window.shadow_task_id) prepByShadowTask.set(window.shadow_task_id, job.id);
+      }));
+      for (const candidateId of candidateIds) {
+        const candidate = candidateById.get(candidateId);
+        const prepJobId = prepByShadowTask.get(candidate?.task_id);
+        const key = prepJobId ? `prep:${prepJobId}` : "shadow";
+        if (!prepJobId && !state.review.tasks.some((task) => task.id === candidate?.task_id)) {
+          throw new Error("无法确认候选所属任务，未执行批量复核；请刷新后重试。");
+        }
+        if (!requestGroups.has(key)) requestGroups.set(key, []);
+        requestGroups.get(key).push(candidateId);
+      }
+    }
+    const requests = [];
+    for (const [key, groupIds] of requestGroups) {
+      const prepJobId = prepReviewJobId(key);
+      const reviewUrl = prepJobId
+        ? "/api/domain/prep/jobs/" + encodeURIComponent(prepJobId) + "/candidates/review"
+        : "/api/domain/shadow/review/batch";
+      for (let index = 0; index < groupIds.length; index += 100) {
+        requests.push({reviewUrl, candidateIds: groupIds.slice(index, index + 100)});
+      }
     }
     let processed = 0;
-    for (const chunk of chunks) {
-      const response = await fetch(reviewUrl, {
+    let promotedWorkspaceId = null;
+    const remainingIds = new Set(candidateIds);
+    for (const request of requests) {
+      const response = await fetch(request.reviewUrl, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({...payload, candidate_ids: chunk})
+        body: JSON.stringify({...payload, candidate_ids: request.candidateIds})
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(formatApiError(result, "批量复核保存失败"));
-      processed += chunk.length;
-      state.review.selectedIds = new Set(candidateIds.slice(processed));
+      promotedWorkspaceId = adoptPromotedWorkspace(result.promotions) || promotedWorkspaceId;
+      processed += request.candidateIds.length;
+      request.candidateIds.forEach((candidateId) => remainingIds.delete(candidateId));
+      state.review.selectedIds = new Set(remainingIds);
       state.review.notice = `正在复核 ${processed} / ${candidateIds.length} 条候选。`;
       renderReview();
     }
     state.review.selectedIds = new Set();
     $("review-batch-note").value = "";
-    state.review.notice = `已复核 ${candidateIds.length} 条候选，继续当前队列。`;
+    state.review.notice = payload.review_state === "accepted"
+      ? `已接受并送入书架 ${candidateIds.length} 条候选。`
+      : `已复核 ${candidateIds.length} 条候选，继续当前队列。`;
+    if (promotedWorkspaceId) {
+      await loadWorkspaces();
+      await refreshWorkbenchData();
+    }
     await refreshReviewAfterMutation({
       previousFilter,
       preferredId,
       acceptedId: payload.review_state === "accepted" ? candidateIds[0] : null
     });
   } catch (error) {
-    state.review.error = String(error);
+    state.review.error = userFacingError(error, "批量复核保存失败");
   } finally {
     state.review.saving = false;
     renderReview();
   }
 }
 
-async function promoteReviewCandidate(candidateId, evidenceStatus) {
-  if (state.review.saving) return;
+async function splitReviewCandidate(candidateId) {
+  const candidate = state.review.candidates.find((item) => item.id === candidateId);
+  if (!candidate || state.review.saving) return;
+  const entered = window.prompt(
+    "输入拆分后的候选内容，每行一条（至少两条）",
+    candidate.text || ""
+  );
+  if (entered == null) return;
+  const texts = entered.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  if (texts.length < 2) {
+    state.review.error = "拆分至少需要两条非空候选内容。";
+    renderReview();
+    return;
+  }
   state.review.saving = true;
   state.review.error = "";
   renderReview();
   try {
     const response = await fetch(
-      "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId) + "/promote",
+      "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId) + "/split",
       {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({evidence_status: evidenceStatus})
+        body: JSON.stringify({
+          parts: texts.map((text) => ({
+            text,
+            kind: candidate.kind,
+            source_refs: reviewSourceRefs(candidate),
+            possible_links: candidate.possible_links || [],
+            open_questions: candidate.open_questions || []
+          })),
+          content_basis: "inference",
+          review_note: "由 GM 拆分，需重新复核。"
+        })
       }
     );
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(formatApiError(payload, "候选提升失败"));
-    await Promise.all([loadReviewQueue(), loadPrepJobs(), loadWorkspaces()]);
-    const nextCandidate = reviewVisibleCandidates().find((candidate) =>
-      candidate.id !== candidateId && candidate.review_state === "accepted" && !candidate.promotion
-    );
-    state.review.selectedCandidateId = nextCandidate?.id || candidateId;
-    state.review.notice = nextCandidate
-      ? "已送入书架，继续处理下一条已接受候选。"
-      : "当前已接受候选均已送入书架，可打开对应书架继续生成备团产物。";
+    if (!response.ok) throw new Error(formatApiError(payload, "拆分候选失败"));
+    state.review.selectedIds = new Set();
+    state.review.selectedCandidateId = null;
+    state.review.notice = "候选已拆分，子候选已回到待复核。";
+    await loadReviewQueue();
   } catch (error) {
-    state.review.error = String(error);
+    state.review.error = userFacingError(error, "合并候选失败");
   } finally {
     state.review.saving = false;
     renderReview();
   }
 }
 
-async function promoteReviewBatch() {
-  const candidates = state.review.candidates.filter((candidate) =>
+async function mergeReviewCandidates() {
+  const selected = state.review.candidates.filter((candidate) =>
     state.review.selectedIds.has(candidate.id)
   );
-  if (!candidates.length || state.review.saving) return;
-  if (candidates.some((candidate) => candidate.review_state !== "accepted")) {
-    state.review.error = "批量提升只接受已通过复核的候选。";
-    renderReview();
-    return;
-  }
-  if (candidates.some((candidate) => candidate.promotion)) {
-    state.review.error = "已选内容中包含已经进入书架的候选，请取消选择后再试。";
-    renderReview();
-    return;
-  }
-  const evidenceStatus = $("review-batch-evidence").value;
+  if (selected.length < 2 || state.review.saving) return;
+  const entered = window.prompt(
+    "输入合并后的候选内容",
+    selected.map((candidate) => candidate.text).join("；")
+  );
+  if (entered == null || !entered.trim()) return;
   state.review.saving = true;
   state.review.error = "";
   renderReview();
   try {
-    for (const candidate of candidates) {
-      const response = await fetch(
-        "/api/domain/shadow/candidates/" + encodeURIComponent(candidate.id) + "/promote",
-        {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({evidence_status: evidenceStatus})
-        }
-      );
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(formatApiError(payload, `候选 ${candidate.id} 提升失败`));
-      }
-    }
+    const response = await fetch("/api/domain/shadow/candidates/merge", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        candidate_ids: selected.map((candidate) => candidate.id),
+        text: entered.trim(),
+        content_basis: "inference",
+        review_note: "由 GM 合并，需重新复核。"
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "合并候选失败"));
     state.review.selectedIds = new Set();
-    await Promise.all([loadReviewQueue(), loadPrepJobs(), loadWorkspaces()]);
-    const nextCandidate = reviewVisibleCandidates().find((candidate) =>
-      candidate.review_state === "accepted" && !candidate.promotion
-    );
-    state.review.selectedCandidateId = nextCandidate?.id || candidates[0]?.id || null;
-    state.review.notice = nextCandidate
-      ? `已将 ${candidates.length} 条候选送入书架，继续处理其余已接受候选。`
-      : "当前已接受候选均已送入书架，可打开书架继续生成备团产物。";
+    state.review.selectedCandidateId = payload.candidate?.id || null;
+    state.review.notice = "候选已合并，合并结果已回到待复核。";
+    await loadReviewQueue();
   } catch (error) {
-    state.review.error = String(error);
+    state.review.error = userFacingError(error, "合并候选失败");
   } finally {
     state.review.saving = false;
     renderReview();
@@ -909,7 +1167,9 @@ function cardHasModelCandidate(card) {
 }
 
 function artifactProfileId() {
-  return state.data.prep_context?.profile_id || state.data.bundle.profile_ids[0] || null;
+  return state.data.prep_context?.profile_id ||
+    state.data.bundle.profile_ids.find((id) => profile(id)?.profile_kind === "runtime") ||
+    state.data.bundle.profile_ids[0] || null;
 }
 
 function artifactDraftAvailability() {
@@ -963,9 +1223,66 @@ const artifactJobPhaseLabels = {
   validating: "确定性校验",
   completed: "已完成"
 };
-
+const ARTIFACT_JOB_LABEL = "整板生成";
 function artifactJobInFlight(job = state.artifacts.job) {
   return Boolean(job && ["queued", "running"].includes(job.status));
+}
+
+function setArtifactJob(job) {
+  if (!job) return;
+  state.artifacts.job = job;
+}
+
+function artifactJobMatchesCurrentBoard(job = state.artifacts.job) {
+  return Boolean(job && (!artifactProfileId() || job.profile_id === artifactProfileId()));
+}
+
+function artifactJobRetryable(job = state.artifacts.job) {
+  return Boolean(job?.status === "failed" && artifactJobMatchesCurrentBoard(job));
+}
+
+function artifactJobProgress(job = state.artifacts.job) {
+  if (!job) return null;
+  const ratio = (done, total) => {
+    const numerator = Number(done) || 0;
+    const denominator = Number(total) || 0;
+    return denominator > 0 ? Math.max(0, Math.min(1, numerator / denominator)) : 0;
+  };
+  let value = 0;
+  if (job.status === "completed" || job.phase === "completed") {
+    value = 100;
+  } else if (job.phase === "local_digest") {
+    value = ratio(job.completed_batches, job.batch_count) * 50;
+  } else if (job.phase === "global_plan") {
+    value = 50 + (Number(job.unit_count) > 0 ? 8 : 0);
+  } else if (job.phase === "materializing") {
+    value = 58 + ratio(job.completed_cards, job.planned_card_count) * 37;
+  } else if (job.phase === "validating") {
+    value = 97;
+  } else if (job.phase === "direct_generation") {
+    value = 50;
+  }
+  const phase = artifactJobPhaseLabels[job.phase] || artifactJobStatusLabels[job.status] || job.status;
+  return {value: Math.round(value), label: `${ARTIFACT_JOB_LABEL} · ${phase}`};
+}
+
+function renderArtifactJobProgress(job = state.artifacts.job) {
+  const container = $("artifact-job-progress");
+  const bar = $("artifact-job-progress-bar");
+  const labelElement = $("artifact-job-progress-label");
+  const valueElement = $("artifact-job-progress-value");
+  if (!container || !bar || !labelElement || !valueElement) return;
+  const progress = artifactJobProgress(job);
+  if (!progress) {
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+  bar.value = progress.value;
+  bar.setAttribute("aria-valuenow", String(progress.value));
+  bar.setAttribute("aria-valuetext", `${progress.label} ${progress.value}%`);
+  labelElement.textContent = progress.label;
+  valueElement.textContent = `${progress.value}%`;
 }
 
 function scheduleArtifactPoll() {
@@ -989,7 +1306,7 @@ async function pollArtifactJob({openOnComplete = false} = {}) {
     );
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "产物生成任务状态读取失败"));
-    state.artifacts.job = payload.job || job;
+    setArtifactJob(payload.job || job);
     const current = state.artifacts.job;
     state.artifacts.generating = artifactJobInFlight(current);
     if (current.status === "completed") {
@@ -1010,13 +1327,13 @@ async function pollArtifactJob({openOnComplete = false} = {}) {
       state.artifacts.pollTimer = null;
       state.artifacts.generating = false;
       state.artifacts.error = current.error
-        ? `上次生成在${artifactJobPhaseLabels[current.phase] || "当前阶段"}失败：${current.error}。请点击“重试失败步骤”；已成功完成的步骤会复用。`
-        : "备团产物生成失败。请点击“重试失败步骤”；已成功完成的步骤会复用。";
+        ? `本轮生成在${artifactJobPhaseLabels[current.phase] || "当前阶段"}存在失败项：${current.error}。请使用主按钮统一重试；已成功步骤会复用。`
+        : "本轮备团产物存在失败项。请使用主按钮统一重试；已成功步骤会复用。";
     } else {
       scheduleArtifactPoll();
     }
   } catch (error) {
-    state.artifacts.error = String(error);
+    state.artifacts.error = userFacingError(error, "产物生成任务状态读取失败");
     state.artifacts.generating = artifactJobInFlight();
     scheduleArtifactPoll();
   }
@@ -1025,10 +1342,14 @@ async function pollArtifactJob({openOnComplete = false} = {}) {
 
 async function draftArtifacts() {
   const availability = artifactDraftAvailability();
-  if (!availability.ready || state.artifacts.generating) return;
+  if (state.artifacts.generating) return;
+  if (artifactJobRetryable()) {
+    await retryArtifactJob(state.artifacts.job);
+    return;
+  }
+  if (!availability.ready) return;
   state.artifacts.generating = true;
   state.artifacts.error = "";
-  state.artifacts.job = null;
   renderAll();
   try {
     const response = await fetch(
@@ -1037,8 +1358,8 @@ async function draftArtifacts() {
     );
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "备团产物生成失败"));
-    state.artifacts.job = payload.job || null;
-    if (!state.artifacts.job) throw new Error("服务器没有返回产物生成任务");
+    if (!payload.job) throw new Error("服务器没有返回产物生成任务");
+    setArtifactJob(payload.job);
     state.artifacts.generating = artifactJobInFlight();
     updateWorkStatus(
       state.artifacts.job.status === "completed"
@@ -1048,8 +1369,36 @@ async function draftArtifacts() {
     renderAll();
     await pollArtifactJob({openOnComplete: true});
   } catch (error) {
-    state.artifacts.error = String(error);
+    state.artifacts.error = userFacingError(error, "备团产物生成失败");
     state.artifacts.generating = false;
+    renderAll();
+  }
+}
+
+async function retryArtifactJob(job) {
+  if (!job?.id || state.artifacts.generating) return;
+  state.artifacts.generating = true;
+  state.artifacts.error = "";
+  if (state.artifacts.pollTimer) clearTimeout(state.artifacts.pollTimer);
+  state.artifacts.pollTimer = null;
+  renderAll();
+  try {
+    const response = await fetch(
+      "/api/domain/examples/" + encodeURIComponent(state.exampleId) +
+      "/cards/draft-jobs/" + encodeURIComponent(job.id) + "/retry",
+      {method: "POST"}
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "重试产物任务失败"));
+    if (!payload.job) throw new Error("服务器没有返回重试后的产物任务");
+    setArtifactJob(payload.job);
+    state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
+    updateWorkStatus("已重新排队" + ARTIFACT_JOB_LABEL);
+    renderAll();
+    await pollArtifactJob();
+  } catch (error) {
+    state.artifacts.generating = false;
+    state.artifacts.error = userFacingError(error, "重试产物任务失败");
     renderAll();
   }
 }
@@ -1076,7 +1425,7 @@ async function reviewCards(cardIds, action) {
     showView("cards");
     updateWorkStatus(action === "approve" ? `已批准 ${cardIds.length} 项备团产物` : `已退回 ${cardIds.length} 项产物修改`);
   } catch (error) {
-    state.artifacts.error = String(error);
+    state.artifacts.error = userFacingError(error, "备团产物复核失败");
   } finally {
     state.artifacts.reviewing = false;
     renderAll();
@@ -1096,11 +1445,30 @@ function selectedCardIdsForReview(action) {
 }
 
 function profile(profileId) {
-  return state.data.profiles[profileId];
+  const publicId = publicProfileIds[profileId] || profileId;
+  const item = state.data?.profiles?.[publicId];
+  if (!item) return null;
+  // The API keeps profile ids only as object-map keys.  Restore the key as a
+  // non-enumerable client-only property for existing joins and selectors,
+  // without putting it into any rendered or copied profile payload.
+  if (item.id !== profileId) {
+    Object.defineProperty(item, "id", {
+      value: profileId,
+      enumerable: false,
+      configurable: true
+    });
+  }
+  return item;
 }
 
 function profileDisplayName(profileId) {
   return prepProfileLabels[profileId] || "备团板块";
+}
+
+function factTagsForDisplay(fact) {
+  return (Array.isArray(fact?.tags) ? fact.tags : [])
+    .filter((tag) => !/^prep-(?:cthulhu-dark-2e|daggerheart|module-prep)$/.test(String(tag)))
+    .map((tag) => String(tag));
 }
 
 async function copyKeyword(value) {
@@ -1109,6 +1477,88 @@ async function copyKeyword(value) {
     updateWorkStatus("关键词已复制");
   } catch {
     updateWorkStatus("复制失败，请手动选择文本");
+  }
+}
+
+function displayMaterialForFact(factId) {
+  return (state.data?.bundle?.display_materials || []).find((material) =>
+    (material.source_fact_ids || []).includes(factId)
+  ) || null;
+}
+
+async function createDisplayMaterialFromFact(factId) {
+  if (!state.editMode || !state.exampleId) return;
+  const fact = state.data.bundle.facts.find((item) => item.id === factId);
+  if (!fact || fact.kind !== "handout") return;
+  try {
+    const response = await fetch(`/api/domain/examples/${encodeURIComponent(state.exampleId)}/display-materials`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({source_fact_id: factId})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "建立展示材料失败"));
+    await refreshWorkbenchData();
+    if (payload.material?.id) openDisplayMaterialEditor(payload.material.id);
+    updateWorkStatus(payload.created ? "展示材料已建立，请确认地点或遭遇关联" : "展示材料已存在");
+  } catch (error) {
+    state.artifacts.error = userFacingError(error, "建立展示材料失败");
+    renderAll();
+  }
+}
+
+function openDisplayMaterialEditor(materialId) {
+  const material = (state.data?.bundle?.display_materials || []).find((item) => item.id === materialId);
+  if (!material) return;
+  state.editingDisplayMaterialId = materialId;
+  $("display-material-editor-title").textContent = `展示材料 · ${material.title}`;
+  $("display-material-title").value = material.title;
+  $("display-material-notes").value = material.gm_notes || "";
+  const selectedLinks = new Set((material.links || []).map((link) =>
+    link.card_id ? `${link.plan_id}::card::${link.card_id}` : `${link.plan_id}::beat::${link.beat_id}`
+  ));
+  const options = [];
+  for (const plan of state.data.bundle.plans || []) {
+    for (const cardId of plan.location_card_ids || []) {
+      const card = state.data.bundle.cards.find((item) => item.id === cardId);
+      if (!card) continue;
+      const value = `${plan.id}::card::${card.id}`;
+      options.push(`<option value="${esc(value)}" ${selectedLinks.has(value) ? "selected" : ""}>${esc(plan.title)} · 地点：${esc(card.title)}</option>`);
+    }
+    for (const beat of plan.beats || []) {
+      const value = `${plan.id}::beat::${beat.id}`;
+      options.push(`<option value="${esc(value)}" ${selectedLinks.has(value) ? "selected" : ""}>${esc(plan.title)} · ${esc(beat.title)}</option>`);
+    }
+  }
+  $("display-material-links").innerHTML = options.join("") || '<option disabled>请先组装运行场景</option>';
+  $("display-material-source").innerHTML = (material.source_refs || []).map((source) => esc(sourceRefLabel(source))).join("；");
+  $("display-material-editor-error").textContent = "";
+  openModal("display-material");
+}
+
+async function submitDisplayMaterialEditor(event) {
+  event.preventDefault();
+  const material = (state.data?.bundle?.display_materials || []).find((item) => item.id === state.editingDisplayMaterialId);
+  if (!material) return;
+  const links = [...$("display-material-links").selectedOptions]
+    .map((option) => String(option.value).split("::"))
+    .filter((parts) => parts.length === 3)
+    .map(([plan_id, targetType, targetId]) => targetType === "card"
+      ? {plan_id, card_id: targetId}
+      : {plan_id, beat_id: targetId});
+  try {
+    const response = await fetch(`/api/domain/examples/${encodeURIComponent(state.exampleId)}/display-materials/${encodeURIComponent(material.id)}`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({title: $("display-material-title").value.trim(), gm_notes: $("display-material-notes").value.trim(), links})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "保存展示材料失败"));
+    await refreshWorkbenchData();
+    closeModal();
+    updateWorkStatus("展示材料已保存");
+  } catch (error) {
+    $("display-material-editor-error").textContent = userFacingError(error, "保存展示材料失败");
   }
 }
 
@@ -1126,7 +1576,13 @@ function bundleProfiles() {
 
 function profileDefinition(profileId, cardType) {
   const item = profile(profileId)?.card_definitions.find((def) => def.type === cardType);
-  return item || { type: cardType, display_name: cardType, required_fields: [], optional_fields: [] };
+  return item || {
+    type: cardType,
+    display_name: "备团卡",
+    description: "当前卡型定义不可用。",
+    required_fields: [],
+    optional_fields: []
+  };
 }
 
 function badge(text, cssClass = "") {
@@ -1157,9 +1613,8 @@ function setDirty(value) {
 function openModal(formName) {
   $("editor-modal").hidden = false;
   $("plan-draft-editor").hidden = formName !== "plan-draft";
-  $("plan-editor").hidden = formName !== "plan";
-  $("source-prep-editor").hidden = formName !== "source-prep";
   $("fact-editor").hidden = formName !== "fact";
+  $("display-material-editor").hidden = formName !== "display-material";
   $("card-editor").hidden = formName !== "card";
 }
 
@@ -1167,15 +1622,16 @@ function closeModal() {
   $("editor-modal").hidden = true;
   state.editingFactId = null;
   state.editingCardId = null;
+  state.editingDisplayMaterialId = null;
   $("fact-editor-error").textContent = "";
   $("card-editor-error").textContent = "";
   $("plan-draft-error").textContent = "";
-  $("plan-editor-error").textContent = "";
-  $("source-prep-error").textContent = "";
+  const displayMaterialError = $("display-material-editor-error");
+  if (displayMaterialError) displayMaterialError.textContent = "";
 }
 
 const planCardTypes = [
-  "scene", "investigation_site", "environment", "scene_extract", "npc", "character", "character_function",
+  "scene", "investigation_site", "location", "environment", "scene_extract", "chapter_overview", "npc", "character", "character_function",
   "threat", "enemy", "anomaly", "clock", "operation_clock", "encounter_clock"
 ];
 
@@ -1235,7 +1691,7 @@ function scenePlanAvailability() {
         : "当前书架尚无可编排产物。请先完成产物生成与复核。"
     };
   }
-  const hasScene = cards.some((card) => ["scene", "investigation_site", "environment"].includes(card.type));
+  const hasScene = cards.some((card) => ["location", "environment"].includes(card.type));
   if (!hasScene) {
     return {
       ready: false,
@@ -1249,7 +1705,7 @@ function scenePlanAvailability() {
     profileId,
     cards,
     guidance: context
-      ? `沿用当前备团任务的来源、页范围、${profileDisplayName(profileId)}板块与 ${context.session_minutes} 分钟时长，自动纳入 ${cards.length} 项已批准产物。`
+      ? `沿用当前备团任务的来源、页范围与${profileDisplayName(profileId)}板块，自动纳入 ${cards.length} 项已批准产物。`
       : `从当前书架的来源引用恢复范围，并自动纳入 ${cards.length} 项已确认产物。`
   };
 }
@@ -1281,7 +1737,6 @@ function openPlanDraftEditor() {
     <div><span>来源</span><strong>${esc(sourceName)}</strong></div>
     <div><span>备团范围</span><strong>${esc(pageRange)}</strong></div>
     <div><span>目标板块</span><strong>${esc(profileDisplayName(availability.profileId))}</strong></div>
-    <div><span>本次时长</span><strong>${context ? `${esc(context.session_minutes)} 分钟` : "沿用书架"}</strong></div>
   `;
   renderPlanCardPicker(availability.cards);
   $("plan-draft-error").textContent = "";
@@ -1289,136 +1744,37 @@ function openPlanDraftEditor() {
   openModal('plan-draft');
 }
 
-function sourcePagesForFile(file) {
-  return state.data.bundle.facts
-    .flatMap((fact) => factSourceRefs(fact)
-      .filter((source) => source.file === file)
-      .map((source) => source.page))
-    .filter((page) => Number.isInteger(page) && page > 0);
+function formatFileSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) return "大小未知";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function openSourcePrep() {
-  const knownFile = primarySource(state.data.bundle.facts[0])?.file;
-  const file = state.sourceFiles.includes(knownFile) ? knownFile : "";
-  const pages = sourcePagesForFile(file);
-  const start = pages.length ? Math.min(...pages) : 1;
-  const end = pages.length ? Math.max(...pages) : start;
-  state.sourcePrep = {file, page: start, start, end, pageCount: null, loadedFile: "", loadedPage: null};
-  $("prep-source-file").value = file;
-  $("prep-start-page").value = start;
-  $("prep-end-page").value = end;
-  $("prep-page").value = start;
-  $("prep-fact-text").value = "";
-  $("prep-fact-kind").value = "clue";
-  $("prep-fact-visibility").value = "explicit";
-  $("prep-fact-locator").value = "";
-  $("prep-fact-tags").value = "";
-  $("prep-page-status").textContent = "正在读取原文页…";
-  openModal("source-prep");
-  loadPrepPage();
-}
-
-function openSourceReference(file, page) {
-  if (!state.sourceFiles.includes(file)) return;
-  const pages = sourcePagesForFile(file);
-  const start = pages.length ? Math.min(...pages) : Math.max(1, Number(page) || 1);
-  const end = pages.length ? Math.max(...pages) : start;
-  const selectedPage = Math.max(start, Math.min(end, Number(page) || start));
-  state.sourcePrep = {
-    file,
-    page: selectedPage,
-    start,
-    end,
-    pageCount: null,
-    loadedFile: "",
-    loadedPage: null
-  };
-  $("prep-source-file").value = file;
-  $("prep-start-page").value = start;
-  $("prep-end-page").value = end;
-  $("prep-page").value = selectedPage;
-  $("prep-page-status").textContent = "正在读取原文页…";
-  openModal("source-prep");
-  loadPrepPage();
-}
-
-function resetSourcePrepPageRange(file) {
-  const pages = sourcePagesForFile(file);
-  const start = pages.length ? Math.min(...pages) : 1;
-  const end = pages.length ? Math.max(...pages) : start;
-  state.sourcePrep = {file, page: start, start, end, pageCount: null, loadedFile: "", loadedPage: null};
-  $("prep-start-page").value = start;
-  $("prep-end-page").value = end;
-  $("prep-page").value = start;
-  $("prep-source-image").removeAttribute("src");
-  $("prep-source-text").textContent = "";
-  $("prep-page-status").textContent = file ? "正在读取原文页…" : "请选择来源 PDF";
-}
-
-function syncSourcePrepFromForm() {
-  const file = $("prep-source-file").value.trim();
-  if (file !== state.sourcePrep.file) {
-    state.sourcePrep.file = file;
-    state.sourcePrep.pageCount = null;
-    state.sourcePrep.loadedFile = "";
-    state.sourcePrep.loadedPage = null;
-  }
-  state.sourcePrep.page = Math.max(1, Number($("prep-page").value) || 1);
-  state.sourcePrep.start = Math.max(1, Number($("prep-start-page").value) || state.sourcePrep.page);
-  state.sourcePrep.end = Math.max(state.sourcePrep.start, Number($("prep-end-page").value) || state.sourcePrep.page);
-  $("prep-page").value = state.sourcePrep.page;
-  $("prep-start-page").value = state.sourcePrep.start;
-  $("prep-end-page").value = state.sourcePrep.end;
-}
-
-async function loadPrepPage() {
-  syncSourcePrepFromForm();
-  const {file, page} = state.sourcePrep;
-  const requestedPage = page;
-  const image = $("prep-source-image");
-  const text = $("prep-source-text");
-  if (!file) {
-    state.sourcePrep.pageCount = null;
-    state.sourcePrep.loadedFile = "";
-    state.sourcePrep.loadedPage = null;
-    image.removeAttribute("src");
-    text.textContent = "请选择一个来源 PDF。";
-    $("prep-page-status").textContent = "请选择来源 PDF";
+function renderSourceFiles() {
+  const host = $("prep-source-file-list");
+  if (!host) return;
+  const items = state.prep.uploadItems || [];
+  if (!items.length) {
+    host.innerHTML = '<div class="empty-state prep-source-empty">尚未上传 PDF。</div>';
     return;
   }
-  $("prep-page-status").textContent = "正在读取原文页…";
-  try {
-    const response = await fetch("/api/domain/source-page?file=" + encodeURIComponent(file) + "&page=" + page, {cache: "no-store"});
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || "HTTP " + response.status);
-    state.sourcePrep.pageCount = payload.page_count;
-    state.sourcePrep.start = Math.min(state.sourcePrep.start, payload.page_count);
-    state.sourcePrep.end = Math.min(Math.max(state.sourcePrep.start, state.sourcePrep.end), payload.page_count);
-    state.sourcePrep.page = Math.min(Math.max(state.sourcePrep.start, state.sourcePrep.page), state.sourcePrep.end);
-    $("prep-page").value = state.sourcePrep.page;
-    $("prep-start-page").value = state.sourcePrep.start;
-    $("prep-end-page").value = state.sourcePrep.end;
-    if (state.sourcePrep.page !== requestedPage) {
-      return loadPrepPage();
-    }
-    state.sourcePrep.loadedFile = file;
-    state.sourcePrep.loadedPage = state.sourcePrep.page;
-    image.src = payload.image_data;
-    text.textContent = payload.text || "该页没有可提取的文本层，请以图片为准。";
-    const shownPage = state.sourcePrep.page;
-    recordSourcePageOpen(file, shownPage, "source_prep");
-    if (hasActiveRuntime()) renderRuntime();
-    $("prep-page-status").textContent = "第 " + shownPage + " 页 / 共 " + payload.page_count + " 页";
-    $("prep-prev-page").disabled = shownPage <= state.sourcePrep.start;
-    $("prep-next-page").disabled = shownPage >= Math.min(state.sourcePrep.end, payload.page_count);
-  } catch (error) {
-    state.sourcePrep.pageCount = null;
-    state.sourcePrep.loadedFile = "";
-    state.sourcePrep.loadedPage = null;
-    image.removeAttribute("src");
-    text.textContent = String(error);
-    $("prep-page-status").textContent = "原文页读取失败";
-  }
+  host.innerHTML = items.map((item) => {
+    const references = Array.isArray(item.references) ? item.references : [];
+    const referenceText = item.referenced
+      ? `正在使用 · ${references.slice(0, 3).map((ref) => ref.label || ref.kind || "已引用").join("、")}`
+      : "未被任务或书架引用，可删除";
+    const referenceDetail = references.length > 3 ? ` 等 ${references.length} 处` : "";
+    return `<article class="prep-source-item">
+      <div class="prep-source-item-main">
+        <strong title="${esc(item.file)}">${esc(item.original_name || sourceBasename(item.file))}</strong>
+        <span class="muted">${item.page_count ? `${item.page_count} 页` : "页数未知"} · ${formatFileSize(item.size_bytes)}</span>
+        <span class="prep-source-reference ${item.referenced ? "referenced" : "available"}">${esc(referenceText + referenceDetail)}</span>
+      </div>
+      <button type="button" class="edit-button danger" data-source-delete="${esc(item.file)}" ${item.referenced ? "disabled" : ""} title="${item.referenced ? "文件仍被使用，不能删除" : "删除这个已上传 PDF"}">删除</button>
+    </article>`;
+  }).join("");
 }
 
 async function loadSourceFiles() {
@@ -1429,6 +1785,16 @@ async function loadSourceFiles() {
   state.prep.uploads = Array.isArray(payload.uploads)
     ? payload.uploads
     : state.sourceFiles.filter((file) => file.startsWith("data/uploads/"));
+  state.prep.uploadItems = Array.isArray(payload.upload_items)
+    ? payload.upload_items
+    : state.prep.uploads.map((file) => ({
+      file,
+      original_name: sourceBasename(file),
+      page_count: null,
+      size_bytes: null,
+      referenced: false,
+      references: []
+    }));
   const resources = Array.isArray(payload.resources)
     ? payload.resources
     : state.sourceFiles.filter((file) => file.startsWith("Resource/"));
@@ -1436,19 +1802,13 @@ async function loadSourceFiles() {
     '<option value="' + esc(file) + '">' + esc(file.split("/").pop()) + '</option>'
   ).join("");
 
-  const prepSelect = $("prep-source-file");
-  const prepSelected = prepSelect.value;
-  prepSelect.innerHTML = '<option value="">选择来源 PDF</option>' +
-    (state.prep.uploads.length ? '<optgroup label="已上传">' + optionItems(state.prep.uploads) + '</optgroup>' : '') +
-    (resources.length ? '<optgroup label="内置参考">' + optionItems(resources) + '</optgroup>' : '');
-  if (state.sourceFiles.includes(prepSelected)) prepSelect.value = prepSelected;
-
   const jobSelect = $("prep-job-source");
   const jobSelected = jobSelect.value;
   jobSelect.innerHTML = '<option value="">' +
     (state.prep.uploads.length ? '选择已上传 PDF' : '请先上传 PDF') + '</option>' +
     optionItems(state.prep.uploads);
   if (state.prep.uploads.includes(jobSelected)) jobSelect.value = jobSelected;
+  renderSourceFiles();
 }
 
 async function loadWorkspaces() {
@@ -1460,40 +1820,47 @@ async function loadWorkspaces() {
 }
 
 async function refreshWorkbenchData() {
-  if (!state.exampleId) {
-    state.data = null;
-    state.artifacts.job = null;
-    state.artifacts.generating = false;
-    fillWorkspaceSelector();
-    renderEmptyWorkspace();
-    return;
+  const refreshToken = ++state.workbenchRefreshToken;
+  state.workbenchLoading = true;
+  try {
+    if (!state.exampleId) {
+      state.data = null;
+      state.artifacts.job = null;
+      state.artifacts.generating = false;
+      fillWorkspaceSelector();
+      renderEmptyWorkspace();
+      return;
+    }
+    const previousProfile = state.cardProfile;
+    const previousType = state.cardType;
+    const response = await fetch(
+      `/api/domain/workbench?example=${encodeURIComponent(state.exampleId)}`,
+      {cache: "no-store"}
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "书架刷新失败"));
+    if (refreshToken !== state.workbenchRefreshToken) return;
+    state.data = payload;
+    state.savedAt = payload.saved_at;
+    state.savedState = payload.saved_state;
+    state.artifacts.job = payload.artifact_job || null;
+    state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
+    scheduleArtifactPoll();
+    fillSelectors();
+    if (previousProfile === "all" || bundleProfiles().some((item) => item.id === previousProfile)) {
+      state.cardProfile = previousProfile;
+      $("card-profile").value = previousProfile;
+      refreshCardTypes();
+    }
+    if ([...$("card-type").options].some((option) => option.value === previousType)) {
+      state.cardType = previousType;
+      $("card-type").value = previousType;
+    }
+    await loadSession();
+    renderAll();
+  } finally {
+    if (refreshToken === state.workbenchRefreshToken) state.workbenchLoading = false;
   }
-  const previousProfile = state.cardProfile;
-  const previousType = state.cardType;
-  const response = await fetch(
-    `/api/domain/workbench?example=${encodeURIComponent(state.exampleId)}`,
-    {cache: "no-store"}
-  );
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(formatApiError(payload, "书架刷新失败"));
-  state.data = payload;
-  state.savedAt = payload.saved_at;
-  state.savedState = payload.saved_state;
-  state.artifacts.job = payload.artifact_job || null;
-  state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
-  scheduleArtifactPoll();
-  fillSelectors();
-  if (previousProfile === "all" || bundleProfiles().some((item) => item.id === previousProfile)) {
-    state.cardProfile = previousProfile;
-    $("card-profile").value = previousProfile;
-    refreshCardTypes();
-  }
-  if ([...$("card-type").options].some((option) => option.value === previousType)) {
-    state.cardType = previousType;
-    $("card-type").value = previousType;
-  }
-  await loadSession();
-  renderAll();
 }
 
 function renderEmptyWorkspace() {
@@ -1501,10 +1868,17 @@ function renderEmptyWorkspace() {
   if (status) { status.className = "status"; status.textContent = "请选择书架工作区"; }
   const panel = $("global-error");
   if (panel) { panel.hidden = true; panel.textContent = ""; }
-  ["shelf-summary", "bundle-detail", "coverage-audit", "fact-grid", "work-card-grid", "plan-list", "scene-holder", "beat-holder", "runtime-exploration-list", "profile-grid"].forEach((id) => {
+  ["shelf-summary", "bundle-detail", "fact-grid", "plan-list", "scene-holder", "beat-holder", "runtime-exploration-list", "profile-grid"].forEach((id) => {
     const element = $(id);
     if (element) element.innerHTML = '<div class="empty-state">请先从书架选择一个工作区。</div>';
   });
+  state.editMode = false;
+  $("edit-toggle").classList.remove("active");
+  $("edit-toggle").disabled = true;
+  $("save-bundle").hidden = true;
+  $("reset-bundle").hidden = true;
+  $("export-bundle").hidden = true;
+  $("create-card").hidden = true;
 }
 
 function fillWorkspaceSelector() {
@@ -1614,79 +1988,38 @@ async function uploadPrepSource() {
     body.append("file", file, file.name);
     const response = await fetch("/api/domain/source-files", {method: "POST", body});
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || "PDF 上传失败");
+    if (!response.ok) throw new Error(formatApiError(payload, "PDF 上传失败"));
     await loadSourceFiles();
     $("prep-job-source").value = payload.file;
     $("prep-source-upload-status").textContent =
       "已上传 · " + payload.page_count + " 页 · " + payload.original_name;
     input.value = "";
   } catch (error) {
-    $("prep-source-upload-status").textContent = String(error);
+    $("prep-source-upload-status").textContent = userFacingError(error, "来源上传失败");
   } finally {
     state.prep.uploading = false;
     renderPrep();
   }
 }
 
-function shiftPrepPage(delta) {
-  syncSourcePrepFromForm();
-  const max = state.sourcePrep.pageCount || state.sourcePrep.end;
-  state.sourcePrep.page = Math.max(state.sourcePrep.start, Math.min(Math.min(state.sourcePrep.end, max), state.sourcePrep.page + delta));
-  $("prep-page").value = state.sourcePrep.page;
-  loadPrepPage();
-}
-
-function createFactFromPrep() {
-  if (!state.editMode) {
-    $("source-prep-error").textContent = "请先打开编辑模式，再把确认过的内容保存为事实。";
-    return;
+async function deletePrepSource(file) {
+  const item = (state.prep.uploadItems || []).find((entry) => entry.file === file);
+  if (!item || item.referenced) return;
+  if (!window.confirm(`删除已上传文件“${item.original_name || sourceBasename(file)}”？`)) return;
+  state.prep.error = "";
+  try {
+    const response = await fetch("/api/domain/source-files/delete?file=" + encodeURIComponent(file), {
+      method: "POST"
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "上传文件删除失败"));
+    if ($("prep-job-source").value === file) $("prep-job-source").value = "";
+    await loadSourceFiles();
+    $("prep-source-upload-status").textContent = "已删除上传文件";
+  } catch (error) {
+    state.prep.error = userFacingError(error, "上传文件删除失败");
+    renderPrep();
   }
-  syncSourcePrepFromForm();
-  if (!state.sourcePrep.file) {
-    $("source-prep-error").textContent = "先指定一个真实 PDF 来源。";
-    return;
-  }
-  if (!state.sourcePrep.pageCount || state.sourcePrep.loadedFile !== state.sourcePrep.file || state.sourcePrep.loadedPage !== state.sourcePrep.page) {
-    $("source-prep-error").textContent = "请先成功读取当前页，再把事实加入事实网。";
-    return;
-  }
-  const text = $("prep-fact-text").value.trim();
-  if (!text) {
-    $("source-prep-error").textContent = "先写下你确认过的短事实；原文预览不会自动变成事实。";
-    return;
-  }
-  const source = {
-    file: state.sourcePrep.file,
-    page: state.sourcePrep.page,
-    locator: $("prep-fact-locator").value.trim() || null
-  };
-  const fact = {
-    id: uniqueId("fact_custom_", state.data.bundle.facts),
-    source,
-    source_refs: [source],
-    evidence_status: "source_fact",
-    text,
-    kind: $("prep-fact-kind").value,
-    visibility: $("prep-fact-visibility").value,
-    links: [],
-    tags: csvValues($("prep-fact-tags").value)
-  };
-  state.data.bundle.facts.push(fact);
-  recordFieldChanges('fact', fact.id, {}, fact);
-  setDirty(true);
-  $("prep-fact-text").value = "";
-  $("prep-fact-locator").value = "";
-  $("prep-fact-tags").value = "";
-  $("source-prep-error").textContent = "已加入未保存事实；可以继续浏览下一页。";
-  renderFacts();
-}
-
-function openPlanEditor(planId) {
-  const plan = state.data.bundle.plans.find((item) => item.id === planId);
-  if (!plan) return;
-  state.editingPlanId = planId;
-  $("plan-json").value = JSON.stringify(plan, null, 2);
-  openModal('plan');
 }
 
 async function submitPlanDraft(event) {
@@ -1698,7 +2031,7 @@ async function submitPlanDraft(event) {
       method: 'POST'
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || 'HTTP ' + response.status);
+    if (!response.ok) throw new Error(formatApiError(payload, "运行场景组装失败"));
     state.data.bundle.plans = state.data.bundle.plans.filter((plan) => plan.id !== payload.plan.id);
     state.data.bundle.plans.push(payload.plan);
     state.savedState = 'saved';
@@ -1710,40 +2043,8 @@ async function submitPlanDraft(event) {
     showView("shelf");
     updateWorkStatus('已保存草案；请检查节拍与开场描述，再点击“开始运行”');
   } catch (error) {
-    $("plan-draft-error").textContent = String(error);
+    $("plan-draft-error").textContent = userFacingError(error, "运行场景组装失败");
     submitButton.disabled = false;
-  }
-}
-
-async function submitPlanEditor(event) {
-  event.preventDefault();
-  let edited;
-  try { edited = JSON.parse($("plan-json").value); } catch (error) {
-    $("plan-editor-error").textContent = 'JSON 错误：' + error.message;
-    return;
-  }
-  const planIndex = state.data.bundle.plans.findIndex((plan) => plan.id === state.editingPlanId);
-  if (planIndex < 0) return;
-  const previousPlan = state.data.bundle.plans[planIndex];
-  const plans = state.data.bundle.plans.slice();
-  plans[planIndex] = edited;
-  const candidate = {...state.data.bundle, plans};
-  try {
-    const response = await fetch('/api/domain/examples/' + encodeURIComponent(state.exampleId) + '/bundle', {
-      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(candidate)
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || 'HTTP ' + response.status);
-    state.data.bundle.plans = plans;
-    state.savedAt = payload.saved_at;
-    state.savedState = 'saved';
-    await loadSession();
-    recordFieldChanges('plan', edited.id, previousPlan, edited);
-    closeModal();
-    renderAll();
-    updateWorkStatus('场景计划已保存');
-  } catch (error) {
-    $("plan-editor-error").textContent = String(error);
   }
 }
 
@@ -1762,42 +2063,11 @@ function openFactEditor(factId) {
   $("fact-page").value = source?.page || "";
   $("fact-locator").value = source?.locator || "";
   $("fact-source-file").value = source?.file || "";
-  $("fact-source-preview").hidden = true;
   $("fact-tags").value = fact.tags.join(", ");
   $("fact-links").value = fact.links.join(", ");
   $("fact-notes").value = fact.notes || "";
   $("fact-editor-error").textContent = "";
   openModal("fact");
-}
-
-async function previewFactSource() {
-  const fact = state.data.bundle.facts.find((item) => item.id === state.editingFactId);
-  if (!fact) return;
-  const preview = $("fact-source-preview");
-  const text = $("fact-source-text");
-  const image = $("fact-source-image");
-  text.textContent = "正在读取原文页…";
-  preview.hidden = false;
-  try {
-    const page = Number($("fact-page").value);
-    const file = $("fact-source-file").value.trim();
-    if (!file || !Number.isInteger(page) || page < 1) {
-      throw new Error("A PDF source file and page are required for preview.");
-    }
-    const response = await fetch(
-      "/api/domain/source-page?file=" + encodeURIComponent(file) + "&page=" + page,
-      {cache: "no-store"}
-    );
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || "HTTP " + response.status);
-    image.src = payload.image_data;
-    text.textContent = payload.text || "该页没有可提取的文本层，请以图片为准。";
-    recordSourcePageOpen(file, page, "fact_preview");
-    if (hasActiveRuntime()) renderRuntime();
-  } catch (error) {
-    image.removeAttribute("src");
-    text.textContent = String(error);
-  }
 }
 
 function submitFactEditor(event) {
@@ -1896,7 +2166,7 @@ async function submitCardEditor(event) {
     $("card-editor-error").textContent = "这张卡已被其他板块的场景计划引用，不能跨板块改写。";
     return;
   }
-  const sceneTypes = ["scene", "investigation_site", "environment"];
+  const sceneTypes = ["location", "environment"];
   if (affectedPlans.some((plan) => sceneTypes.includes(card.type) && !sceneTypes.includes(cardType))) {
     $("card-editor-error").textContent = "这张卡是计划的场景卡，不能改成非场景卡型。";
     return;
@@ -1905,7 +2175,7 @@ async function submitCardEditor(event) {
   try {
     fields = JSON.parse($("card-fields").value);
   } catch (error) {
-    $("card-editor-error").textContent = `JSON 错误：${error.message}`;
+    $("card-editor-error").textContent = `JSON 错误：${userFacingError(error, "格式无效")}`;
     return;
   }
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
@@ -1959,27 +2229,6 @@ function uniqueId(prefix, collection) {
   return `${prefix}${index}`;
 }
 
-function createFact() {
-  const facts = state.data.bundle.facts;
-  const fact = {
-    id: uniqueId("fact_custom_", facts),
-    source: null,
-    source_refs: [],
-    evidence_status: "gm_authored",
-    text: "新事实：写下这条场景事实。",
-    kind: "clue",
-    visibility: "gm_suggestion",
-    links: [],
-    tags: ["自定义"]
-  };
-  facts.push(fact);
-  setDirty(true);
-  showView("facts");
-  renderAll();
-  openFactEditor(fact.id);
-  updateWorkStatus("已新建事实");
-}
-
 function deleteFact(factId) {
   const fact = state.data.bundle.facts.find((item) => item.id === factId);
   if (!fact || !confirm(`删除事实“${fact.text.slice(0, 24)}…”？引用它的备团产物会移除该来源。`)) return;
@@ -2008,9 +2257,8 @@ function createCard() {
   const preferredProfileId = state.cardProfile !== "all"
     && enabledProfileIds.has(state.cardProfile)
     ? state.cardProfile
-    : (enabledProfileIds.has("cthulhu-dark-2e")
-      ? "cthulhu-dark-2e"
-      : bundleProfiles()[0]?.id);
+    : (bundleProfiles().find((item) => item.profile_kind === "runtime")?.id ||
+      bundleProfiles()[0]?.id);
   const selectedProfile = profiles[preferredProfileId];
   if (!selectedProfile) return;
   const preferredType = state.cardType !== "all" &&
@@ -2076,12 +2324,12 @@ async function deleteCard(cardId) {
       {method: "DELETE"}
     );
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || "备团产物删除失败");
+    if (!response.ok) throw new Error(formatApiError(payload, "备团产物删除失败"));
     state.selectedCardIds.delete(cardId);
     await refreshWorkbenchData();
     updateWorkStatus("已删除备团产物草案");
   } catch (error) {
-    state.artifacts.error = String(error);
+    state.artifacts.error = userFacingError(error, "备团产物复核失败");
     renderAll();
   }
 }
@@ -2142,17 +2390,9 @@ function sourceHtml(factIds) {
   const lines = cited.map((fact) => {
     const refs = factSourceRefs(fact);
     const source = refs.length ? refs.map(sourceRefLabel).join("; ") : "无原文来源";
-    const sourceButtons = refs
-      .filter((item) => state.sourceFiles.includes(item.file))
-      .map((item) =>
-        '<button class="edit-button" type="button" data-open-source-file="' + esc(item.file) +
-        '" data-open-source-page="' + esc(item.page) + '">查看 p' + esc(item.page) + '</button>'
-      )
-      .join("");
     return '<li>' + esc(fact.text) + ' <button type="button" class="icon-button" title="复制事实关键词" data-copy-keyword="' + esc(fact.text) + '">复制</button> ' +
       badge(label(factEvidenceStatus(fact)), factEvidenceStatus(fact)) +
       ' <span class="page-ref">' + esc(source) + '</span>' +
-      (sourceButtons ? '<div class="row-actions">' + sourceButtons + '</div>' : '') +
       '</li>';
   }).join("");
   return `<details class="field"><summary class="field-label">来源事实</summary><ul>${lines}</ul></details>`;
@@ -2167,6 +2407,27 @@ function runtimeCards(cardTypes) {
     cardTypes.includes(card.type) &&
     (!planCardIds || planCardIds.has(card.id))
   );
+}
+
+function runtimeSceneCards() {
+  return runtimeCards(["location", "environment"]);
+}
+
+function runtimeConfirmedSceneCards() {
+  const plan = currentPlan();
+  if (!plan) return [];
+  const planCardIds = new Set(plan.card_ids || []);
+  const planCards = (state.data?.bundle?.cards || []).filter((card) =>
+    card.profile_id === state.runtimeProfileId && planCardIds.has(card.id)
+  );
+  if (plan.navigation_mode === "location") {
+    const locationIds = new Set(plan.location_card_ids || []);
+    return planCards.filter((card) => locationIds.has(card.id));
+  }
+  const beat = currentBeat();
+  if (!beat) return planCards;
+  const beatCardIds = new Set(beat.card_ids || []);
+  return planCards.filter((card) => beatCardIds.has(card.id));
 }
 
 function hasActiveRuntime() {
@@ -2199,15 +2460,6 @@ function recordLookup(subjectType, subjectId, text, cardId = null) {
     subjectId,
     cardId,
     metadata: {subject_type: subjectType}
-  });
-}
-
-function recordSourcePageOpen(file, page, reason) {
-  if (!hasActiveRuntime()) return;
-  sessionLog('source_page_opened', '打开来源页：' + file + ' · p' + page, {
-    subjectType: 'source_page',
-    subjectId: file + ':p' + page,
-    metadata: {file, page, reason}
   });
 }
 
@@ -2273,7 +2525,7 @@ function clueHtml(card, group, values) {
 }
 
 function currentRuntimeCard() {
-  const cards = runtimeCards(["scene", "investigation_site", "environment"]);
+  const cards = runtimeSceneCards();
   return cards.find((card) => card.id === state.session?.current_card_id) || cards[0] || null;
 }
 
@@ -2296,11 +2548,19 @@ function previewList(title, values) {
 function planReviewHtml(plan) {
   const cardsById = new Map(state.data.bundle.cards.map((card) => [card.id, card]));
   const factsById = new Map(state.data.bundle.facts.map((fact) => [fact.id, fact]));
+  const materialsById = new Map((state.data.bundle.display_materials || []).map((material) => [material.id, material]));
+  if (plan.navigation_mode === "location") {
+    const locations = (plan.location_card_ids || []).map((id) => cardsById.get(id)).filter(Boolean);
+    return '<details class="plan-review"><summary>审阅 ' + locations.length + ' 个地点</summary><div class="plan-beat-list">' +
+      (locations.length ? locations.map((card) => '<article class="plan-beat-preview"><div class="plan-beat-head"><strong>' + esc(card.title) + '</strong><span class="page-ref">地点卡</span></div><p>' + esc(card.fields?.arrival_description || card.fields?.normal_state || '') + '</p></article>').join('') : '<p class="muted">尚未纳入地点卡。</p>') +
+      '</div></details>';
+  }
   return '<details class="plan-review"><summary>审阅 ' + plan.beats.length + ' 个节拍</summary><div class="plan-beat-list">' +
     plan.beats.map((beat, index) => {
       const sourcePages = beat.source_pages?.length ? beat.source_pages : (plan.source_pages || []);
       const cards = (beat.card_ids || []).map((id) => cardsById.get(id)).filter(Boolean);
       const facts = (beat.reveal_fact_ids || []).map((id) => factsById.get(id)).filter(Boolean);
+      const materials = (beat.display_material_ids || []).map((id) => materialsById.get(id)).filter(Boolean);
       const cardTags = cards.length
         ? '<div class="tag-row">' + cards.map((card) => badge(card.title)).join("") + '</div>'
         : '<span class="muted">本拍未指定参考卡</span>';
@@ -2314,7 +2574,8 @@ function planReviewHtml(plan) {
         (beat.rule_focus ? '<div class="plan-rule-focus"><strong>本板块的运行关注</strong><p>' + esc(beat.rule_focus) + '</p></div>' : '') +
         previewList('软提示', beat.soft_cues) + previewList('硬推进', beat.hard_cues) +
         previewList('可以问自己', beat.question_prompts) + previewList('何时离开', beat.exit_when) +
-        '<div class="plan-preview-block"><strong>参考卡</strong>' + cardTags + factTags + '</div>' +
+        '<div class="plan-preview-block"><strong>参考卡</strong>' + cardTags + factTags +
+          (materials.length ? '<div class="plan-preview-materials"><strong>展示材料</strong>：' + materials.map((material) => esc(material.title)).join('；') + '</div>' : '') + '</div>' +
         '</article>';
     }).join("") + '</div></details>';
 }
@@ -2325,9 +2586,8 @@ function renderPlans() {
     '<article class="plan-item ' + (plan.id === state.session?.current_plan_id ? 'selected' : '') + '">' +
       '<div class="plan-item-body"><div><strong>' + esc(plan.title) + '</strong><p class="muted">' + esc(plan.premise) + '</p><div class="plan-source-summary">来源：' + esc(plan.source_file) + (plan.source_pages?.length ? ' · ' + plan.source_pages.map((page) => 'p' + esc(page)).join(' ') : '') + '</div></div>' +
         planReviewHtml(plan) + '</div>' +
-      '<div class="row-actions"><span class="badge accent">' + plan.beats.length + ' 节拍</span>' +
+      '<div class="row-actions"><span class="badge accent">' + (plan.navigation_mode === "location" ? (plan.location_card_ids || []).length + ' 地点' : plan.beats.length + ' 节拍') + '</span>' +
         (plan.id === state.session?.current_plan_id ? '<span class="badge">当前运行</span>' : '<span class="badge">待开始</span>') +
-        '<button class="edit-button" data-edit-plan="' + esc(plan.id) + '">查看场景</button>' +
         '<button class="edit-button danger" data-delete-plan="' + esc(plan.id) + '">删除场景</button>' +
         (plan.id === state.session?.current_plan_id ? '<button class="edit-button" data-resume-plan="' + esc(plan.id) + '">回到运行</button><button class="edit-button" data-start-plan="' + esc(plan.id) + '">重新开始</button>' : '<button class="edit-button" data-start-plan="' + esc(plan.id) + '">开始运行</button>') +
         '</div>' +
@@ -2353,6 +2613,10 @@ async function deletePlan(planId) {
 function renderBeat() {
   const beat = currentBeat();
   const plan = currentPlan();
+  if (plan?.navigation_mode === "location") {
+    $("beat-holder").innerHTML = '';
+    return;
+  }
   if (!beat || !plan) {
     $("beat-holder").innerHTML = '<div class="empty-state">尚未开始场景计划。先在书架检查草案，再点击“开始运行”；这里不会替 GM 决定玩家行动。</div>';
     return;
@@ -2367,6 +2631,8 @@ function renderBeat() {
   const cardsById = new Map(state.data.bundle.cards.map((card) => [card.id, card]));
   const factsById = new Map(state.data.bundle.facts.map((fact) => [fact.id, fact]));
   const referenceCards = (beat.card_ids || []).map((id) => cardsById.get(id)).filter(Boolean);
+  const materialsById = new Map((state.data.bundle.display_materials || []).map((material) => [material.id, material]));
+  const displayMaterials = (beat.display_material_ids || []).map((id) => materialsById.get(id)).filter(Boolean);
   const referenceFacts = (beat.reveal_fact_ids || []).map((id) => factsById.get(id)).filter(Boolean);
   const cardReferences = referenceCards.length
     ? '<div class="beat-reference"><h3>本拍参考卡（GM 内部）</h3><div class="tag-row">' + referenceCards.map((card) => badge(card.title + ' · ' + profileDefinition(card.profile_id, card.type).display_name)).join('') + '</div></div>'
@@ -2374,20 +2640,27 @@ function renderBeat() {
   const factReferences = referenceFacts.length
     ? '<div class="beat-reference"><h3>本拍可调用事实（GM 内部）</h3><ul class="beat-facts">' + referenceFacts.map((fact) => '<li>' + esc(fact.text) + ' ' + badge(label(factEvidenceStatus(fact)), factEvidenceStatus(fact)) + ' <span class="page-ref">' + esc(factSourceLabel(fact)) + '</span></li>').join('') + '</ul></div>'
     : '';
+  const materialReferences = displayMaterials.length
+    ? '<div class="beat-reference beat-handouts"><h3>本拍可展示材料（原文）</h3><div class="runtime-handout-list">' + displayMaterials.map((material) =>
+      '<article class="runtime-handout"><div class="card-title-row"><strong>' + esc(material.title) + '</strong>' + badge('展示材料', 'accent') + '</div>' +
+      (material.gm_notes ? '<p class="muted">' + esc(material.gm_notes) + '</p>' : '') +
+      '<div class="page-ref">' + material.source_refs.map((source) => esc(sourceRefLabel(source))).join('；') + '</div></article>'
+    ).join('') + '</div></div>'
+    : '';
   $("beat-holder").innerHTML =
     '<section class="panel beat-panel"><div class="panel-head"><div><span class="badge accent">节拍 ' + (beatIndex + 1) + ' / ' + plan.beats.length + '</span><h2>' + esc(beat.title) + '</h2></div>' +
     '<div class="row-actions"><button class="edit-button" data-beat-delta="-1" ' + (beatIndex <= 0 ? 'disabled' : '') + '>上一拍</button><button class="edit-button" data-beat-delta="1" ' + (beatIndex >= plan.beats.length - 1 ? 'disabled' : '') + '>下一拍</button></div></div>' +
     '<div class="beat-framing"><strong>描述方向（GM 内部）</strong><p>' + esc(framing) + '</p></div><p class="beat-situation"><strong>局势理解</strong><br>' + esc(beat.situation || '') + '</p>' +
     (beat.rule_focus ? '<div class="beat-rule-focus"><strong>本板块关注（GM 内部）</strong><p>' + esc(beat.rule_focus) + '</p></div>' : '') +
     '<div class="beat-source-row">来源页：' + sourcePages.map((page) => '<span class="page-ref">p' + esc(page) + '</span>').join(' ') + '</div>' +
-    cardReferences + factReferences +
+    cardReferences + materialReferences + factReferences +
     '<div class="beat-columns"><div><h3>软提示</h3><ul>' + softCues.map((item) => '<li>' + esc(item) + '</li>').join('') + '</ul></div><div><h3>硬推进</h3><ul>' + hardCues.map((item) => '<li>' + esc(item) + '</li>').join('') + '</ul></div></div>' +
     '<div class="beat-columns"><div><h3>可以问自己</h3><ul>' + questionPrompts.map((item) => '<li>' + esc(item) + '</li>').join('') + '</ul></div><div><h3>何时离开</h3><ul>' + exitWhen.map((item) => '<li>' + esc(item) + '</li>').join('') + '</ul></div></div>' +
     '</section>';
 }
 
 function changeRuntimeScene(cardId) {
-  const card = runtimeCards(["scene", "investigation_site", "environment"])
+  const card = runtimeConfirmedSceneCards()
     .find((item) => item.id === cardId);
   if (!card || !state.session || state.session.current_card_id === card.id) return;
   state.session.current_card_id = card.id;
@@ -2417,6 +2690,7 @@ async function startPlan(planId) {
   state.runtimeProfileId = plan.profile_id;
   if ($("runtime-profile")) $("runtime-profile").value = plan.profile_id;
   state.session.revealed_clue_keys = [];
+  state.session.trigger_states = {};
   state.session.clock_stages = {};
   plan.card_ids.forEach((cardId) => {
     const card = state.data.bundle.cards.find((item) => item.id === cardId);
@@ -2427,10 +2701,10 @@ async function startPlan(planId) {
   state.session.log = [];
   state.session.notes = '';
   state.session.current_plan_id = plan.id;
-  state.session.current_beat_id = plan.beats[0]?.id || null;
+  state.session.current_beat_id = plan.navigation_mode === "location" ? null : (plan.beats[0]?.id || null);
   const sceneCard = plan.card_ids
     .map((cardId) => state.data.bundle.cards.find((card) => card.id === cardId))
-    .find((card) => card && ["scene", "investigation_site", "environment"].includes(card.type));
+    .find((card) => card && ["location", "environment"].includes(card.type));
   state.session.current_card_id = sceneCard?.id || null;
   sessionLog('run_started', '开始场景计划：' + plan.title, {
     subjectType: 'session',
@@ -2455,6 +2729,7 @@ function resumePlan(planId) {
 function changeBeat(delta) {
   const plan = currentPlan();
   const beat = currentBeat();
+  if (plan?.navigation_mode === "location") return;
   if (!plan || !beat || !state.session) return;
   const index = plan.beats.findIndex((item) => item.id === beat.id);
   const next = plan.beats[index + delta];
@@ -2478,13 +2753,19 @@ function showView(viewName) {
   if (viewName === "prep") {
     if (!state.prep.config) {
       loadPrepConfig().catch((error) => {
-        state.prep.error = String(error);
+        state.prep.error = userFacingError(error, "模型配置加载失败");
         renderPrep();
       });
     }
     loadPrepJobs();
   }
   if (viewName === "review") loadReviewQueue();
+  if (viewName === "shelf" && state.exampleId) {
+    refreshWorkbenchData().catch((error) => {
+      state.artifacts.error = userFacingError(error, "书架刷新失败");
+      renderAll();
+    });
+  }
 }
 
 function renderArtifactStage() {
@@ -2493,18 +2774,16 @@ function renderArtifactStage() {
   const openButton = $("open-artifacts");
   const job = state.artifacts.job;
   const jobInFlight = artifactJobInFlight(job);
-  button.disabled = !availability.ready || state.artifacts.generating;
-  const retryingFailedJob = job?.status === "failed" && availability.ready;
+  const retryable = artifactJobRetryable(job);
+  button.disabled = state.artifacts.generating || (!retryable && !availability.ready);
   button.textContent = state.artifacts.generating
     ? "正在生成草案…"
-    : retryingFailedJob
-      ? "重试失败步骤"
-      : "生成备团产物草案";
-  button.title = retryingFailedJob
-    ? "重试上次失败的步骤；已成功完成的步骤会复用，不会从头生成"
-    : availability.ready
-      ? "调用当前模型生成可复核草案"
-      : availability.guidance;
+    : retryable ? "重试失败项" : "生成备团产物草案";
+  button.title = availability.ready
+    ? retryable
+      ? "在当前生成队列中统一重试失败项；成功步骤会复用"
+      : "开始当前书架的完整产物生成"
+    : availability.guidance;
   openButton.disabled = !availability.cards.length;
   const phaseProgress = job?.phase === "local_digest"
     ? ` · ${job.completed_batches || 0}/${job.batch_count || 0} 个局部批次 · ${job.unit_count || 0} 个整理单元`
@@ -2516,9 +2795,9 @@ function renderArtifactStage() {
           ? ` · ${job.fact_count || 0} 条事实`
           : "";
   const jobSummary = jobInFlight
-    ? `后台任务：${artifactJobPhaseLabels[job.phase] || artifactJobStatusLabels[job.status] || job.status}` + phaseProgress
+    ? `后台任务：${ARTIFACT_JOB_LABEL} · ${artifactJobPhaseLabels[job.phase] || artifactJobStatusLabels[job.status] || job.status}` + phaseProgress
     : job?.status === "failed"
-      ? `上次任务在${artifactJobPhaseLabels[job.phase] || "生成阶段"}失败：${job.error || "可重新尝试；已完成步骤会复用"}`
+      ? `上次${ARTIFACT_JOB_LABEL}在${artifactJobPhaseLabels[job.phase] || "生成阶段"}失败：${job.error || "可重新尝试；已完成步骤会复用"}`
       : "";
   $("artifact-draft-guidance").textContent =
     state.artifacts.error || jobSummary || availability.guidance;
@@ -2531,6 +2810,7 @@ function renderArtifactStage() {
       (job.phase ? ` · ${artifactJobPhaseLabels[job.phase] || job.phase}` : "") +
       `</span>` : ""
   ].join("");
+  renderArtifactJobProgress(job);
 }
 
 function renderShelf() {
@@ -2540,6 +2820,7 @@ function renderShelf() {
   $("shelf-summary").innerHTML = [
     ["事实", bundle.facts.length],
     ["备团产物", bundle.cards.length],
+    ["展示材料", (bundle.display_materials || []).length],
     ["备团板块", profiles.length],
     ["卡型定义", cardTypes.size]
   ].map(([name, value]) => `
@@ -2554,14 +2835,6 @@ function renderShelf() {
     <p class="muted">${esc(bundle.description)}</p>
     <div class="tag-row">${bundleProfiles().map((item) => badge(profileDisplayName(item.id) + " · " + profileKindLabels[item.profile_kind || "runtime"], item.profile_kind === "runtime" ? "accent" : "")).join("")}</div>
   `;
-  const coverage = state.data.coverage || {};
-  $("coverage-audit").innerHTML = coverage.location_total
-    ? `<div class="panel-head"><div><h3>地点覆盖审计</h3><p class="muted">已覆盖 ${coverage.location_covered || 0} / ${coverage.location_total} 个来源地点。</p></div></div>` +
-      ((coverage.uncovered_location_titles || []).length
-        ? `<p class="coverage-warning">尚未独立成卡：${coverage.uncovered_location_titles.map(esc).join("；")}</p><button class="edit-button" id="draft-missing-locations" type="button">补生成遗漏地点卡</button>`
-        : `<p class="coverage-ok">当前来源地点均已被场景/地点卡覆盖。</p>`)
-    : "";
-
   $("profile-grid").innerHTML = profiles.map((item) => {
     const cards = state.data.bundle.cards.filter((card) => card.profile_id === item.id).length;
     const definitions = item.card_definitions.map((def) => `
@@ -2587,26 +2860,37 @@ function renderShelf() {
 
 function renderFacts() {
   const query = state.factSearch.trim().toLowerCase();
+  const sourcePage = parseReviewPageRanges(state.factSourcePage);
   const matches = state.data.bundle.facts.filter((fact) => {
-    const kindOk = state.factKind === "all" || fact.kind === state.factKind;
+    const kindOk = state.factKind === "all" || (state.factKind === "handout" ? isHandoutFact(fact) : fact.kind === state.factKind && !isHandoutFact(fact));
     const visibleOk = state.factVisibility === "all" || fact.visibility === state.factVisibility;
-    const haystack = [fact.id, fact.text, fact.notes || "", factEvidenceStatus(fact), factSourceLabel(fact), ...fact.tags].join(" ").toLowerCase();
-    return kindOk && visibleOk && (!query || haystack.includes(query));
+    const haystack = [fact.id, fact.text, fact.notes || "", factEvidenceStatus(fact), factSourceLabel(fact), ...factTagsForDisplay(fact)].join(" ").toLowerCase();
+    const pageOk = !sourcePage.ranges.length || factSourceRefs(fact).some((source) =>
+      sourcePage.ranges.some(([start, end]) => source.page >= start && source.page <= end)
+    );
+    return sourcePage.valid && kindOk && visibleOk && pageOk && (!query || haystack.includes(query));
   });
-
-  renderFactRelationGraph();
 
   $("fact-grid").innerHTML = matches.map((fact) => {
     const links = fact.links.map((linkedId) => {
       const linked = state.data.bundle.facts.find((item) => item.id === linkedId);
       return `<button class="link-button" data-fact-link="${esc(linkedId)}">→ ${esc(linked?.text || linkedId)}</button>`;
     }).join("");
+    const material = displayMaterialForFact(fact.id);
+    const materialAction = fact.kind === "handout"
+      ? material
+        ? `<button class="edit-button" data-edit-display-material="${esc(material.id)}">管理展示材料</button>`
+        : state.editMode
+          ? `<button class="edit-button" data-create-display-material="${esc(fact.id)}">建立展示材料</button>`
+          : ""
+      : "";
     return `
       <article class="domain-card fact-card ${state.selectedFactId === fact.id ? "selected" : ""}" data-fact-id="${esc(fact.id)}">
         <div class="card-title-row">
-          <strong>${esc(label(fact.kind))}</strong> <button type="button" class="icon-button" title="复制事实关键词" data-copy-keyword="${esc(fact.id)}">复制 ID</button>
+          <strong>${esc(factKindLabel(fact))}</strong> <button type="button" class="icon-button" title="复制事实关键词" data-copy-keyword="${esc(fact.text)}">复制事实</button>
           <span class="row-actions">
             ${badge(label(fact.visibility), fact.visibility)}
+            ${materialAction}
             ${state.editMode ? `<button class="edit-button" data-edit-fact="${esc(fact.id)}">编辑</button>` : ""}
             ${state.editMode ? `<button class="edit-button danger" data-delete-fact="${esc(fact.id)}">删除</button>` : ""}
           </span>
@@ -2617,7 +2901,7 @@ function renderFacts() {
           ${factSourceRefs(fact).length
             ? factSourceRefs(fact).map((source) => badge(`p${source.page}`, "accent")).join("")
             : badge("无原文来源")}
-          ${fact.tags.map((tag) => badge(tag)).join("")}
+          ${factTagsForDisplay(fact).map((tag) => badge(tag)).join("")}
         </div>
         ${links ? `<div class="link-list">${links}</div>` : ""}
       </article>
@@ -2625,19 +2909,80 @@ function renderFacts() {
   }).join("") || `<div class="empty-state">没有匹配的事实。</div>`;
 }
 
-function renderFactRelationGraph() {
-  const host = $("fact-relation-graph");
-  if (!host) return;
-  const facts = state.data.bundle.facts;
-  const center = facts.find((fact) => fact.id === state.selectedFactId) || facts[0];
-  if (!center) { host.innerHTML = '<div class="empty-state">暂无事实可展示。</div>'; return; }
-  const linkedIds = new Set([...(center.links || []), center.id]);
-  facts.forEach((fact) => {
-    if ((fact.links || []).includes(center.id)) linkedIds.add(fact.id);
+function sourceRefEditorRows(refs, disabled = false) {
+  const items = Array.isArray(refs) && refs.length ? refs : [{}];
+  return items.map((source) => `
+    <div class="review-source-row" data-review-source-row>
+      <label>文件<input type="text" data-review-source-field="file" value="${esc(source.file || "")}" ${disabled ? "disabled" : ""}></label>
+      <label>页码<input type="number" min="1" step="1" data-review-source-field="page" value="${esc(source.page || "")}" ${disabled ? "disabled" : ""}></label>
+      <label>定位<input type="text" data-review-source-field="locator" value="${esc(source.locator || "")}" ${disabled ? "disabled" : ""}></label>
+      <label>摘录<input type="text" data-review-source-field="excerpt" value="${esc(source.excerpt || source.quote || "")}" ${disabled ? "disabled" : ""}></label>
+      <button type="button" class="icon-button danger" title="移除来源" data-review-source-remove ${disabled || items.length <= 1 ? "disabled" : ""}>移除</button>
+    </div>
+  `).join("");
+}
+
+function syncReviewSourceRemoveButtons(editor) {
+  if (!editor) return;
+  const rows = [...editor.querySelectorAll("[data-review-source-row]")];
+  const disabled = state.review.saving || rows.length <= 1;
+  rows.forEach((row) => {
+    const button = row.querySelector("[data-review-source-remove]");
+    if (button) button.disabled = disabled;
   });
-  const linked = facts.filter((fact) => linkedIds.has(fact.id));
-  host.innerHTML = '<div class="relation-center"><strong>中心事实</strong><p>' + esc(center.text) + '</p><button type="button" class="icon-button" data-copy-keyword="' + esc(center.text) + '">复制</button></div>' +
-    '<div class="relation-edges">' + linked.filter((fact) => fact.id !== center.id).map((fact) => '<button type="button" class="relation-node" data-fact-link="' + esc(fact.id) + '"><strong>' + esc(label(fact.kind)) + '</strong><span>' + esc(fact.text) + '</span></button>').join('') + '</div>';
+}
+
+function collectReviewSourceRefs() {
+  const rows = [...document.querySelectorAll("[data-review-source-row]")];
+  const refs = [];
+  for (const row of rows) {
+    const value = (name) => row.querySelector(`[data-review-source-field="${name}"]`)?.value.trim() || "";
+    const page = Number(value("page"));
+    const file = value("file");
+    if (!file && !value("locator") && !value("excerpt") && !Number.isFinite(page)) continue;
+    refs.push({
+      file,
+      page,
+      ...(value("locator") ? {locator: value("locator")} : {}),
+      ...(value("excerpt") ? {excerpt: value("excerpt")} : {})
+    });
+  }
+  return refs;
+}
+
+async function saveReviewSourceRefs(candidateId) {
+  if (state.review.saving) return;
+  const refs = collectReviewSourceRefs();
+  if (!refs.length || refs.some((ref) => !ref.file || !Number.isSafeInteger(ref.page) || ref.page < 1)) {
+    state.review.error = "请为每条来源填写文件和正整数页码。";
+    renderReview();
+    return;
+  }
+  const candidate = state.review.candidates.find((item) => item.id === candidateId);
+  if (!candidate) return;
+  const previousFilter = state.review.reviewState;
+  state.review.saving = true;
+  state.review.error = "";
+  renderReview();
+  try {
+    const response = await fetch(
+      "/api/domain/shadow/candidates/" + encodeURIComponent(candidateId),
+      {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({source_refs: refs})
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "来源引用保存失败"));
+    state.review.notice = "来源引用已更新，候选已退回复核。";
+    await refreshReviewAfterMutation({previousFilter, preferredId: candidateId});
+  } catch (error) {
+    state.review.error = userFacingError(error, "来源引用保存失败");
+  } finally {
+    state.review.saving = false;
+    renderReview();
+  }
 }
 
 function renderCards() {
@@ -2706,13 +3051,16 @@ function renderReview() {
   const taskFilter = $("review-task-filter");
   if (!taskFilter) return;
   const prepJobs = state.prep.jobs || [];
+  const prepTaskIds = prepShadowTaskIds();
   const prepOptions = prepJobs.map((job) =>
     '<option value="' + esc(prepReviewFilterValue(job.id)) + '">' +
     esc(reviewPrepJobLabel(job)) + ' · 全部窗口</option>'
   );
-  const shadowOptions = review.tasks.map((task) =>
+  const shadowOptions = review.tasks
+    .filter((task) => !prepTaskIds.has(task.id))
+    .map((task) =>
     '<option value="' + esc(task.id) + '">' + esc(reviewTaskLabel(task)) + '</option>'
-  );
+    );
   const taskOptions = [
     '<option value="">全部任务</option>',
     prepOptions.length ? '<optgroup label="备团任务（全部窗口）">' + prepOptions.join("") + '</optgroup>' : "",
@@ -2724,67 +3072,61 @@ function renderReview() {
   $("review-page-filter").value = review.sourcePage;
 
   const visible = reviewVisibleCandidates();
+  const pageData = reviewPageCandidates(visible);
+  const pageVisible = pageData.items;
   const visibleIds = new Set(visible.map((candidate) => candidate.id));
-  review.selectedIds = new Set(
-    [...review.selectedIds].filter((candidateId) => visibleIds.has(candidateId))
-  );
   if (!visibleIds.has(review.selectedCandidateId)) {
     review.selectedCandidateId = visible[0]?.id || null;
   }
   const selected = selectedReviewCandidate();
   const selectionCount = review.selectedIds.size;
-  const selectedCandidates = visible.filter((candidate) =>
-    review.selectedIds.has(candidate.id)
-  );
   const pageFilter = parseReviewPageRanges(review.sourcePage);
-  const canPromoteSelection = Boolean(selectedCandidates.length) && selectedCandidates.every(
-    (candidate) => candidate.review_state === "accepted" && !candidate.promotion
-  );
   const pageFilterInput = $("review-page-filter");
   if (pageFilterInput) {
     pageFilterInput.setAttribute("aria-invalid", pageFilter.valid ? "false" : "true");
     pageFilterInput.title = pageFilter.valid ? "按来源页筛选，可输入单页、范围或离散页" : "页码范围格式无效，例如 4-6, 8";
   }
+  renderReviewPagination(visible.length, pageData.pageCount, review.page);
   $("review-summary").textContent = review.loading
     ? "正在加载候选队列…"
     : `${visible.length} 条候选 · ${reviewStateLabels[review.reviewState] || "全部状态"}` +
+      ` · 已选 ${selectionCount}` +
       (review.sourcePage ? ` · p${formatReviewPageRanges(review.sourcePage)}` : "") +
       (!pageFilter.valid ? " · 页码范围格式无效（如 4-6, 8）" : "") +
       (review.notice ? ` · ${review.notice}` : "");
+  const selectAllLabel = $("review-select-all-label");
+  if (selectAllLabel) selectAllLabel.textContent = `选择筛选结果（${visible.length}）`;
   $("review-select-all").checked = Boolean(visible.length) && visible.every(
     (candidate) => review.selectedIds.has(candidate.id)
   );
   $("review-select-all").indeterminate = Boolean(selectionCount) && selectionCount < visible.length;
   $("review-batch-apply").disabled = !selectionCount || review.saving;
-  $("review-batch-promote").disabled = !canPromoteSelection || review.saving;
   $("review-batch-apply").textContent = selectionCount
-    ? `复核所选 · ${selectionCount}`
-    : "复核所选";
-  $("review-batch-promote").textContent = selectionCount
-    ? `送入书架 · ${selectionCount}`
-    : "送入书架";
+    ? `复核所选并送入书架 · ${selectionCount}`
+    : "复核所选并送入书架";
 
-  $("review-candidate-list").innerHTML = pageFilter.valid ? visible.map((candidate) => {
+  $("review-candidate-list").innerHTML = pageFilter.valid ? pageVisible.map((candidate, index) => {
     const sourceBadges = reviewSourceRefs(candidate).map((source) =>
       badge(`p${source.page}`, "accent")
     ).join("");
     const isSelected = candidate.id === review.selectedCandidateId;
+    const candidateLabel = reviewCandidateLabel(candidate, pageData.start + index);
     return `
       <article class="review-candidate ${isSelected ? "selected" : ""}">
-        <label class="review-candidate-check" aria-label="选择 ${esc(candidate.id)}">
+        <label class="review-candidate-check" aria-label="选择 ${esc(candidateLabel)}">
           <input type="checkbox" data-review-select-id="${esc(candidate.id)}" ${review.selectedIds.has(candidate.id) ? "checked" : ""} ${review.saving ? "disabled" : ""}>
         </label>
         <div class="review-candidate-body">
           <div class="review-candidate-head">
-            <strong>${esc(candidate.id)}</strong>
+            <strong>${esc(candidateLabel)}</strong>
             <div class="tag-row">
               ${badge(evidenceStatusLabels.model_candidate, "model_candidate")}
               ${badge(reviewStateLabels[candidate.review_state] || candidate.review_state, candidate.review_state)}
               ${badge(label(candidate.kind))}
             </div>
           </div>
-          <p class="review-candidate-text">${esc(reviewDisplayText(candidate))}</p>
-          <div class="review-candidate-meta">${sourceBadges}${candidate.reviewed_text ? badge("有复核稿") : ""}</div>
+          <p class="review-candidate-text">${esc(reviewDisplaySummary(candidate))}</p>
+          <div class="review-candidate-meta">${sourceBadges}${candidate.content_basis && candidate.content_basis !== "model_candidate" ? badge(evidenceStatusLabels[candidate.content_basis] || candidate.content_basis, candidate.content_basis) : ""}</div>
         </div>
         <div class="review-candidate-actions">
           ${candidate.promotion ? badge("已入书架", "accepted") : ""}
@@ -2808,42 +3150,31 @@ function renderReview() {
     return;
   }
 
-  const sourceRows = reviewSourceRefs(selected).map((source) => `
-    <button class="link-button review-source-button" type="button"
-      data-review-source-file="${esc(source.file)}" data-review-source-page="${source.page}">
-      ${esc(sourceRefLabel(source))}
-    </button>
-  `).join("") || '<span class="muted">没有来源引用。</span>';
-  const possibleLinks = Array.isArray(selected.possible_links) ? selected.possible_links : [];
+  const sourceRows = sourceRefEditorRows(reviewSourceRefs(selected), review.saving);
   const openQuestions = Array.isArray(selected.open_questions) ? selected.open_questions : [];
   const history = Array.isArray(selected.review_history) ? selected.review_history.slice().reverse() : [];
+  const selectedIndex = visible.findIndex((candidate) => candidate.id === selected.id);
+  const selectedLabel = reviewCandidateLabel(selected, selectedIndex < 0 ? null : selectedIndex);
   const historyHtml = history.map((event) => `
     <div class="review-history-item">
-      <div class="tag-row">${badge(reviewStateLabels[event.review_state] || event.review_state, event.review_state)} <span class="muted">${esc(String(event.created_at || "").replace("T", " ").slice(0, 16))}</span></div>
-      ${event.reviewed_text ? `<p><strong>复核稿：</strong>${esc(event.reviewed_text)}</p>` : ""}
-      ${event.review_note ? `<p><strong>说明：</strong>${esc(event.review_note)}</p>` : ""}
+      <div class="tag-row">${badge(event.action || "review")} ${badge(reviewStateLabels[event.review_state] || event.review_state, event.review_state)} <span class="muted">${esc(String(event.created_at || "").replace("T", " ").slice(0, 16))}</span></div>
+      ${event.note ? `<p><strong>说明：</strong>${esc(event.note)}</p>` : ""}
+      ${event.field_paths?.length ? `<p class="muted">字段：${esc(event.field_paths.join(", "))}</p>` : ""}
+      ${event.related_candidate_ids?.length > 1 ? `<p class="muted">关联候选：${esc(event.related_candidate_ids.map(reviewCandidateHistoryLabel).join("、"))}</p>` : ""}
     </div>
   `).join("") || '<p class="muted">尚无复核记录。</p>';
-  const currentReviewText = selected.reviewed_text || selected.text;
+  const currentReviewText = selected.text || "";
   const promotion = selected.promotion || null;
   const promotionHtml = promotion
     ? `<section class="review-promotion">
         <div class="tag-row">${badge("已进入书架", "accepted")} ${badge(evidenceStatusLabels[promotion.evidence_status] || promotion.evidence_status)}</div>
         <button class="edit-button" type="button" data-review-workspace="${esc(promotion.workspace_id)}">打开对应书架</button>
       </section>`
-    : selected.review_state === "accepted"
-      ? `<section class="review-promotion">
-          <div class="field-label">提升为书架事实</div>
-          <div class="review-detail-actions">
-            <button class="action-link" type="button" data-review-promote="source_fact" data-review-candidate="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>提升为原文事实</button>
-            <button class="edit-button" type="button" data-review-promote="inference" data-review-candidate="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>提升为可验证推断</button>
-          </div>
-        </section>`
-      : "";
+    : "";
   $("review-candidate-detail").innerHTML = `
     <div class="review-detail-head">
       <div>
-        <h2>${esc(selected.id)}</h2>
+        <h2>${esc(selectedLabel)}</h2>
         <div class="tag-row">
           ${badge(evidenceStatusLabels.model_candidate, "model_candidate")}
           ${badge(reviewStateLabels[selected.review_state] || selected.review_state, selected.review_state)}
@@ -2854,11 +3185,17 @@ function renderReview() {
       <span class="muted">${esc(String(selected.created_at || "").replace("T", " ").slice(0, 16))}</span>
     </div>
     <section class="review-text-block">
-      <div class="field-label">模型原文</div>
+      <div class="field-label">当前候选内容</div>
       <p>${esc(selected.text)}</p>
     </section>
     <div class="review-edit-grid">
-      <label>复核文本<textarea id="review-edited-text" rows="5" ${review.saving ? "disabled" : ""}>${esc(currentReviewText)}</textarea></label>
+      <label>当前内容<textarea id="review-edited-text" rows="5" ${review.saving ? "disabled" : ""}>${esc(currentReviewText)}</textarea></label>
+      <label>内容依据<select id="review-content-basis" ${review.saving ? "disabled" : ""}>
+        <option value="model_candidate">模型候选</option>
+        <option value="source_fact">原文事实</option>
+        <option value="inference">可验证推断</option>
+        <option value="gm_authored">GM 创作</option>
+      </select></label>
       <label>复核说明<textarea id="review-note" rows="3" ${review.saving ? "disabled" : ""}>${esc(selected.review_note || "")}</textarea></label>
     </div>
     <div class="review-detail-actions">
@@ -2866,25 +3203,29 @@ function renderReview() {
       <button class="edit-button danger" type="button" data-review-action="rejected" data-review-candidate="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>拒绝</button>
       <button class="action-link" type="button" data-review-action="accepted" data-review-candidate="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>接受</button>
     </div>
+    <div class="review-detail-actions review-replacement-actions">
+      <button class="edit-button" type="button" data-review-split="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>拆分为子候选</button>
+      <button class="edit-button" type="button" data-review-merge="${esc(selected.id)}" ${review.saving || review.selectedIds.size < 2 ? "disabled" : ""}>合并所选候选</button>
+    </div>
     ${promotionHtml}
     <div class="review-detail-error">${review.error ? esc(review.error) : ""}</div>
     <section class="review-reference-section">
-      <h3>原文页</h3>
-      <div class="review-reference-list">${sourceRows}</div>
-    </section>
-    <section class="review-reference-section">
-      <h3>关联目标</h3>
-      ${possibleLinks.length ? `<ul class="review-link-list">${possibleLinks.map((item) => `<li><code>${esc(item)}</code></li>`).join("")}</ul>` : '<p class="muted">未提供关联目标。</p>'}
+      <h3>来源定位</h3>
+      <div class="review-source-editor">${sourceRows}</div>
+      <div class="review-detail-actions">
+        <button type="button" class="edit-button" data-review-source-add ${review.saving ? "disabled" : ""}>添加来源</button>
+        <button type="button" class="action-link" data-review-source-save="${esc(selected.id)}" ${review.saving ? "disabled" : ""}>保存来源引用</button>
+      </div>
     </section>
     <section class="review-reference-section">
       <h3>待确认问题</h3>
       ${openQuestions.length ? `<ul class="review-link-list">${openQuestions.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : '<p class="muted">无。</p>'}
     </section>
-    <details class="review-history" open>
-      <summary>复核历史 · ${history.length}</summary>
-      <div class="review-history-list">${historyHtml}</div>
-    </details>
   `;
+  const acceptButton = document.querySelector('[data-review-action="accepted"]');
+  if (acceptButton && prepReviewJobId(review.taskId)) acceptButton.textContent = "确认并送入书架";
+  const contentBasis = $("review-content-basis");
+  if (contentBasis) contentBasis.value = selected.content_basis || "model_candidate";
 }
 
 function renderRuntimeLegacy() {
@@ -2910,7 +3251,7 @@ function renderRuntimeLegacy() {
 
   const sceneCard = state.data.bundle.cards.find((card) =>
     card.profile_id === state.runtimeProfileId &&
-    ["scene", "investigation_site", "environment"].includes(card.type)
+    ["location", "environment"].includes(card.type)
   );
   $("current-scene").innerHTML = sceneCard ? `
     <article class="domain-card selected">
@@ -2923,10 +3264,53 @@ function renderRuntimeLegacy() {
 
 function runtimeCardFieldsHtml(card) {
   return Object.entries(card.fields)
-    .filter(([key]) => !["direct_clues", "hidden_clues", "current_stage"].includes(key))
+    .filter(([key]) => !["direct_clues", "hidden_clues", "current_stage", "first_triggers"].includes(key))
     .map(([key, value]) =>
       '<div class="field"><div class="field-label">' + esc(label(key)) + '</div><div class="field-value">' + esc(formatValue(value)) + '</div></div>'
     ).join("");
+}
+
+function triggerKey(card, index) {
+  return card.id + ':first:' + index;
+}
+
+function locationTriggersHtml(card) {
+  const triggers = Array.isArray(card.fields?.first_triggers) ? card.fields.first_triggers : [];
+  if (!triggers.length) return '';
+  const labels = {unhandled: '未处理', active: '已触发', resolved: '已解决'};
+  return '<div class="runtime-section"><h3>地点触发</h3><div class="runtime-trigger-list">' + triggers.map((trigger, index) => {
+    const key = triggerKey(card, index);
+    const value = state.session?.trigger_states?.[key] || 'unhandled';
+    return '<label class="runtime-trigger ' + esc(value) + '"><span>' + esc(trigger) + '</span><select data-trigger-state="' + esc(key) + '">' +
+      Object.entries(labels).map(([stateValue, stateLabel]) => '<option value="' + stateValue + '" ' + (stateValue === value ? 'selected' : '') + '>' + stateLabel + '</option>').join('') +
+      '</select></label>';
+  }).join('') + '</div></div>';
+}
+
+function locationMaterialsHtml(plan, card) {
+  if (!plan || !card) return '';
+  const materials = (state.data?.bundle?.display_materials || []).filter((material) =>
+    (material.links || []).some((link) => link.plan_id === plan.id && link.card_id === card.id)
+  );
+  if (!materials.length) return '';
+  return '<div class="runtime-section"><h3>可展示材料</h3><div class="runtime-handout-list">' + materials.map((material) =>
+    '<article class="runtime-handout"><div class="card-title-row"><strong>' + esc(material.title) + '</strong>' + badge('展示材料', 'accent') + '</div>' +
+    (material.gm_notes ? '<p class="muted">' + esc(material.gm_notes) + '</p>' : '') +
+    '<div class="page-ref">' + (material.source_refs || []).map((source) => esc(sourceRefLabel(source))).join('；') + '</div></article>'
+  ).join('') + '</div></div>';
+}
+
+function changeTriggerState(key, value) {
+  if (!state.session || !['unhandled', 'active', 'resolved'].includes(value)) return;
+  if (!state.session.trigger_states) state.session.trigger_states = {};
+  if (value === 'unhandled') delete state.session.trigger_states[key];
+  else state.session.trigger_states[key] = value;
+  sessionLog('gm_move', '更新地点触发：' + (value === 'active' ? '已触发' : value === 'resolved' ? '已解决' : '未处理'), {
+    subjectType: 'card',
+    subjectId: key.split(':first:')[0],
+    metadata: {trigger_key: key, trigger_state: value}
+  });
+  renderRuntime();
 }
 
 function renderRuntime() {
@@ -2934,6 +3318,9 @@ function renderRuntime() {
   if (activePlan) state.runtimeProfileId = activePlan.profile_id;
   const item = profile(state.runtimeProfileId);
   if (!item || !state.session) return;
+  renderRuntimeOverview();
+  renderRuntimeReferenceCards();
+  renderGlobalDisplayMaterials();
   const runtimeProfileSelect = $("runtime-profile");
   if (runtimeProfileSelect) {
     runtimeProfileSelect.value = state.runtimeProfileId;
@@ -2948,7 +3335,9 @@ function renderRuntime() {
     const beatIndex = beat ? activePlan.beats.findIndex((item) => item.id === beat.id) + 1 : 0;
     planStatus.className = "runtime-plan-status active";
     planStatus.innerHTML = '<strong>运行中：</strong> ' + esc(activePlan.title) +
-      (beatIndex ? ' <span class="muted">· 当前节拍 ' + beatIndex + ' / ' + activePlan.beats.length + '</span>' : '');
+      (activePlan.navigation_mode === 'location'
+        ? ' <span class="muted">· 地点自由切换</span>'
+        : (beatIndex ? ' <span class="muted">· 当前节拍 ' + beatIndex + ' / ' + activePlan.beats.length + '</span>' : ''));
   } else {
     planStatus.className = "runtime-plan-status pending";
     planStatus.innerHTML = '<strong>尚未开始场景计划。</strong> 请在书架检查草案，再明确点击“开始运行”。当前内容仅供 GM 预览。';
@@ -2983,14 +3372,17 @@ function renderRuntime() {
     '</div>';
   $("gm-move-select").innerHTML = moves || '<option value="">当前板块暂无 GM 移动</option>';
 
-  const sceneCards = runtimeCards(["scene", "investigation_site", "environment"]);
+  const runtimeQuery = ($("runtime-reference-search")?.value || '').trim().toLowerCase();
+  const sceneCards = runtimeConfirmedSceneCards().filter((card) =>
+    (!runtimeQuery || [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(' ').toLowerCase().includes(runtimeQuery))
+  );
   const scene = currentRuntimeCard();
   $("runtime-exploration-list").innerHTML = sceneCards.length
     ? sceneCards.map((card) => '<button type="button" class="exploration-node ' + (card.id === scene?.id ? 'selected' : '') + '" data-runtime-scene="' + esc(card.id) + '"><strong>' + esc(card.title) + '</strong><span>' + esc(profileDefinition(card.profile_id, card.type).display_name) + '</span></button>').join("")
     : '<div class="empty-state">当前计划还没有可探索地点。</div>';
   $("scene-holder").innerHTML = scene ?
     '<article class="domain-card selected runtime-scene-card"><div class="card-title-row"><div><div class="card-title">' + esc(scene.title) + '</div><p class="card-subtitle">' + esc(scene.subtitle || '当前地点') + '</p></div>' + badge('当前地点', 'accent') + '</div>' +
-    runtimeCardFieldsHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues) + sourceHtml(scene.fact_ids) + '</article>' :
+    runtimeCardFieldsHtml(scene) + locationTriggersHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues) + locationMaterialsHtml(activePlan, scene) + sourceHtml(scene.fact_ids) + '</article>' :
     '<div class="empty-state">当前板块暂无场景级卡。请先完成该板块的产物生成与复核。</div>';
 
   const clocks = runtimeCards(["clock", "operation_clock", "encounter_clock"]);
@@ -3015,8 +3407,52 @@ function renderRuntime() {
   }).join("") || '<div class="muted">还没有运行记录。</div>';
   $("session-notes").value = state.session.notes || '';
   $("session-status").textContent = state.sessionState === 'saved' && state.sessionUpdatedAt
-    ? (state.sessionDirty ? '有未保存修改' : '已保存 ' + state.sessionUpdatedAt.replace('T', ' ').slice(0, 16))
+    ? (state.sessionDirty ? '运行状态待保存' : '运行状态已保存 ' + state.sessionUpdatedAt.replace('T', ' ').slice(0, 16))
     : state.sessionState === 'invalid' ? '存档无效，使用新状态' : '未保存的本次运行';
+}
+
+function renderGlobalDisplayMaterials() {
+  const host = $("runtime-materials-global");
+  if (!host) return;
+  const materials = state.data?.bundle?.display_materials || [];
+  const pages = state.data?.display_material_pages || [];
+  host.innerHTML = materials.length || pages.length
+    ? '<article class="runtime-handout"><div class="card-title-row"><strong>可能包含展示材料的来源页</strong>' + badge('来源提示', 'accent') + '</div>' +
+      '<div class="page-ref">' + (pages.length ? pages.map((page) => 'p' + esc(page)).join('、') : '暂无明确页码提示') + '</div>' +
+      (materials.length ? '<p class="muted">已确认材料仍保留来源页记录；未确认图片或版面不自动命名。</p>' : '') + '</article>'
+    : '<div class="empty-state">当前范围没有展示材料来源页提示。</div>';
+}
+
+function runtimePlanCards() {
+  const plan = currentPlan();
+  if (!plan || !state.data?.bundle) return [];
+  const ids = new Set(plan.card_ids || []);
+  return state.data.bundle.cards.filter((card) => ids.has(card.id));
+}
+
+function renderRuntimeOverview() {
+  const host = $("runtime-overview");
+  if (!host) return;
+  const overview = runtimePlanCards().find((card) => card.type === "chapter_overview");
+  host.innerHTML = overview
+    ? '<article class="domain-card runtime-overview-card"><div class="card-title-row"><div class="card-title">' + esc(overview.title) + '</div>' + badge('章节总览', 'accent') + '</div>' + runtimeCardFieldsHtml(overview) + sourceHtml(overview.fact_ids) + '</article>'
+    : '<div class="empty-state">当前运行计划没有章节总览卡。</div>';
+}
+
+function renderRuntimeReferenceCards() {
+  const host = $("runtime-reference-list");
+  if (!host) return;
+  const query = ($("runtime-reference-search")?.value || '').trim().toLowerCase();
+  const type = $("runtime-reference-filter")?.value || 'all';
+  const cards = runtimePlanCards().filter((card) => {
+    if (card.type === 'location' || card.type === 'environment' || card.type === 'chapter_overview') return false;
+    if (type !== 'all' && !(type === 'clock' ? ['clock', 'operation_clock', 'encounter_clock'].includes(card.type) : card.type === type)) return false;
+    if (!query) return true;
+    return [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(' ').toLowerCase().includes(query);
+  });
+  host.innerHTML = cards.length
+    ? cards.map((card) => '<article class="domain-card runtime-reference-card"><div class="card-title-row"><div class="card-title">' + esc(card.title) + '</div>' + badge(profileDefinition(card.profile_id, card.type).display_name, 'neutral') + '</div>' + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids) + '</article>').join('')
+    : '<div class="empty-state">没有符合条件的运行资料。</div>';
 }
 
 function fillSelectors() {
@@ -3054,6 +3490,16 @@ function refreshCardTypes() {
 
 function renderAll() {
   renderPrep();
+  if (!state.data?.bundle) {
+    renderEmptyWorkspace();
+    return;
+  }
+  $("edit-toggle").disabled = false;
+  const exportBundle = $("export-bundle");
+  if (exportBundle) {
+    exportBundle.hidden = false;
+    exportBundle.href = `/api/domain/export?example=${encodeURIComponent(state.exampleId)}`;
+  }
   renderShelf();
   renderFacts();
   renderCards();
@@ -3079,7 +3525,7 @@ async function saveBundle() {
       body: JSON.stringify(state.data.bundle)
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    if (!response.ok) throw new Error(formatApiError(payload, "运行场景保存失败"));
     state.saving = false;
     state.savedAt = payload.saved_at;
     state.savedState = "saved";
@@ -3093,7 +3539,7 @@ async function saveBundle() {
     updateWorkStatus("保存失败");
     const panel = $("global-error");
     panel.hidden = false;
-    panel.textContent = String(error);
+    panel.textContent = userFacingError(error, "运行场景保存失败");
     return false;
   }
 }
@@ -3108,7 +3554,7 @@ async function resetBundle() {
     updateWorkStatus("还原失败");
     const panel = $("global-error");
     panel.hidden = false;
-    panel.textContent = String(error);
+    panel.textContent = userFacingError(error, "运行场景还原失败");
   }
 }
 
@@ -3121,7 +3567,7 @@ async function saveSession() {
       method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(state.session)
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || 'HTTP ' + response.status);
+    if (!response.ok) throw new Error(formatApiError(payload, "运行状态保存失败"));
     state.sessionUpdatedAt = payload.updated_at;
     state.sessionState = 'saved';
     state.sessionDirty = false;
@@ -3130,7 +3576,7 @@ async function saveSession() {
   } catch (error) {
     const panel = $("global-error");
     panel.hidden = false;
-    panel.textContent = String(error);
+    panel.textContent = userFacingError(error, "运行状态保存失败");
     return false;
   } finally {
     state.sessionSaving = false;
@@ -3239,6 +3685,10 @@ function bindEvents() {
     state.factSearch = event.target.value;
     renderFacts();
   });
+  $("fact-page").addEventListener("input", (event) => {
+    state.factSourcePage = event.target.value.trim();
+    renderFacts();
+  });
   $("fact-kind").addEventListener("change", (event) => {
     state.factKind = event.target.value;
     renderFacts();
@@ -3246,11 +3696,6 @@ function bindEvents() {
   $("fact-visibility").addEventListener("change", (event) => {
     state.factVisibility = event.target.value;
     renderFacts();
-  });
-  $("source-prep").addEventListener("click", openSourcePrep);
-  $("prep-source-file").addEventListener("change", (event) => {
-    resetSourcePrepPageRange(event.target.value.trim());
-    loadPrepPage();
   });
   $("card-profile").addEventListener("change", (event) => {
     state.cardProfile = event.target.value;
@@ -3287,17 +3732,6 @@ function bindEvents() {
     reviewCards(selectedCardIdsForReview("reopen"), "reopen")
   );
   $("draft-artifacts").addEventListener("click", draftArtifacts);
-  document.addEventListener("click", (event) => {
-    if (!event.target.closest("#draft-missing-locations")) return;
-    if (!state.exampleId || state.artifacts.generating) return;
-    state.artifacts.generating = true;
-    state.artifacts.error = "";
-    renderAll();
-    fetch(`/api/domain/examples/${encodeURIComponent(state.exampleId)}/cards/draft-missing-locations`, {method: "POST"})
-      .then(async (response) => { const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(formatApiError(payload, "补生成地点卡失败")); return payload; })
-      .then((payload) => { state.artifacts.job = payload.job || null; updateWorkStatus("遗漏地点卡已排队生成"); renderAll(); scheduleArtifactPoll(); })
-      .catch((error) => { $("global-error").hidden = false; $("global-error").textContent = String(error); });
-  });
   $("open-artifacts").addEventListener("click", () => showView("cards"));
   $("review-refresh").addEventListener("click", () => {
     state.review.notice = "";
@@ -3305,6 +3739,7 @@ function bindEvents() {
   });
   $("review-task-filter").addEventListener("change", (event) => {
     state.review.taskId = event.target.value;
+    state.review.page = 1;
     state.review.selectedIds = new Set();
     state.review.selectedCandidateId = null;
     state.review.notice = "";
@@ -3312,6 +3747,7 @@ function bindEvents() {
   });
   $("review-state-filter").addEventListener("change", (event) => {
     state.review.reviewState = event.target.value;
+    state.review.page = 1;
     state.review.selectedIds = new Set();
     state.review.selectedCandidateId = null;
     state.review.notice = "";
@@ -3319,6 +3755,8 @@ function bindEvents() {
   });
   $("review-page-filter").addEventListener("input", (event) => {
     state.review.sourcePage = event.target.value.trim();
+    state.review.page = 1;
+    state.review.selectedIds = new Set();
     renderReview();
   });
   $("review-select-all").addEventListener("change", (event) => {
@@ -3327,6 +3765,24 @@ function bindEvents() {
       ? new Set(visible.map((candidate) => candidate.id))
       : new Set();
     renderReview();
+  });
+  $("review-pagination").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-review-page]");
+    if (!button || button.disabled) return;
+    const page = Number(button.dataset.reviewPage);
+    if (!Number.isSafeInteger(page) || page < 1) return;
+    state.review.page = page;
+    renderReview();
+  });
+  $("prep-source-refresh").addEventListener("click", () => {
+    loadSourceFiles().catch((error) => {
+      state.prep.error = userFacingError(error, "来源 PDF 列表加载失败");
+      renderPrep();
+    });
+  });
+  $("prep-source-file-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-source-delete]");
+    if (button) void deletePrepSource(button.dataset.sourceDelete);
   });
   $("review-candidate-list").addEventListener("change", (event) => {
     const checkbox = event.target.closest("[data-review-select-id]");
@@ -3337,13 +3793,16 @@ function bindEvents() {
     renderReview();
   });
   $("review-batch-apply").addEventListener("click", () => submitReviewBatch());
-  $("review-batch-promote").addEventListener("click", () => promoteReviewBatch());
   $("runtime-profile").addEventListener("change", (event) => {
     state.runtimeProfileId = event.target.value;
     renderRuntime();
   });
+  $("runtime-reference-search")?.addEventListener("input", () => renderRuntime());
+  $("runtime-reference-filter")?.addEventListener("change", () => renderRuntime());
   $("scene-holder").addEventListener("change", (event) => {
     if (event.target.id === "runtime-scene-select") changeRuntimeScene(event.target.value);
+    const trigger = event.target.closest("[data-trigger-state]");
+    if (trigger) changeTriggerState(trigger.dataset.triggerState, trigger.value);
   });
   $("runtime-exploration-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-runtime-scene]");
@@ -3351,21 +3810,16 @@ function bindEvents() {
   });
   $("draft-plan").addEventListener("click", openPlanDraftEditor);
   $("plan-draft-editor").addEventListener("submit", submitPlanDraft);
-  $("plan-editor").addEventListener("submit", submitPlanEditor);
   $("card-profile-edit").addEventListener("change", (event) => {
     refreshCardEditorTypes(event.target.value);
   });
-  $("source-prep-editor").addEventListener("submit", (event) => {
-    event.preventDefault();
-    createFactFromPrep();
+  $("display-material-editor").addEventListener("submit", (event) => {
+    submitDisplayMaterialEditor(event);
   });
-  $("prep-load-page").addEventListener("click", loadPrepPage);
-  $("prep-prev-page").addEventListener("click", () => shiftPrepPage(-1));
-  $("prep-next-page").addEventListener("click", () => shiftPrepPage(1));
   $("save-session").addEventListener("click", saveSession);
   $("reset-session").addEventListener("click", () => resetSession().catch((error) => {
     $("global-error").hidden = false;
-    $("global-error").textContent = String(error);
+    $("global-error").textContent = userFacingError(error, "运行状态重置失败");
   }));
   $("apply-gm-move").addEventListener("click", applyGmMove);
   $("add-session-note").addEventListener("click", addSessionNote);
@@ -3374,7 +3828,7 @@ function bindEvents() {
     if (state.session) {
       state.session.notes = $("session-notes").value;
       state.sessionDirty = true;
-      $("session-status").textContent = "有未保存修改";
+      $("session-status").textContent = "运行状态待保存";
     }
   });
   $("example-select").addEventListener("change", (event) => {
@@ -3389,27 +3843,25 @@ function bindEvents() {
   });
   $("rename-workspace").addEventListener("click", () => renameWorkspace().catch((error) => {
     $("global-error").hidden = false;
-    $("global-error").textContent = error instanceof Error ? error.message : String(error);
+    $("global-error").textContent = userFacingError(error, "书架重命名失败");
   }));
   $("delete-workspace").addEventListener("click", () => deleteWorkspace().catch((error) => {
     $("global-error").hidden = false;
-    $("global-error").textContent = error instanceof Error ? error.message : String(error);
+    $("global-error").textContent = userFacingError(error, "书架项目删除失败");
   }));
   $("edit-toggle").addEventListener("click", () => {
+    if (!state.data?.bundle) return;
     state.editMode = !state.editMode;
     $("edit-toggle").classList.toggle("active", state.editMode);
     $("save-bundle").hidden = !state.editMode;
     $("reset-bundle").hidden = !state.editMode || !state.data.has_seed;
-    $("create-fact").hidden = !state.editMode;
     $("create-card").hidden = !state.editMode;
     renderAll();
   });
   $("save-bundle").addEventListener("click", saveBundle);
   $("reset-bundle").addEventListener("click", resetBundle);
-  $("create-fact").addEventListener("click", createFact);
   $("create-card").addEventListener("click", createCard);
   $("fact-editor").addEventListener("submit", submitFactEditor);
-  $("fact-preview-source").addEventListener("click", previewFactSource);
   $("card-editor").addEventListener("submit", submitCardEditor);
 
   document.addEventListener("click", (event) => {
@@ -3421,6 +3873,7 @@ function bindEvents() {
     const reviewStage = event.target.closest("[data-review-stage]");
     if (reviewStage) {
       state.review.reviewState = reviewStage.dataset.reviewStage;
+      state.review.page = 1;
       state.review.sourcePage = "";
       state.review.selectedIds = new Set();
       state.review.selectedCandidateId = null;
@@ -3444,15 +3897,16 @@ function bindEvents() {
             ? rebuildPrepJob(jobId)
             : runPrepJob(jobId);
       request.catch((error) => {
-        state.prep.error = String(error);
+        state.prep.error = userFacingError(error, "备团任务处理失败");
         renderPrep();
       });
       return;
     }
-    const prepReview = event.target.closest("[data-prep-review-task]");
+    const prepReview = event.target.closest("[data-prep-review-job]");
     if (prepReview) {
-      state.review.taskId = prepReview.dataset.prepReviewTask;
+      state.review.taskId = prepReviewFilterValue(prepReview.dataset.prepReviewJob);
       state.review.reviewState = "needs_review";
+      state.review.page = 1;
       state.review.sourcePage = "";
       state.review.selectedIds = new Set();
       state.review.selectedCandidateId = null;
@@ -3467,12 +3921,29 @@ function bindEvents() {
       renderReview();
       return;
     }
-    const reviewPromote = event.target.closest("[data-review-promote]");
-    if (reviewPromote) {
-      promoteReviewCandidate(
-        reviewPromote.dataset.reviewCandidate,
-        reviewPromote.dataset.reviewPromote
-      );
+    const sourceRemove = event.target.closest("[data-review-source-remove]");
+    if (sourceRemove) {
+      const row = sourceRemove.closest("[data-review-source-row]");
+      const editor = row?.closest(".review-source-editor");
+      if (row) row.remove();
+      syncReviewSourceRemoveButtons(editor);
+      return;
+    }
+    const sourceAdd = event.target.closest("[data-review-source-add]");
+    if (sourceAdd) {
+      const editor = document.querySelector(".review-source-editor");
+      if (editor) {
+        const wrapper = document.createElement("div");
+        wrapper.innerHTML = sourceRefEditorRows([{}]);
+        const row = wrapper.firstElementChild;
+        editor.appendChild(row);
+        syncReviewSourceRemoveButtons(editor);
+      }
+      return;
+    }
+    const sourceSave = event.target.closest("[data-review-source-save]");
+    if (sourceSave) {
+      void saveReviewSourceRefs(sourceSave.dataset.reviewSourceSave);
       return;
     }
     const reviewWorkspace = event.target.closest("[data-review-workspace]");
@@ -3488,12 +3959,14 @@ function bindEvents() {
       );
       return;
     }
-    const reviewSource = event.target.closest("[data-review-source-file]");
-    if (reviewSource) {
-      openSourceReference(
-        reviewSource.dataset.reviewSourceFile,
-        Number(reviewSource.dataset.reviewSourcePage)
-      );
+    const reviewSplit = event.target.closest("[data-review-split]");
+    if (reviewSplit) {
+      splitReviewCandidate(reviewSplit.dataset.reviewSplit);
+      return;
+    }
+    const reviewMerge = event.target.closest("[data-review-merge]");
+    if (reviewMerge) {
+      mergeReviewCandidates();
       return;
     }
     const resumeButton = event.target.closest("[data-resume-plan]");
@@ -3502,15 +3975,13 @@ function bindEvents() {
     if (planButton) {
       startPlan(planButton.dataset.startPlan).catch((error) => {
         $("global-error").hidden = false;
-        $("global-error").textContent = String(error);
+        $("global-error").textContent = userFacingError(error, "运行场景启动失败");
       });
     }
-    const editPlanButton = event.target.closest("[data-edit-plan]");
-    if (editPlanButton) openPlanEditor(editPlanButton.dataset.editPlan);
     const deletePlanButton = event.target.closest("[data-delete-plan]");
     if (deletePlanButton) deletePlan(deletePlanButton.dataset.deletePlan).catch((error) => {
       $("global-error").hidden = false;
-      $("global-error").textContent = String(error);
+      $("global-error").textContent = userFacingError(error, "运行场景删除失败");
     });
     const beatButton = event.target.closest("[data-beat-delta]");
     if (beatButton) changeBeat(Number(beatButton.dataset.beatDelta));
@@ -3520,6 +3991,16 @@ function bindEvents() {
     if (clockButton) changeClock(clockButton.dataset.clockAction, Number(clockButton.dataset.clockDelta));
     const editFact = event.target.closest("[data-edit-fact]");
     if (editFact) openFactEditor(editFact.dataset.editFact);
+    const createMaterial = event.target.closest("[data-create-display-material]");
+    if (createMaterial) {
+      createDisplayMaterialFromFact(createMaterial.dataset.createDisplayMaterial);
+      return;
+    }
+    const editMaterial = event.target.closest("[data-edit-display-material]");
+    if (editMaterial) {
+      openDisplayMaterialEditor(editMaterial.dataset.editDisplayMaterial);
+      return;
+    }
     const cardReview = event.target.closest("[data-card-review-action]");
     if (cardReview) {
       reviewCards([cardReview.dataset.cardReviewId], cardReview.dataset.cardReviewAction);
@@ -3532,14 +4013,6 @@ function bindEvents() {
     const deleteCardButton = event.target.closest("[data-delete-card]");
     if (deleteCardButton) deleteCard(deleteCardButton.dataset.deleteCard);
     if (event.target.closest("[data-close-modal]") || event.target === $("editor-modal")) closeModal();
-    const sourceButton = event.target.closest("[data-open-source-file]");
-    if (sourceButton) {
-      openSourceReference(
-        sourceButton.dataset.openSourceFile,
-        Number(sourceButton.dataset.openSourcePage)
-      );
-      return;
-    }
     const link = event.target.closest("[data-fact-link]");
     if (link) {
       state.selectedFactId = link.dataset.factLink;
@@ -3585,12 +4058,17 @@ async function init() {
     await loadWorkspaces();
     if (!state.exampleId) {
       bindEvents();
+      await Promise.all([loadSourceFiles(), loadPrepConfig(), loadPrepJobs()]);
+      renderPrep();
       renderEmptyWorkspace();
       if (["prep", "shelf", "facts", "cards", "review", "runtime"].includes(state.initialView)) showView(state.initialView);
       return;
     }
-    document.querySelector('.action-link[href^="/api/domain/export"]').href =
-      `/api/domain/export?example=${encodeURIComponent(state.exampleId)}`;
+    const exportBundle = $("export-bundle");
+    if (exportBundle) {
+      exportBundle.hidden = false;
+      exportBundle.href = `/api/domain/export?example=${encodeURIComponent(state.exampleId)}`;
+    }
     updateSessionReviewLinks();
     const response = await fetch(
       `/api/domain/workbench?example=${encodeURIComponent(state.exampleId)}`,
@@ -3623,7 +4101,7 @@ async function init() {
     status.textContent = "加载失败";
     const panel = $("global-error");
     panel.hidden = false;
-    panel.textContent = String(error);
+    panel.textContent = userFacingError(error, "工作台加载失败");
   }
 }
 

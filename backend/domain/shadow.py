@@ -1,7 +1,7 @@
 """P1 shadow-mode contracts kept outside approved domain bundles."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -10,7 +10,16 @@ from .models import FactKind, SourceRef
 
 ShadowTaskStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 ShadowRunStatus = Literal["running", "succeeded", "failed", "cancelled"]
+ShadowErrorKind = Literal[
+    "model_format",
+    "upstream_unavailable",
+    "input_config",
+    "worker",
+    "cancelled",
+]
 ShadowReviewState = Literal["needs_review", "accepted", "rejected"]
+ShadowReviewAction = Literal["review", "edit", "split", "merge"]
+CandidateContentBasis = Literal["model_candidate", "source_fact", "inference", "gm_authored"]
 
 
 class ShadowTaskSpec(BaseModel):
@@ -79,6 +88,7 @@ class ShadowRun(BaseModel):
     raw_response_summary: str | None = Field(default=None, max_length=2000)
     parse_error: str | None = Field(default=None, max_length=2000)
     transport_error: str | None = Field(default=None, max_length=2000)
+    error_kind: ShadowErrorKind | None = None
     candidate_count: int = Field(default=0, ge=0)
 
     @field_validator(
@@ -128,20 +138,48 @@ class ShadowResponse(BaseModel):
 
 
 class ShadowReviewEvent(BaseModel):
-    """An append-only GM review action that preserves the model's original text."""
+    """Metadata for one candidate operation; content lives only on the candidate."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(pattern=r"^shadow_review_[a-z0-9_-]+$")
+    action: ShadowReviewAction = "review"
     review_state: ShadowReviewState
-    reviewed_text: str | None = Field(default=None, min_length=1, max_length=2000)
-    review_note: str | None = Field(default=None, min_length=1, max_length=2000)
+    note: str | None = Field(default=None, min_length=1, max_length=2000)
+    source_changes: list[str] = Field(default_factory=list, max_length=24)
+    field_paths: list[str] = Field(default_factory=list, max_length=24)
+    related_candidate_ids: list[str] = Field(default_factory=list, max_length=50)
     created_at: str = Field(min_length=1)
 
-    @field_validator("reviewed_text", "review_note")
+    @field_validator("note")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("source_changes", "field_paths", "related_candidate_ids")
+    @classmethod
+    def normalize_metadata_lists(cls, value: list[str]) -> list[str]:
+        values = [item.strip() for item in value if item.strip()]
+        if len(values) != len(set(values)):
+            raise ValueError("review metadata values must be unique")
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_content_fields(cls, value: Any) -> Any:
+        """Read old rows without carrying historical content into new writes."""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "action" not in data:
+            data["action"] = "review"
+        if data.get("note") is None and data.get("review_note"):
+            data["note"] = data["review_note"]
+        # Older rows stored a second text field in every event. It is
+        # intentionally ignored; only operation metadata is reconstructed.
+        data.pop("reviewed_text", None)
+        data.pop("review_note", None)
+        return data
 
 
 class ShadowCandidate(ShadowCandidateDraft):
@@ -151,14 +189,31 @@ class ShadowCandidate(ShadowCandidateDraft):
     task_id: str = Field(pattern=r"^shadow_task_[a-z0-9_-]+$")
     run_id: str = Field(pattern=r"^shadow_run_[a-z0-9_-]+$")
     evidence_status: Literal["model_candidate"] = "model_candidate"
+    # The candidate remains unpromoted, while this field records the basis of
+    # the current editable claim for promotion validation.
+    content_basis: CandidateContentBasis = "model_candidate"
     review_state: ShadowReviewState = "needs_review"
-    reviewed_text: str | None = Field(default=None, min_length=1, max_length=2000)
     review_note: str | None = Field(default=None, min_length=1, max_length=2000)
     reviewed_at: str | None = None
     review_history: list[ShadowReviewEvent] = Field(default_factory=list, max_length=100)
     created_at: str = Field(min_length=1)
 
-    @field_validator("reviewed_text", "review_note", "reviewed_at")
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_review_content(cls, value: Any) -> Any:
+        """Load legacy rows while writing only the current-record shape."""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        # The previous schema kept a second reviewed text field. The current
+        # record is authoritative; discard the stale duplicate instead of
+        # allowing old model output to overwrite the current text.
+        data.pop("reviewed_text", None)
+        if "content_basis" not in data:
+            data["content_basis"] = "model_candidate"
+        return data
+
+    @field_validator("review_note", "reviewed_at")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
@@ -170,10 +225,122 @@ class ShadowCandidate(ShadowCandidateDraft):
         latest = self.review_history[-1]
         if self.review_state != latest.review_state:
             raise ValueError("candidate review_state must match the latest review event")
-        if self.reviewed_text != latest.reviewed_text:
-            raise ValueError("candidate reviewed_text must match the latest review event")
-        if self.review_note != latest.review_note:
-            raise ValueError("candidate review_note must match the latest review event")
         if self.reviewed_at != latest.created_at:
             raise ValueError("candidate reviewed_at must match the latest review event")
+        if self.review_note != latest.note:
+            raise ValueError("candidate review_note must match the latest review event")
         return self
+
+
+class ShadowCandidateEdit(BaseModel):
+    """Current-record candidate edit; omitted fields remain unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str | None = Field(default=None, min_length=1, max_length=2000)
+    kind: FactKind | None = None
+    source_refs: list[SourceRef] | None = Field(default=None, min_length=1, max_length=12)
+    possible_links: list[str] | None = Field(default=None, max_length=24)
+    open_questions: list[str] | None = Field(default=None, max_length=24)
+    content_basis: Literal["source_fact", "inference", "gm_authored"] | None = None
+    review_note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("text", "review_note")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("possible_links", "open_questions")
+    @classmethod
+    def normalize_optional_lists(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        values = [item.strip() for item in value if item.strip()]
+        if len(values) != len(set(values)):
+            raise ValueError("candidate list values must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def has_change(self) -> "ShadowCandidateEdit":
+        if not any(
+            value is not None
+            for value in (
+                self.text,
+                self.kind,
+                self.source_refs,
+                self.possible_links,
+                self.open_questions,
+                self.content_basis,
+                self.review_note,
+            )
+        ) and "review_note" not in self.model_fields_set:
+            raise ValueError("candidate edit must change at least one field")
+        if self.text is not None and self.content_basis is None:
+            # A rewritten claim is not allowed to silently retain source-fact
+            # semantics; the caller must opt into a stronger basis explicitly.
+            self.content_basis = "inference"
+        return self
+
+
+class ShadowCandidateSplitIn(BaseModel):
+    """Replacement children for one candidate split operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    parts: list[ShadowCandidateDraft] = Field(min_length=2, max_length=12)
+    content_basis: Literal["source_fact", "inference", "gm_authored"] = "inference"
+    review_note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("review_note")
+    @classmethod
+    def strip_optional_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ShadowCandidateMergeIn(BaseModel):
+    """Replacement candidate for a merge operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_ids: list[str] = Field(min_length=2, max_length=50)
+    text: str = Field(min_length=1, max_length=2000)
+    kind: FactKind | None = None
+    source_refs: list[SourceRef] | None = Field(default=None, min_length=1, max_length=12)
+    possible_links: list[str] | None = Field(default=None, max_length=24)
+    open_questions: list[str] | None = Field(default=None, max_length=24)
+    content_basis: Literal["source_fact", "inference", "gm_authored"] = "inference"
+    review_note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("candidate_ids")
+    @classmethod
+    def normalize_candidate_ids(cls, value: list[str]) -> list[str]:
+        values = [item.strip() for item in value if item.strip()]
+        if len(values) < 2:
+            raise ValueError("merge needs at least two candidate ids")
+        if len(values) != len(set(values)):
+            raise ValueError("merge candidate ids must be unique")
+        return values
+
+    @field_validator("review_note")
+    @classmethod
+    def strip_optional_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("possible_links", "open_questions")
+    @classmethod
+    def normalize_optional_lists(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        values = [item.strip() for item in value if item.strip()]
+        if len(values) != len(set(values)):
+            raise ValueError("candidate list values must be unique")
+        return values

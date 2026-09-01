@@ -17,7 +17,16 @@ if str(ROOT) not in sys.path:
 from backend.app import artifacts, prep, storage  # noqa: E402
 from backend.app.llm import FakeLLM, find_task  # noqa: E402
 from backend.app.main import app  # noqa: E402
-from backend.domain import ExampleBundle, PageSpan, PrepJobCreate, SourceFact, SourceRef  # noqa: E402
+from backend.domain import (  # noqa: E402
+    ExampleBundle,
+    ExtractionWindow,
+    PageSpan,
+    PrepJob,
+    PrepJobCreate,
+    PrepScope,
+    SourceFact,
+    SourceRef,
+)
 
 
 def make_running_header_pdf(path: Path) -> None:
@@ -100,7 +109,6 @@ async def main() -> None:
                     source_file=relative_source,
                     page_range="1-10",
                     profile_id="cthulhu-dark-2e",
-                    session_minutes=120,
                 )
             )
             rebuilt = prep.rebuild_prep_job(first.id)
@@ -112,6 +120,33 @@ async def main() -> None:
 
             workspace = large_workspace()
             storage.save_domain_bundle(workspace.id, workspace.model_dump(mode="json"))
+            artifact_scope = PrepJob(
+                id="prep_job_reassessment_large",
+                status="completed",
+                scope=PrepScope(
+                    source_file="fixture://chapter",
+                    source_version="v1",
+                    page_spans=[PageSpan(start=96, end=180)],
+                    profile_id="cthulhu-dark-2e",
+                    objective="chapter artifact contract",
+                ),
+                model_id="fake-reassessment",
+                prompt_version="test",
+                schema_version="test",
+                workspace_id=workspace.id,
+                windows=[
+                    ExtractionWindow(
+                        id="prep_window_reassessment_large",
+                        page_span=PageSpan(start=96, end=180),
+                        core_span=PageSpan(start=96, end=180),
+                        status="succeeded",
+                        input_chars=10,
+                    )
+                ],
+                created_at=storage.now(),
+                updated_at=storage.now(),
+            )
+            storage.create_prep_job(artifact_scope.model_dump(mode="json"))
 
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -158,6 +193,12 @@ async def main() -> None:
                 storage.save_domain_bundle(
                     retry_workspace.id, retry_workspace.model_dump(mode="json")
                 )
+                retry_scope = artifact_scope.model_copy(update={
+                    "id": "prep_job_reassessment_retry",
+                    "workspace_id": retry_workspace.id,
+                    "updated_at": storage.now(),
+                })
+                storage.create_prep_job(retry_scope.model_dump(mode="json"))
                 storage.set_config(
                     {
                         "base_url": "http://offline.invalid",
@@ -194,12 +235,25 @@ async def main() -> None:
                     first_status = await client.get(
                         f"/api/domain/examples/{retry_workspace.id}/cards/draft-jobs/{retry_job_id}"
                     )
-                    assert first_status.json()["job"]["status"] == "failed"
+                    failed_job = first_status.json()["job"]
+                    assert failed_job["status"] == "failed"
+                    assert failed_job["completed_cards"] == failed_job["planned_card_count"]
+                    assert failed_job["card_count"] < failed_job["planned_card_count"]
+                    assert "已全部尝试" in failed_job["error"]
                     local_calls = flaky.calls.get("prep:artifact_local_digest", 0)
                     global_calls = flaky.calls.get("prep:artifact_global_plan", 0)
+                    materialize_calls = flaky.calls.get("prep:artifact_materialize", 0)
+                    assert materialize_calls >= failed_job["planned_card_count"]
+
+                    duplicate_try = await client.post(
+                        f"/api/domain/examples/{retry_workspace.id}/cards/draft"
+                    )
+                    assert duplicate_try.status_code == 202, duplicate_try.text
+                    assert duplicate_try.json()["created"] is False
+                    assert duplicate_try.json()["job"]["id"] == retry_job_id
 
                     second_try = await client.post(
-                        f"/api/domain/examples/{retry_workspace.id}/cards/draft"
+                        f"/api/domain/examples/{retry_workspace.id}/cards/draft-jobs/{retry_job_id}/retry"
                     )
                     assert second_try.status_code == 202, second_try.text
                     assert second_try.json()["job"]["id"] == retry_job_id

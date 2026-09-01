@@ -47,7 +47,7 @@ GM 已确认 PDF 上传和真实模型抽取基本可用；一次末段失败经
 
 - 只有最新复核状态为 `accepted` 且存在复核历史的候选可以提升。
 - 同一候选重复以同一证据状态提升是幂等操作；改用另一证据状态会返回冲突。
-- 提升复制完整 `source_refs/source_version`，使用复核稿优先于模型原文。
+- 提升复制完整 `source_refs/source_version`，使用候选当前记录；编辑后的非原文内容必须标为推断或 GM 创作。
 - `SourceFact.provenance` 保存 candidate、task、run、review 和提升时间。
 - `candidate_promotions` 保存候选与事实完整快照；即使原任务随后删除，审计信息仍在。
 - 工作区 ID 与任务 ID 一致，不会把真实上传模组注入 `red_signal_fixture` 或 `naimen_pilot`。

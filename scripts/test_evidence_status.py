@@ -68,9 +68,11 @@ def main() -> None:
     )
 
     planned_candidate = bundle.model_copy(deep=True)
-    planned_candidate.plans[0].beats[0].reveal_fact_ids.append("fact_evidence_candidate")
+    planned_candidate.cards[1].edit_state = "approved"
+    planned_candidate.plans[0].card_ids.append("card_evidence_candidate_draft")
+    planned_candidate.plans[0].location_card_ids.append("card_evidence_candidate_draft")
     expect_rejection(
-        "scene plan cannot reveal a model candidate",
+        "runtime plan cannot include a candidate-backed card",
         lambda: validate_bundle(planned_candidate, profiles),
     )
 
