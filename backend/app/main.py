@@ -23,22 +23,20 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-import fitz
+import pymupdf as fitz
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from . import artifacts, analyze, extract, generate, llm, prep, shadow, skill_loader, storage
+from . import artifacts, analyze, extract, generate, llm, prep, shadow, storage
 from ..domain import (
     DomainValidationError,
     DisplayMaterial,
     DisplayMaterialLink,
     ExampleBundle,
     PrepJobCreate,
-    SessionLogEntry,
     SessionState,
-    ScenePlan,
     ShadowTaskSpec,
     ShadowCandidateEdit,
     ShadowCandidateMergeIn,
@@ -1137,10 +1135,11 @@ def _promote_accepted_prep_candidates(candidates, review_state: str) -> list[dic
     if review_state != "accepted":
         return []
     prep_task_ids = {
-        window.shadow_task_id
+        task_id
         for job in prep.list_prep_jobs()
         for window in job.windows
-        if window.shadow_task_id
+        for task_id in (window.shadow_task_id, window.consolidation_task_id)
+        if task_id
     }
     promotions = []
     try:
@@ -1512,7 +1511,6 @@ def retry_domain_card_draft_job(
         raise HTTPException(409, str(error)) from error
     if not created:
         raise HTTPException(409, "只有失败的产物任务可以重试")
-    prep_job = prep.find_prep_job_by_workspace(example)
     background_tasks.add_task(
         artifacts.execute_artifact_job,
         job.id,

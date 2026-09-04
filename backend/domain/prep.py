@@ -17,13 +17,22 @@ WindowBoundaryBasis = Literal[
     "continuation",
     "page_limit",
     "char_budget",
+    "transport_budget",
 ]
 WindowBoundarySignal = Literal["possible_heading", "possible_continuation", "sentence_end"]
 SegmentationStatus = Literal["pending", "succeeded", "fallback"]
-SegmentationStrategy = Literal["semantic-v1", "mechanical-v3"]
+SegmentationStrategy = Literal["semantic-v1", "semantic-v2", "mechanical-v3"]
+WindowSplitReason = Literal[
+    "legacy",
+    "none",
+    "scope_end",
+    "page_limit",
+    "transport_budget",
+]
 PrepErrorKind = Literal[
     "model_format",
     "upstream_unavailable",
+    "account_access",
     "input_config",
     "worker",
     "cancelled",
@@ -140,6 +149,22 @@ class PrepJobCreate(BaseModel):
         return value or None
 
 
+class CoreTextSlice(BaseModel):
+    """A lossless character range owned by one transport window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int = Field(ge=1)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def range_is_non_empty(self) -> "CoreTextSlice":
+        if self.end_char <= self.start_char:
+            raise ValueError("core text slice must contain at least one character")
+        return self
+
+
 class ExtractionWindow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,17 +177,30 @@ class ExtractionWindow(BaseModel):
     boundary_pages: list[int] = Field(default_factory=list, max_length=2)
     boundary_basis: WindowBoundaryBasis = "legacy"
     boundary_signals: list[WindowBoundarySignal] = Field(default_factory=list, max_length=3)
+    split_reason: WindowSplitReason = "legacy"
+    semantic_segment_id: str | None = Field(
+        default=None, pattern=r"^semantic_segment_[a-z0-9_-]+$"
+    )
+    segment_window_index: int | None = Field(default=None, ge=1)
+    segment_window_count: int | None = Field(default=None, ge=1)
+    core_text_slices: list[CoreTextSlice] = Field(default_factory=list, max_length=48)
     truncated_pages: list[int] = Field(default_factory=list, max_length=8)
     status: PrepWindowStatus = "queued"
     shadow_task_id: str | None = Field(
         default=None, pattern=r"^shadow_task_[a-z0-9_-]+$"
     )
+    consolidation_task_id: str | None = Field(
+        default=None, pattern=r"^shadow_task_[a-z0-9_-]+$"
+    )
+    consolidation_status: PrepWindowStatus | None = None
+    consolidation_candidate_count: int = Field(default=0, ge=0)
+    consolidation_error: str | None = Field(default=None, max_length=2000)
     candidate_count: int = Field(default=0, ge=0)
     input_chars: int = Field(default=0, ge=0)
     error: str | None = Field(default=None, max_length=2000)
     error_kind: PrepErrorKind | None = None
 
-    @field_validator("error")
+    @field_validator("error", "consolidation_error")
     @classmethod
     def strip_error(cls, value: str | None) -> str | None:
         if value is None:
@@ -193,6 +231,34 @@ class ExtractionWindow(BaseModel):
             raise ValueError("boundary_signals values must be unique")
         if any(page in core_pages for page in self.context_pages):
             raise ValueError("context_pages cannot overlap core_span")
+        indexed = self.segment_window_index is not None
+        counted = self.segment_window_count is not None
+        if indexed != counted:
+            raise ValueError(
+                "segment_window_index and segment_window_count must be provided together"
+            )
+        if self.semantic_segment_id is None and (indexed or counted):
+            raise ValueError("segment window numbering requires a semantic segment id")
+        window_index = self.segment_window_index
+        window_count = self.segment_window_count
+        if window_index is not None and window_count is not None and window_index > window_count:
+            raise ValueError("segment window index cannot exceed its count")
+        if self.consolidation_task_id is None:
+            if self.consolidation_status not in {None, "failed"}:
+                raise ValueError("only a preflight consolidation failure may lack a task")
+            if self.consolidation_status == "failed" and not self.consolidation_error:
+                raise ValueError("failed consolidation without a task needs an error")
+        seen_ranges: dict[int, list[tuple[int, int]]] = {}
+        for text_slice in self.core_text_slices:
+            if text_slice.page not in core_pages:
+                raise ValueError("core text slices must stay inside core_span")
+            ranges = seen_ranges.setdefault(text_slice.page, [])
+            if any(
+                text_slice.start_char < end and start < text_slice.end_char
+                for start, end in ranges
+            ):
+                raise ValueError("core text slices cannot overlap")
+            ranges.append((text_slice.start_char, text_slice.end_char))
         return self
 
 

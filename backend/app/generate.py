@@ -4,7 +4,6 @@
 """
 from __future__ import annotations
 
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
@@ -300,7 +299,7 @@ def run_generate_staged(campaign_id: int, part: str, client: LLMClient | FakeLLM
                     yield {"type": "stage_done", "current": done_count, "total": total,
                            "chunk": st["title"],
                            "count": len(data.get("locations", data.get("tools", [])) or [])}
-                except Exception as e:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
                     # 自动重试一次（中转站波动常见，重试常能成功）
                     try:
                         _, data = _stage_one(st)

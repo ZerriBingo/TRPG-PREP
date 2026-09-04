@@ -150,7 +150,9 @@ const prepBoundaryLabels = {
   sentence_end: "历史句末信号（非分段）",
   continuation: "历史续写信号（非分段）",
   page_limit: "固定页数",
-  char_budget: "字数上限"
+  char_budget: "历史字数上限",
+  transport_budget: "传输预算（语义段未切断）",
+  semantic: "语义段末端"
 };
 const prepProfileLabels = {
   "cthulhu-dark-2e": "现实恐怖",
@@ -308,18 +310,24 @@ function prepReviewJobId(value) {
 
 function reviewTaskLabel(task) {
   const pages = Array.isArray(task.source_pages) ? task.source_pages.join(",") : "";
-  return "分析窗口 · " + sourceBasename(task.source_file) + (pages ? " · p" + pages : "");
+  const prefix = task.task_kind === "semantic_consolidation" ? "语义段归并" : "分析窗口";
+  return prefix + " · " + sourceBasename(task.source_file) + (pages ? " · p" + pages : "");
 }
 
 function prepShadowTaskIds() {
   return new Set((state.prep.jobs || []).flatMap((job) =>
-    (job.windows || []).map((window) => window.shadow_task_id).filter(Boolean)
+    (job.windows || []).flatMap((window) => [
+      window.shadow_task_id,
+      window.consolidation_task_id
+    ]).filter(Boolean)
   ));
 }
 
 function prepJobForShadowTask(taskId) {
   return (state.prep.jobs || []).find((job) =>
-    (job.windows || []).some((window) => window.shadow_task_id === taskId)
+    (job.windows || []).some((window) =>
+      window.shadow_task_id === taskId || window.consolidation_task_id === taskId
+    )
   ) || null;
 }
 
@@ -348,6 +356,7 @@ function reviewPrepJobLabel(job) {
 const prepErrorKindLabels = {
   model_format: "模型格式",
   upstream_unavailable: "上游服务",
+  account_access: "账号或访问状态",
   input_config: "输入或配置",
   worker: "后台任务",
   cancelled: "已取消"
@@ -356,6 +365,7 @@ const prepErrorKindLabels = {
 const prepErrorKindSummaries = {
   model_format: "模型返回格式不兼容，可重试此页段。",
   upstream_unavailable: "上游服务暂时不可用，可稍后重试。",
+  account_access: "账号、密钥、代理或供应商状态异常；请检查后再试。",
   input_config: "来源或模型配置有误，请检查后重试。",
   worker: "后台任务未完成，可重试此页段。",
   cancelled: "该页段已取消。"
@@ -369,8 +379,28 @@ function prepErrorSummary(value, errorKind = "") {
   }
   if (/Model is unavailable/i.test(error)) return "当前模型暂时不可用，可稍后重试。";
   if (/HTTP 429|rate.?limit/i.test(error)) return "上游请求过于频繁，可稍后重试。";
+  if (/account_muted|账号访问被暂停/i.test(error)) {
+    return "账号、密钥、代理或供应商状态异常；请检查后再试。";
+  }
   if (/cancelled/i.test(error)) return "该页段已取消。";
   return userFacingError(error, "该页段处理失败，请重试。");
+}
+
+function prepConsolidationErrorSummary(value) {
+  const error = String(value || "").trim();
+  if (/account_muted|账号访问被暂停/i.test(error)) {
+    return "账号、密钥、代理或供应商状态异常；请检查后再试。";
+  }
+  if (/validation errors for ShadowResponse|model output validation failed/i.test(error)) {
+    return "模型返回格式不兼容，可重试未完成部分。";
+  }
+  if (/timeout|timed out|超时/i.test(error)) {
+    return "上游模型请求超时，可重试未完成部分。";
+  }
+  if (/interrupted|中断/i.test(error)) {
+    return "任务在语义段整理完成前中断，可重试未完成部分。";
+  }
+  return userFacingError(error, "语义段整理未完成，可重试未完成部分。");
 }
 
 const prepSegmentationLabels = {
@@ -431,40 +461,62 @@ function renderPrep() {
       ? '<div class="prep-segmentation-pending">语义分段准备中；完成后显示语义窗口。</div>'
       : (job.windows || []).map((window) => {
       const coreSpan = window.core_span || window.page_span;
+      const segmentSummaryWindow = !window.semantic_segment_id ||
+        !window.segment_window_count ||
+        window.segment_window_index === window.segment_window_count;
       const contextLabel = Array.isArray(window.context_pages) && window.context_pages.length
         ? " · 上下文 " + window.context_pages.map((page) => "p" + page).join(", ")
         : "";
       const truncationLabel = Array.isArray(window.truncated_pages) && window.truncated_pages.length
         ? " · 截断 " + window.truncated_pages.map((page) => "p" + page).join(", ")
         : "";
-      const boundaryClass = ["heading", "sentence_end", "continuation", "char_budget"].includes(window.boundary_basis)
+      const segmentLabel = window.semantic_segment_id
+        ? " · 语义单元窗口 " + (window.segment_window_index || "?") + "/" + (window.segment_window_count || "?")
+        : "";
+      const consolidationLabel = segmentSummaryWindow && window.consolidation_status
+        ? " · 段级归并 " + (prepWindowStatusLabels[window.consolidation_status] || window.consolidation_status) +
+          (window.consolidation_candidate_count ? " · " + window.consolidation_candidate_count + " 条结果" : "")
+        : "";
+      const consolidationError = segmentSummaryWindow && window.consolidation_error
+        ? '<details class="prep-window-error"><summary>' + esc(prepConsolidationErrorSummary(window.consolidation_error)) + '</summary><p class="muted prep-technical-error">错误详情：' + esc(window.consolidation_error) + '</p></details>'
+        : "";
+      const boundaryClass = ["heading", "sentence_end", "continuation", "char_budget", "transport_budget"].includes(window.boundary_basis)
         ? "needs_review"
         : "neutral";
-      const windowAction = window.shadow_task_id && window.candidate_count
+      const mechanicalReviewEntry = !window.semantic_segment_id &&
+        window.shadow_task_id && window.candidate_count > 0;
+      const semanticReviewEntry = job.status === "completed" &&
+        window.semantic_segment_id &&
+        window.segment_window_index === window.segment_window_count &&
+        window.consolidation_status === "succeeded" &&
+        window.consolidation_candidate_count > 0;
+      const windowAction = mechanicalReviewEntry || semanticReviewEntry
         ? '<button class="edit-button" type="button" data-prep-review-job="' +
           esc(job.id) + '">复核</button>'
         : "";
       const error = window.error
         ? '<details class="prep-window-error"><summary>' + esc(prepErrorSummary(window.error, window.error_kind)) +
           '</summary><p class="muted">错误类别：' + esc(prepErrorKindLabels[window.error_kind] || "未分类") +
-          ' · 可在任务操作中重试失败页段。</p><p class="muted prep-technical-error">' + esc(window.error) + '</p></details>'
+          (job.segmentation_strategy === "semantic-v2" ? ' · 可在任务操作中重试未完成部分。' : ' · 可在任务操作中重试失败页段。') +
+          '</p><p class="muted prep-technical-error">' + esc(window.error) + '</p></details>'
         : "";
       return '<div class="prep-window-row">' +
         '<span class="page-ref">负责 ' + esc(prepSpanLabel(coreSpan)) + '</span>' +
         badge(prepWindowStatusLabels[window.status] || window.status, window.status) +
         '<span class="muted">读取 ' + esc(prepSpanLabel(window.page_span)) + contextLabel +
-          ' · ' + window.candidate_count + " 条候选" + truncationLabel +
+          ' · ' + window.candidate_count + " 条窗口观察" + segmentLabel + consolidationLabel + truncationLabel +
           ' ' + badge(prepBoundaryLabels[window.boundary_basis] || window.boundary_basis, boundaryClass) + '</span>' +
-        windowAction + error +
+        windowAction + error + consolidationError +
         '</div>';
       }).join("");
     const actions = [];
+    const retryActionLabel = job.segmentation_strategy === "semantic-v2" ? "重试未完成部分" : "重试失败页段";
     if (job.status === "running") {
       actions.push('<button class="edit-button danger" type="button" data-prep-action="cancel" data-prep-job-id="' +
         esc(job.id) + '">取消</button>');
     } else if (["queued", "failed", "partial", "cancelled"].includes(job.status)) {
       actions.push('<button class="edit-button" type="button" data-prep-action="run" data-prep-job-id="' +
-        esc(job.id) + '">' + (job.status === "queued" ? "开始" : "重试失败页段") + '</button>');
+        esc(job.id) + '">' + (job.status === "queued" ? "开始" : retryActionLabel) + '</button>');
     }
     if (job.promoted_count > 0 && job.workspace_id) {
       actions.push('<button class="edit-button" type="button" data-prep-action="workspace" data-prep-workspace-id="' +
@@ -489,7 +541,7 @@ function renderPrep() {
       '<div class="prep-job-progress"><span>' + job.candidate_count + " 条候选" +
       '</span><span>' + job.windows.filter((item) => item.status === "succeeded").length +
       "/" + job.windows.length + " 个窗口" + '</span><span class="segmentation-status ' +
-      esc(segmentationStatus) + '" title="语义分段只决定窗口边界；失败时使用机械窗口">' + esc(segmentationText) + '</span></div>' +
+      esc(segmentationStatus) + '" title="语义段决定逻辑归属；传输预算只生成同一语义段的子窗口">' + esc(segmentationText) + '</span></div>' +
       '<div class="prep-window-list">' + windowsHtml + '</div>' +
       '<div class="row-actions">' + actions.join("") + '</div>' +
       '</article>';
@@ -1006,7 +1058,9 @@ async function submitReviewBatch() {
       state.prep.jobs = prepJobs;
       const prepByShadowTask = new Map();
       prepJobs.forEach((job) => (job.windows || []).forEach((window) => {
-        if (window.shadow_task_id) prepByShadowTask.set(window.shadow_task_id, job.id);
+        [window.shadow_task_id, window.consolidation_task_id].filter(Boolean).forEach((taskId) => {
+          prepByShadowTask.set(taskId, job.id);
+        });
       }));
       for (const candidateId of candidateIds) {
         const candidate = candidateById.get(candidateId);
@@ -1283,6 +1337,24 @@ function renderArtifactJobProgress(job = state.artifacts.job) {
   bar.setAttribute("aria-valuetext", `${progress.label} ${progress.value}%`);
   labelElement.textContent = progress.label;
   valueElement.textContent = `${progress.value}%`;
+}
+
+function artifactQuestionSummaryHtml(job = state.artifacts.job) {
+  const preview = Array.isArray(job?.open_questions) ? job.open_questions : [];
+  const total = Math.max(Number(job?.open_question_count) || 0, preview.length);
+  if (!total) return "";
+  const overflow = Math.max(
+    Number(job?.open_question_overflow_count) || 0,
+    total - preview.length,
+    0
+  );
+  const questions = preview.length
+    ? `<ul>${preview.map((question) => `<li>${esc(question)}</li>`).join("")}</ul>`
+    : "";
+  const overflowNote = overflow
+    ? `<p class="muted">另有 ${overflow} 条待确认问题未列入此摘要。</p>`
+    : "";
+  return `<details class="artifact-question-summary"><summary>待确认问题：已展示 ${preview.length} / 共计 ${total}</summary>${questions}${overflowNote}</details>`;
 }
 
 function scheduleArtifactPoll() {
@@ -2809,7 +2881,7 @@ function renderArtifactStage() {
     job ? `<span><strong>${artifactJobStatusLabels[job.status] || job.status}</strong> 生成任务` +
       (job.phase ? ` · ${artifactJobPhaseLabels[job.phase] || job.phase}` : "") +
       `</span>` : ""
-  ].join("");
+  ].join("") + artifactQuestionSummaryHtml(job);
   renderArtifactJobProgress(job);
 }
 

@@ -1,5 +1,4 @@
 """验证增量保存：run_analysis 流里应出现 partial 事件，且每块后知识库统计增长。"""
-import json
 import sys
 from pathlib import Path
 

@@ -1,5 +1,5 @@
 """FakeLLM 全流程验证：子切后 6 块分析 + 分阶段生成（不依赖中转站）。"""
-import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -30,7 +30,6 @@ assert done2 is not None
 print("PASS: 分阶段生成 6 阶段完成")
 
 # 检查子块文本带页标记（决定模型能否标准页码）
-import sqlite3
 conn = sqlite3.connect(str(ROOT / "data/app.db"))
 conn.row_factory = sqlite3.Row
 rows = conn.execute("SELECT idx, title, length(text) n FROM chunks WHERE campaign_id=35 ORDER BY idx").fetchall()

@@ -1,9 +1,14 @@
-# trpg-prep（TRPG 备团）
+# trpg-prep legacy skill（兼容管线）
 
-将模组源材料（PDF / 文本）转化为可直接用于主持的三部分备团产物。
-本 skill 是程序的运行时组件：分析、生成、迭代的全部 prompt 与 schema 均由此文件及其 schemas/ 目录驱动。
+> 这是旧 `analyze` / `generate` 兼容入口使用的运行时资源，不是当前 semantic-v2
+> 备团管线的产品契约。当前领域行为以 `CONTEXT.md`、`docs/REASSESSMENT_2026-08-31.md`、
+> `docs/ARTIFACT_CONTRACTS.md` 和 `docs/LLM_PIPELINE.md` 为准。这里的内容和 schema
+> 只在维护兼容入口时使用。
 
-## 工作流（程序按此执行）
+将模组源材料（PDF / 文本）转化为旧兼容接口所需的三部分备团产物。
+本 skill 与 `schemas/` 只服务旧管线，保留在仓库中以避免兼容入口失效。
+
+## 旧兼容工作流（仅供 legacy 入口）
 
 1. **摄入**：提取模组文本层，逐页检测文本密度（文本页 / 低文本页 / 扫描页），按章节标题页分块，附录单独标记。
 2. **分析（逐块 map）**：对每个分块调用一次模型，抽取结构化事实：地点、NPC、物品、事件、线索，每项必须带来源页码。

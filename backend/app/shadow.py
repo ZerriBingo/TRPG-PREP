@@ -49,6 +49,8 @@ def _transport_error_kind(error: str) -> str:
     text = str(error or "").casefold()
     if "cancel" in text or "取消" in text:
         return "cancelled"
+    if "account_muted" in text or "账号访问被暂停" in text:
+        return "account_access"
     if any(token in text for token in ("429", "502", "503", "524", "rate limit", "temporarily", "timeout", "timed out", "network", "网络", "上游")):
         return "upstream_unavailable"
     if any(token in text for token in ("401", "403", "422", "api key", "配置", "密钥", "invalid model")):
@@ -122,8 +124,11 @@ def create_shadow_task(spec: ShadowTaskSpec) -> tuple[ShadowTask, bool]:
     return existing, False
 
 
-def list_shadow_tasks() -> list[ShadowTask]:
-    return [ShadowTask.model_validate(item) for item in storage.list_shadow_tasks()]
+def list_shadow_tasks(*, include_internal: bool = False) -> list[ShadowTask]:
+    tasks = [ShadowTask.model_validate(item) for item in storage.list_shadow_tasks()]
+    if include_internal:
+        return tasks
+    return [task for task in tasks if task.queue_visibility == "review"]
 
 
 def list_shadow_runs(task_id: str) -> list[ShadowRun]:
@@ -132,7 +137,10 @@ def list_shadow_runs(task_id: str) -> list[ShadowRun]:
 
 
 def list_shadow_candidates(
-    task_id: str | None = None, review_state: str | None = "needs_review"
+    task_id: str | None = None,
+    review_state: str | None = "needs_review",
+    *,
+    include_internal: bool = False,
 ) -> list[ShadowCandidate]:
     if task_id is not None:
         _task_from_store(task_id)
@@ -140,7 +148,11 @@ def list_shadow_candidates(
         raise ShadowResultValidationError(f"invalid shadow review state: {review_state}")
     return [
         ShadowCandidate.model_validate(item)
-        for item in storage.list_shadow_candidates(task_id, review_state)
+        for item in storage.list_shadow_candidates(
+            task_id,
+            review_state,
+            queue_visibility=None if include_internal else "review",
+        )
     ]
 
 
@@ -149,8 +161,19 @@ def shadow_task_detail(task_id: str) -> dict:
     return {
         "task": task,
         "runs": list_shadow_runs(task_id),
-        "candidates": list_shadow_candidates(task_id, review_state=None),
+        "candidates": list_shadow_candidates(
+            task_id, review_state=None, include_internal=True
+        ),
     }
+
+
+def set_shadow_task_visibility(task_id: str, queue_visibility: str) -> ShadowTask:
+    """Change queue visibility for a task and all of its current candidates."""
+    _task_from_store(task_id)
+    if queue_visibility not in {"review", "internal"}:
+        raise ShadowResultValidationError("invalid shadow task queue visibility")
+    storage.set_shadow_task_visibility(task_id, queue_visibility)
+    return _task_from_store(task_id)
 
 
 def cancel_shadow_task(task_id: str) -> ShadowTask:
@@ -326,6 +349,15 @@ def _candidate_from_replacement(
         task_id=task.id,
         run_id=run_id,
         evidence_status="model_candidate",
+        queue_visibility=task.queue_visibility,
+        candidate_role=(
+            "segment_result"
+            if task.task_kind == "semantic_consolidation"
+            else "window_observation"
+            if task.task_kind == "prep_window"
+            else "standalone"
+        ),
+        semantic_segment_id=task.semantic_segment_id,
         content_basis=content_basis,
         review_state="needs_review",
         review_note=event.note,
@@ -626,6 +658,15 @@ def submit_shadow_result(
                     id=f"shadow_candidate_{run.id.removeprefix('shadow_run_')}_{index}",
                     task_id=task.id,
                     run_id=run.id,
+                    queue_visibility=task.queue_visibility,
+                    candidate_role=(
+                        "segment_result"
+                        if task.task_kind == "semantic_consolidation"
+                        else "window_observation"
+                        if task.task_kind == "prep_window"
+                        else "standalone"
+                    ),
+                    semantic_segment_id=task.semantic_segment_id,
                     **candidate_data,
                     created_at=storage.now(),
                 )

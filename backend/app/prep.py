@@ -9,11 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import fitz
+import pymupdf as fitz
 from pydantic import ValidationError
 
 from ..domain import (
     ExampleBundle,
+    CoreTextSlice,
     DisplayMaterial,
     ExtractionWindow,
     FactProvenance,
@@ -39,8 +40,15 @@ MAX_REFERENCE_PAGE_COUNT = 8
 MAX_WINDOW_INPUT_CHARS = 14000
 MAX_SEMANTIC_PAGE_SIGNATURE_CHARS = 220
 MAX_SEMANTIC_INPUT_CHARS = 18000
-PROMPT_VERSION = "prep-fact-extract-v3"
+SEMANTIC_SLICE_MIN_BREAK_RATIO = 0.45
+PROMPT_VERSION = "prep-fact-extract-v4"
 SCHEMA_VERSION = "shadow-candidate-v1"
+CONSOLIDATION_PROMPT_VERSION = "prep-fact-consolidate-v4"
+DETERMINISTIC_CONSOLIDATION_VERSION = "prep-fact-consolidate-deterministic-v1"
+MAX_CONSOLIDATION_INPUT_CHARS = 15000
+MAX_CONSOLIDATION_CANDIDATES = 50
+MAX_CONSOLIDATION_ROUNDS = 8
+INTERRUPTED_CONSOLIDATION_ERROR = "segment consolidation was interrupted before completion"
 
 PROFILE_OBJECTIVES = {
     "cthulhu-dark-2e": (
@@ -109,6 +117,8 @@ def _prep_error_kind(error: object) -> str:
     text = str(error or "").casefold()
     if "cancel" in text or "取消" in text:
         return "cancelled"
+    if "account_muted" in text or "账号访问被暂停" in text:
+        return "account_access"
     if any(token in text for token in ("json", "validation", "schema", "字段", "格式", "candidate")):
         return "model_format"
     if any(token in text for token in ("api key", "配置", "密钥", "source pdf", "source file", "输入")):
@@ -211,14 +221,242 @@ def _estimated_window_chars(
     return sum(len(page_texts.get(page, "")) + 32 for page in range(transport_start, transport_end + 1))
 
 
+def _preferred_text_end(text: str, start: int, hard_end: int) -> int:
+    """Choose a readable break without ever exceeding the requested range."""
+    if hard_end >= len(text):
+        return len(text)
+    if hard_end <= start:
+        return min(len(text), start + 1)
+    minimum = start + max(1, int((hard_end - start) * SEMANTIC_SLICE_MIN_BREAK_RATIO))
+    break_chars = "\n。！？!?；;，,、:：.!?"
+    candidates = [text.rfind(character, start + 1, hard_end) + 1 for character in break_chars]
+    candidates = [position for position in candidates if position >= minimum]
+    if candidates:
+        return max(candidates)
+    whitespace = max(text.rfind(" ", start + 1, hard_end), text.rfind("\t", start + 1, hard_end))
+    if whitespace >= minimum:
+        return whitespace
+    return hard_end
+
+
+def _semantic_context_pages(span: PageSpan, core_start: int, core_end: int) -> list[int]:
+    pages: list[int] = []
+    if core_start > span.start:
+        pages.append(core_start - 1)
+    if core_end < span.end:
+        pages.append(core_end + 1)
+    return pages
+
+
+def _build_lossless_windows(
+    path: Path,
+    spans: list[PageSpan],
+    job_token: str,
+    *,
+    semantic_segments: bool,
+) -> list[ExtractionWindow]:
+    """Partition source ranges into lossless, auditable transport windows."""
+    page_texts = _page_texts(path, spans)
+    all_windows: list[ExtractionWindow] = []
+    global_index = 1
+    for segment_index, span in enumerate(spans, start=1):
+        segment_id = (
+            f"semantic_segment_{job_token}_{segment_index}"
+            if semantic_segments
+            else None
+        )
+        segment_windows: list[ExtractionWindow] = []
+        cursor_page = span.start
+        while cursor_page <= span.end:
+            core_start = cursor_page
+            feasible_ends = [
+                end
+                for end in range(core_start, span.end + 1)
+                if _estimated_window_chars(page_texts, span, core_start, end)
+                <= MAX_WINDOW_INPUT_CHARS
+            ]
+            slices: list[CoreTextSlice] = []
+            split_due_to_budget = False
+            if feasible_ends:
+                core_end = max(feasible_ends)
+                split_due_to_budget = core_end < span.end
+                for page in range(core_start, core_end + 1):
+                    page_text = page_texts.get(page, "")
+                    if page_text:
+                        slices.append(
+                            CoreTextSlice(page=page, start_char=0, end_char=len(page_text))
+                        )
+                cursor_page = core_end + 1
+            else:
+                # A single page can exceed the whole request budget. In that
+                # rare case, split only that page into contiguous source ranges;
+                # no page text is discarded or silently overwritten.
+                page_text = page_texts.get(core_start, "")
+                marker_chars = len(f"--- PDF p{core_start} ---\n")
+                available = max(1, MAX_WINDOW_INPUT_CHARS - marker_chars)
+                end_offset = _preferred_text_end(page_text, 0, available)
+                if not page_text:
+                    cursor_page = core_start + 1
+                else:
+                    slices.append(
+                        CoreTextSlice(
+                            page=core_start,
+                            start_char=0,
+                            end_char=end_offset,
+                        )
+                    )
+                    if end_offset < len(page_text):
+                        # Store the continuation offset on a local attribute by
+                        # advancing through a dedicated fragment loop below.
+                        continuation_offset = end_offset
+                        core_end = core_start
+                        context_pages = []
+                        transport = PageSpan(start=core_start, end=core_end, label=span.label)
+                        core = PageSpan(start=core_start, end=core_end, label=span.label)
+                        segment_windows.append(
+                            ExtractionWindow(
+                                id=f"prep_window_{job_token}_{global_index}",
+                                page_span=transport,
+                                core_span=core,
+                                context_pages=context_pages,
+                                boundary_pages=[core_start],
+                                boundary_basis="transport_budget",
+                                boundary_signals=[],
+                                split_reason="transport_budget",
+                                semantic_segment_id=segment_id,
+                                core_text_slices=slices,
+                            )
+                        )
+                        global_index += 1
+                        while continuation_offset < len(page_text):
+                            next_end = _preferred_text_end(
+                                page_text,
+                                continuation_offset,
+                                continuation_offset + available,
+                            )
+                            final_fragment = next_end >= len(page_text)
+                            segment_windows.append(
+                                ExtractionWindow(
+                                    id=f"prep_window_{job_token}_{global_index}",
+                                    page_span=transport,
+                                    core_span=core,
+                                    context_pages=[],
+                                    boundary_pages=[] if final_fragment else [core_start],
+                                    boundary_basis=(
+                                        "semantic"
+                                        if semantic_segments and final_fragment
+                                        else "scope_end"
+                                        if final_fragment and core_start == span.end
+                                        else "page_limit"
+                                        if final_fragment
+                                        else "transport_budget"
+                                    ),
+                                    boundary_signals=[],
+                                    split_reason=(
+                                        "none"
+                                        if semantic_segments and final_fragment
+                                        else "scope_end"
+                                        if final_fragment and core_start == span.end
+                                        else "page_limit"
+                                        if final_fragment
+                                        else "transport_budget"
+                                    ),
+                                    semantic_segment_id=segment_id,
+                                    core_text_slices=[
+                                        CoreTextSlice(
+                                            page=core_start,
+                                            start_char=continuation_offset,
+                                            end_char=next_end,
+                                        )
+                                    ],
+                                )
+                            )
+                            global_index += 1
+                            continuation_offset = next_end
+                        cursor_page = core_start + 1
+                        continue
+                    cursor_page = core_start + 1
+                core_end = core_start
+
+            context_pages = _semantic_context_pages(span, core_start, core_end)
+            transport_start = min([core_start, *context_pages])
+            transport_end = max([core_end, *context_pages])
+            transport = PageSpan(start=transport_start, end=transport_end, label=span.label)
+            core = PageSpan(start=core_start, end=core_end, label=span.label)
+            boundary_pages: list[int] = []
+            boundary_signals: list[str] = []
+            has_remaining = cursor_page <= span.end
+            if has_remaining:
+                boundary_page = core_end
+                next_page = cursor_page if cursor_page > core_end else core_end + 1
+                boundary_pages = [boundary_page]
+                if next_page <= span.end and next_page != boundary_page:
+                    boundary_pages.append(next_page)
+                current_text = page_texts.get(boundary_page, "")
+                next_text = page_texts.get(next_page, "")
+                if _looks_like_page_heading(next_text):
+                    boundary_signals.append("possible_heading")
+                if _looks_continued(current_text, next_text):
+                    boundary_signals.append("possible_continuation")
+                elif _ends_sentence(current_text):
+                    boundary_signals.append("sentence_end")
+                boundary_basis = "transport_budget" if split_due_to_budget else "page_limit"
+                split_reason = "transport_budget" if split_due_to_budget else "page_limit"
+            else:
+                boundary_basis = "semantic" if semantic_segments else "scope_end"
+                split_reason = "none" if semantic_segments else "scope_end"
+
+            segment_windows.append(
+                ExtractionWindow(
+                    id=f"prep_window_{job_token}_{global_index}",
+                    page_span=transport,
+                    core_span=core,
+                    context_pages=context_pages,
+                    boundary_pages=boundary_pages,
+                    boundary_basis=boundary_basis,
+                    boundary_signals=boundary_signals,
+                    split_reason=split_reason,
+                    semantic_segment_id=segment_id,
+                    core_text_slices=slices,
+                )
+            )
+            global_index += 1
+
+        if not segment_windows:
+            label = "semantic segment" if semantic_segments else "source span"
+            identifier = segment_id or f"p{span.start}-{span.end}"
+            raise PrepSourceError(f"{label} {identifier} produced no windows")
+        if not semantic_segments:
+            all_windows.extend(segment_windows)
+            continue
+        count = len(segment_windows)
+        for index, window in enumerate(segment_windows, start=1):
+            data = window.model_copy(
+                update={
+                    "segment_window_index": index,
+                    "segment_window_count": count,
+                    "split_reason": (
+                        "transport_budget" if count > 1 and index < count else window.split_reason
+                    ),
+                }
+            )
+            all_windows.append(data)
+    return all_windows
+
+
 def _build_windows(
     path: Path,
     spans: list[PageSpan],
     job_token: str,
     *,
     semantic_boundaries: bool = False,
+    lossless_semantic: bool = False,
 ) -> list[ExtractionWindow]:
     """Build non-overlapping ownership cores with repeated boundary context."""
+    if semantic_boundaries and lossless_semantic:
+        return _build_lossless_windows(
+            path, spans, job_token, semantic_segments=semantic_boundaries
+        )
     page_texts = _page_texts(path, spans)
     windows: list[ExtractionWindow] = []
     window_index = 1
@@ -379,7 +617,10 @@ def _normalize_semantic_segments(parsed: Any, scope_spans: list[PageSpan]) -> li
 
 def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
     """Plan semantic page units once, falling back to persisted mechanical windows."""
-    if job.segmentation_strategy != "semantic-v1" or job.segmentation_status != "pending":
+    if (
+        job.segmentation_strategy not in {"semantic-v1", "semantic-v2"}
+        or job.segmentation_status != "pending"
+    ):
         return job
     try:
         signatures = _semantic_page_signatures(path, job.scope.page_spans)
@@ -396,6 +637,7 @@ def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
             segments,
             job.id.removeprefix("prep_job_"),
             semantic_boundaries=True,
+            lossless_semantic=job.segmentation_strategy == "semantic-v2",
         )
         return _save_job(
             job,
@@ -406,11 +648,29 @@ def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
         )
     except Exception as error:  # noqa: BLE001
         # Semantic planning is an enhancement to extraction, never a reason to
-        # lose a whole job. The original deterministic windows remain intact.
+        # lose a whole job. New v2 jobs still use lossless mechanical transport
+        # windows, so a planner failure cannot reintroduce core-text clipping.
+        fallback_windows = None
+        if job.segmentation_strategy == "semantic-v2":
+            fallback_windows = _build_lossless_windows(
+                path,
+                job.scope.page_spans,
+                job.id.removeprefix("prep_job_"),
+                semantic_segments=False,
+            )
         return _save_job(
             job,
             segmentation_status="fallback",
             segmentation_error=str(error)[:2000],
+            **(
+                {
+                    "windows": [
+                        item.model_dump(mode="json") for item in fallback_windows
+                    ]
+                }
+                if fallback_windows is not None
+                else {}
+            ),
         )
 
 
@@ -432,6 +692,9 @@ def _clip_page_text(text: str, limit: int, mode: str) -> tuple[str, bool]:
 
 
 def _window_excerpt(path: Path, window: ExtractionWindow) -> tuple[str, list[int]]:
+    if window.core_text_slices:
+        return _lossless_semantic_excerpt(path, window)
+
     page_texts = _page_texts(path, [window.page_span])
     core = window.core_span or window.page_span
     pages = window.page_span.pages()
@@ -458,6 +721,78 @@ def _window_excerpt(path: Path, window: ExtractionWindow) -> tuple[str, list[int
             truncated_pages.append(page_number)
         parts.append(f"--- PDF p{page_number} ---\n{page_text or '[no extractable text]'}")
     excerpt = "\n\n".join(parts)[:MAX_WINDOW_INPUT_CHARS]
+    if not any(
+        line.strip() and not line.startswith(("--- PDF p", "[no extractable"))
+        for line in excerpt.splitlines()
+    ):
+        raise PrepSourceError(
+            f"pages {window.page_span.start}-{window.page_span.end} contain no extractable text"
+        )
+    return excerpt, truncated_pages
+
+
+def _lossless_semantic_excerpt(
+    path: Path, window: ExtractionWindow
+) -> tuple[str, list[int]]:
+    """Pack a semantic window while never clipping its owned source text."""
+    page_texts = _page_texts(path, [window.page_span])
+    core = window.core_span or window.page_span
+    core_pages = set(core.pages())
+    slice_map: dict[int, list[CoreTextSlice]] = {}
+    for text_slice in window.core_text_slices:
+        slice_map.setdefault(text_slice.page, []).append(text_slice)
+
+    def core_text(page: int) -> str:
+        text = page_texts.get(page, "")
+        slices = sorted(slice_map.get(page, []), key=lambda item: item.start_char)
+        if not slices:
+            return text
+        return "".join(text[item.start_char : item.end_char] for item in slices)
+
+    def block(page: int, text: str) -> str:
+        return f"--- PDF p{page} ---\n{text or '[no extractable text]'}"
+
+    core_blocks = {
+        page: block(page, core_text(page))
+        for page in core.pages()
+    }
+    core_length = sum(len(value) for value in core_blocks.values())
+    core_length += max(0, len(core_blocks) - 1) * 2
+    if core_length > MAX_WINDOW_INPUT_CHARS:
+        raise PrepSourceError(
+            f"semantic core p{core.start}-{core.end} exceeds the transport budget"
+        )
+
+    context_pages = [page for page in window.page_span.pages() if page not in core_pages]
+    context_blocks: dict[int, str] = {}
+    truncated_pages: list[int] = []
+    used = core_length
+    for page in context_pages:
+        full_block = block(page, page_texts.get(page, ""))
+        separator = 2 if core_blocks or context_blocks else 0
+        if used + separator + len(full_block) <= MAX_WINDOW_INPUT_CHARS:
+            context_blocks[page] = full_block
+            used += separator + len(full_block)
+            continue
+        available = MAX_WINDOW_INPUT_CHARS - used - separator
+        if available <= len(f"--- PDF p{page} ---\n"):
+            truncated_pages.append(page)
+            continue
+        text_limit = available - len(f"--- PDF p{page} ---\n")
+        clipped, _ = _clip_page_text(page_texts.get(page, ""), text_limit, "head")
+        context_blocks[page] = block(page, clipped)
+        truncated_pages.append(page)
+        used += separator + len(context_blocks[page])
+
+    parts: list[str] = []
+    for page in window.page_span.pages():
+        if page in core_blocks:
+            parts.append(core_blocks[page])
+        elif page in context_blocks:
+            parts.append(context_blocks[page])
+    excerpt = "\n\n".join(parts)
+    if len(excerpt) > MAX_WINDOW_INPUT_CHARS:
+        raise PrepSourceError("semantic transport window exceeded its character budget")
     if not any(
         line.strip() and not line.startswith(("--- PDF p", "[no extractable"))
         for line in excerpt.splitlines()
@@ -526,6 +861,10 @@ def _normalize_prep_response(
             normalized_candidates.append(raw_candidate)
             continue
         candidate = dict(raw_candidate)
+        # The reducer input includes this internal observation id so the model
+        # can distinguish source candidates. It is not part of the public
+        # candidate schema and some models echo it back verbatim.
+        candidate.pop("candidate_id", None)
         kind = candidate.get("kind")
         if isinstance(kind, str):
             cleaned_kind = kind.strip()
@@ -540,6 +879,12 @@ def _normalize_prep_response(
             for raw_ref in raw_refs:
                 if isinstance(raw_ref, dict):
                     ref = dict(raw_ref)
+                    # Some providers use source_file for the same field name
+                    # used by the surrounding task payload. Accept only this
+                    # exact alias; SourceRef remains strict for everything
+                    # else.
+                    if "file" not in ref and "source_file" in ref:
+                        ref["file"] = ref.pop("source_file")
                     pages = _reference_pages(ref.get("page"))
                     file_name = ref.get("file") or task.source_file
                     locator = ref.get("locator")
@@ -584,6 +929,10 @@ def _normalize_prep_response(
                 continue
         normalized_candidates.append(candidate)
     normalized["candidates"] = normalized_candidates
+    if normalized.get("open_questions") == []:
+        # Consolidation questions belong to individual candidates. An empty
+        # provider-level list carries no information and is harmless noise.
+        normalized.pop("open_questions")
     return normalized
 
 
@@ -620,6 +969,75 @@ def _replace_window(job: PrepJob, window_id: str, **updates) -> PrepJob:
     return _save_job(job, windows=windows)
 
 
+def _latest_consolidation_error(task_ids: set[str]) -> str | None:
+    """Recover a durable reducer error without exposing model internals."""
+    failures: list[tuple[str, int, str]] = []
+    for task_id in task_ids:
+        try:
+            runs = shadow.list_shadow_runs(task_id)
+        except (shadow.ShadowTaskNotFoundError, shadow.ShadowResultValidationError):
+            continue
+        for run in runs:
+            if run.status != "failed":
+                continue
+            error = run.parse_error or run.transport_error
+            if error:
+                failures.append((run.started_at, run.attempt, error[:2000]))
+    if not failures:
+        return None
+    failures.sort(key=lambda item: (item[0], item[1]))
+    return failures[-1][2]
+
+
+def _repair_stale_consolidation_diagnostics() -> None:
+    """Repair only the generic marker written by the previous recovery code."""
+    with _active_jobs_lock:
+        active = set(_active_jobs)
+    for raw in storage.list_prep_jobs():
+        job = PrepJob.model_validate(raw)
+        if (
+            job.id in active
+            or job.status not in {"partial", "failed"}
+            or job.segmentation_strategy != "semantic-v2"
+            or job.segmentation_status != "succeeded"
+        ):
+            continue
+        changed = False
+        updates_by_id: dict[str, dict] = {}
+        for _segment_id, segment_windows in _semantic_window_groups(job):
+            if not any(
+                window.consolidation_error == INTERRUPTED_CONSOLIDATION_ERROR
+                for window in segment_windows
+            ):
+                continue
+            task_ids = {
+                window.consolidation_task_id
+                for window in segment_windows
+                if window.consolidation_task_id
+            }
+            recovered_error = _latest_consolidation_error(task_ids)
+            for window in segment_windows:
+                data = window.model_dump(mode="json")
+                if recovered_error:
+                    data["consolidation_error"] = recovered_error
+                elif not task_ids:
+                    data.update(
+                        consolidation_status=None,
+                        consolidation_candidate_count=0,
+                        consolidation_error=None,
+                    )
+                else:
+                    continue
+                updates_by_id[window.id] = data
+                changed = True
+        if changed:
+            merged_windows = [
+                updates_by_id.get(item.id, item.model_dump(mode="json"))
+                for item in job.windows
+            ]
+            _save_job(job, windows=merged_windows)
+
+
 def _recover_interrupted_jobs() -> None:
     with _active_jobs_lock:
         active = set(_active_jobs)
@@ -627,6 +1045,120 @@ def _recover_interrupted_jobs() -> None:
         job = PrepJob.model_validate(raw)
         if job.status != "running" or job.id in active:
             continue
+        interrupted_segments: dict[str, str | None] = {}
+        recovery_errors: dict[str, str] = {}
+        semantic_groups: list[tuple[str, list[ExtractionWindow]]] = []
+        completed_segment_tasks: dict[str, str] = {}
+        if (
+            job.segmentation_strategy == "semantic-v2"
+            and job.segmentation_status == "succeeded"
+        ):
+            task_rows = storage.list_shadow_tasks()
+            tasks_by_id = {
+                str(task.get("id")): task
+                for task in task_rows
+                if isinstance(task, dict) and task.get("id")
+            }
+            semantic_groups = _semantic_window_groups(job)
+            for segment_id, segment_windows in semantic_groups:
+                if not all(window.status == "succeeded" for window in segment_windows):
+                    continue
+                linked_task_ids = {
+                    window.consolidation_task_id
+                    for window in segment_windows
+                    if window.consolidation_task_id
+                }
+                if (
+                    len(linked_task_ids) == 1
+                    and all(
+                        window.consolidation_status == "succeeded"
+                        for window in segment_windows
+                    )
+                    and next(iter(linked_task_ids)) in tasks_by_id
+                    and tasks_by_id[next(iter(linked_task_ids))].get("status")
+                    == "completed"
+                ):
+                    completed_segment_tasks[segment_id] = next(iter(linked_task_ids))
+                    continue
+
+                has_consolidation_state = any(
+                    window.consolidation_status is not None
+                    for window in segment_windows
+                )
+                if not linked_task_ids and not has_consolidation_state:
+                    # Extraction completed, but this segment had not reached
+                    # the reducer seam when the process stopped. Leave it
+                    # queued for the next run instead of inventing a failure.
+                    continue
+
+                existing_error = next(
+                    (
+                        window.consolidation_error
+                        for window in segment_windows
+                        if window.consolidation_error
+                        and window.consolidation_error != INTERRUPTED_CONSOLIDATION_ERROR
+                    ),
+                    None,
+                )
+
+                for task_id in linked_task_ids:
+                    try:
+                        shadow.set_shadow_task_visibility(task_id, "internal")
+                    except shadow.ShadowTaskNotFoundError:
+                        pass
+                active_tasks = [
+                    task
+                    for task in task_rows
+                    if task.get("task_kind") == "semantic_consolidation"
+                    and task.get("semantic_segment_id") == segment_id
+                    and str(task.get("idempotency_key", "")).startswith(
+                        job.id + ":consolidate:"
+                    )
+                    and task.get("status") in {"queued", "running"}
+                ]
+                for task in active_tasks:
+                    try:
+                        shadow.cancel_shadow_task(task["id"])
+                    except (
+                        shadow.ShadowTaskConflictError,
+                        shadow.ShadowTaskNotFoundError,
+                    ):
+                        # A task that finished or was removed while recovery ran
+                        # can be retried from the durable window observations.
+                        pass
+                recovery_errors[segment_id] = (
+                    INTERRUPTED_CONSOLIDATION_ERROR
+                    if active_tasks
+                    else existing_error
+                    or _latest_consolidation_error(linked_task_ids)
+                    or INTERRUPTED_CONSOLIDATION_ERROR
+                )
+                interrupted_segments[segment_id] = (
+                    active_tasks[0]["id"]
+                    if active_tasks
+                    else next(iter(linked_task_ids), None)
+                )
+
+            if (
+                semantic_groups
+                and len(completed_segment_tasks) == len(semantic_groups)
+            ):
+                exposed_task_ids: list[str] = []
+                for segment_id, task_id in completed_segment_tasks.items():
+                    try:
+                        shadow.set_shadow_task_visibility(task_id, "review")
+                        exposed_task_ids.append(task_id)
+                    except shadow.ShadowTaskNotFoundError:
+                        for exposed_task_id in exposed_task_ids:
+                            try:
+                                shadow.set_shadow_task_visibility(
+                                    exposed_task_id, "internal"
+                                )
+                            except shadow.ShadowTaskNotFoundError:
+                                pass
+                        interrupted_segments[segment_id] = task_id
+                        break
+
         windows = []
         for window in job.windows:
             data = window.model_dump(mode="json")
@@ -636,7 +1168,31 @@ def _recover_interrupted_jobs() -> None:
                     error="generation was interrupted before completion",
                     error_kind="worker",
                 )
+            if window.semantic_segment_id in interrupted_segments:
+                consolidation_task_id = interrupted_segments[window.semantic_segment_id]
+                data["consolidation_task_id"] = consolidation_task_id
+                data.update(
+                    consolidation_status="failed",
+                    consolidation_candidate_count=0,
+                    consolidation_error=recovery_errors[window.semantic_segment_id],
+                )
             windows.append(data)
+        if (
+            semantic_groups
+            and not interrupted_segments
+            and len(completed_segment_tasks) == len(semantic_groups)
+        ):
+            candidate_count = sum(
+                segment_windows[0].consolidation_candidate_count
+                for _segment_id, segment_windows in semantic_groups
+            )
+            _save_job(
+                job,
+                status="completed",
+                windows=windows,
+                candidate_count=candidate_count,
+            )
+            continue
         succeeded = any(item["status"] == "succeeded" for item in windows)
         _save_job(job, status="partial" if succeeded else "failed", windows=windows)
 
@@ -687,7 +1243,7 @@ def create_prep_job(
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
         window_strategy="core-context-v3",
-        segmentation_strategy="semantic-v1",
+        segmentation_strategy="semantic-v2",
         segmentation_status="pending",
         semantic_segments=[],
         workspace_id=workspace_id or job_id,
@@ -767,7 +1323,7 @@ def job_needs_rebuild(job: PrepJob) -> bool:
         # A missing or unreadable source cannot be rebuilt from the UI yet.
         return False
 
-    if job.segmentation_strategy == "semantic-v1":
+    if job.segmentation_strategy in {"semantic-v1", "semantic-v2"}:
         # Semantic boundaries depend on the model and page signatures. They
         # are durable for this job; a new explicit rebuild creates a fresh
         # planning request instead of silently re-slicing an existing queue.
@@ -791,14 +1347,8 @@ def job_needs_rebuild(job: PrepJob) -> bool:
 
 def _job_with_promotion_count(job: PrepJob) -> PrepJob:
     candidate_ids: list[str] = []
-    for window in job.windows:
-        if window.shadow_task_id:
-            candidate_ids.extend(
-                item["id"]
-                for item in storage.list_shadow_candidates(
-                    window.shadow_task_id, review_state=None
-                )
-            )
+    for candidate in list_prep_job_candidates(job.id, review_state=None):
+        candidate_ids.append(candidate["id"])
     count = len(storage.list_candidate_promotions(candidate_ids))
     if count == job.promoted_count:
         return job
@@ -807,6 +1357,7 @@ def _job_with_promotion_count(job: PrepJob) -> PrepJob:
 
 def list_prep_jobs() -> list[PrepJob]:
     _recover_interrupted_jobs()
+    _repair_stale_consolidation_diagnostics()
     return [
         _job_with_promotion_count(PrepJob.model_validate(item))
         for item in storage.list_prep_jobs()
@@ -815,6 +1366,7 @@ def list_prep_jobs() -> list[PrepJob]:
 
 def get_prep_job(job_id: str) -> PrepJob:
     _recover_interrupted_jobs()
+    _repair_stale_consolidation_diagnostics()
     return _job_with_promotion_count(_job_from_store(job_id))
 
 
@@ -869,11 +1421,27 @@ def start_prep_job(
     if fake_model is not None:
         updates["fake_model"] = bool(fake_model)
 
+    retrying_segments = {
+        segment_id
+        for segment_id, segment_windows in _semantic_window_groups(job)
+        if job.segmentation_strategy == "semantic-v2"
+        and all(window.status == "succeeded" for window in segment_windows)
+        and any(
+            window.consolidation_status != "succeeded"
+            for window in segment_windows
+        )
+    }
     windows = []
     for window in job.windows:
         data = window.model_dump(mode="json")
         if window.status in {"failed", "cancelled"}:
             data.update(status="queued", error=None, error_kind=None)
+        if window.semantic_segment_id in retrying_segments:
+            data.update(
+                consolidation_status=None,
+                consolidation_candidate_count=0,
+                consolidation_error=None,
+            )
         windows.append(data)
     job = _save_job(job, status="running", windows=windows, **updates)
     with _active_jobs_lock:
@@ -902,17 +1470,17 @@ def delete_prep_job(job_id: str) -> None:
         is_active = job.id in _active_jobs
     if job.status == "running" or is_active:
         raise PrepJobConflictError("running prep jobs must be cancelled before deletion")
-    task_ids = [
-        window.shadow_task_id for window in job.windows if window.shadow_task_id
-    ]
-    if not storage.delete_prep_job(job.id, task_ids):
+    if not storage.delete_prep_job(job.id):
         raise PrepJobNotFoundError(f"unknown prep job: {job.id}")
 
 
 def _job_for_shadow_task(task_id: str) -> PrepJob:
     for raw in storage.list_prep_jobs():
         job = PrepJob.model_validate(raw)
-        if any(window.shadow_task_id == task_id for window in job.windows):
+        if any(
+            task_id in {window.shadow_task_id, window.consolidation_task_id}
+            for window in job.windows
+        ):
             return job
     raise PrepPromotionConflictError(
         "candidate is not attached to a preparation job workspace"
@@ -1191,6 +1759,30 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
             "must cite multiple source_refs. Do not invent rules, motives, links, or outcomes. "
             "Return an empty candidates array when the pages do not support a useful fact."
         )
+    elif window.semantic_segment_id:
+        system = (
+            "You extract source-bound observations for one semantic segment from a "
+            "bounded transport window. Return exactly one JSON object with a candidates "
+            'array shaped as {"candidates":[{"text":"...","kind":"clue",'
+            '"source_refs":[{"file":"exact source file","page":5,"locator":null}],'
+            '"confidence":0.75,"open_questions":[]}]}. Every source_refs item must be '
+            "an object; file must exactly equal SOURCE_FILE_JSON; page must be an integer "
+            "from SOURCE_PAGES_JSON. Cite every supporting page visible in this window. "
+            "Classify every observation with exactly one kind from clue, npc, location, "
+            "handout, event, threat, stakes, obstacle, timeline, or resource. Use clue "
+            "only for a discovered piece of information; use npc for a person or group's "
+            "role or behavior, location for a playable place, event for something that "
+            "happened or is happening, threat for an active danger or pressure, stakes "
+            "for what can be lost, obstacle for a barrier, timeline for timing or change "
+            "over time, resource for something usable, and handout for a map, letter, "
+            "photo, newspaper, log, record, or other player-facing source asset. Do not "
+            "default every observation to clue when another kind fits. "
+            "This is a partial observation, not an independent scene or final fact: do "
+            "not invent content, motives, links, or outcomes, and do not omit a supported "
+            "detail just because it crosses a transport boundary. The segment-level "
+            "reducer will merge duplicate observations. Return an empty candidates array "
+            "when the supplied text supports no useful observation."
+        )
     else:
         system = (
             "You extract source-bound TRPG preparation facts. Return only one JSON object "
@@ -1217,6 +1809,8 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
         f"CORE_PAGES_JSON={json.dumps(core_pages)}\n"
         f"CONTEXT_PAGES_JSON={json.dumps(window.context_pages)}\n"
         f"BOUNDARY_PAGES_JSON={json.dumps(window.boundary_pages)}\n"
+        f"SEMANTIC_SEGMENT_ID_JSON={json.dumps(window.semantic_segment_id)}\n"
+        f"CORE_TEXT_SLICES_JSON={json.dumps([item.model_dump(mode='json') for item in window.core_text_slices])}\n"
         f"TARGET_PROFILE_JSON={json.dumps(job.scope.profile_id)}\n"
         f"PREP_DIRECTIVE_JSON={json.dumps(job.scope.objective, ensure_ascii=False)}\n"
         "SOURCE_TEXT_START\n"
@@ -1227,6 +1821,875 @@ def _prompt_messages(job: PrepJob, window: ExtractionWindow, excerpt: str) -> li
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+def _semantic_window_groups(job: PrepJob) -> list[tuple[str, list[ExtractionWindow]]]:
+    groups: dict[str, list[ExtractionWindow]] = {}
+    order: list[str] = []
+    for window in job.windows:
+        segment_id = window.semantic_segment_id
+        if not segment_id:
+            continue
+        if segment_id not in groups:
+            groups[segment_id] = []
+            order.append(segment_id)
+        groups[segment_id].append(window)
+    return [(segment_id, groups[segment_id]) for segment_id in order]
+
+
+def _semantic_segment_span(
+    segment_id: str, windows: list[ExtractionWindow]
+) -> PageSpan:
+    cores = [window.core_span or window.page_span for window in windows]
+    label = next((span.label for span in cores if span.label), None)
+    return PageSpan(
+        start=min(span.start for span in cores),
+        end=max(span.end for span in cores),
+        label=label,
+    )
+
+
+def _raw_segment_candidates(windows: list[ExtractionWindow]) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for window in windows:
+        if not window.shadow_task_id:
+            continue
+        for raw in storage.list_shadow_candidates(
+            window.shadow_task_id,
+            review_state=None,
+            queue_visibility=None,
+        ):
+            candidate_id = str(raw.get("id", ""))
+            if candidate_id and candidate_id in seen:
+                continue
+            if candidate_id:
+                seen.add(candidate_id)
+            candidates.append(raw)
+    return candidates
+
+
+def _compact_segment_candidates(candidates: list[dict]) -> list[dict]:
+    """Build the compact, source-complete wire representation for a reducer."""
+    compact: list[dict] = []
+    for index, raw in enumerate(candidates, start=1):
+        refs = []
+        for reference in raw.get("source_refs") or []:
+            if not isinstance(reference, dict):
+                continue
+            item = {"page": reference.get("page")}
+            if reference.get("locator") is not None:
+                item["locator"] = reference["locator"]
+            refs.append(item)
+        item = {
+            # This identifies an input observation only. A short ordinal is
+            # enough for the reducer and avoids repeating storage UUIDs.
+            "candidate_id": f"c{index}",
+            "text": raw.get("text"),
+            "kind": raw.get("kind"),
+            "source_refs": refs,
+        }
+        for field in ("possible_links", "open_questions"):
+            if raw.get(field):
+                item[field] = raw[field]
+        # The reducer assigns its own confidence; it is not source evidence.
+        compact.append(item)
+    return compact
+
+
+def _consolidation_parent_task_ids(
+    candidates: list[dict], fallback: list[str]
+) -> list[str]:
+    ids = [
+        str(candidate.get("task_id"))
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("task_id")
+    ]
+    return list(dict.fromkeys(ids)) or list(dict.fromkeys(fallback))
+
+
+def _format_consolidation_input(
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    candidates: list[dict],
+    source_task_ids: list[str] | None = None,
+) -> str:
+    parent_ids = source_task_ids
+    if parent_ids is None:
+        parent_ids = [
+            window.shadow_task_id
+            for window in windows
+            if window.shadow_task_id
+        ]
+    payload = json.dumps(
+        _compact_segment_candidates(candidates),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        f"SEMANTIC_SEGMENT_ID_JSON={json.dumps(segment_id)}\n"
+        f"SEMANTIC_SEGMENT_PAGES_JSON={json.dumps(segment_span.pages())}\n"
+        f"WINDOW_TASK_IDS_JSON={json.dumps(list(dict.fromkeys(parent_ids)))}\n"
+        f"WINDOW_CANDIDATES_JSON={payload}"
+    )
+
+
+def _consolidation_candidate_batches(
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    candidates: list[dict],
+    parent_task_ids: list[str],
+) -> list[tuple[list[dict], list[str]]]:
+    """Partition reducer input without clipping any candidate evidence."""
+    if not candidates:
+        return [([], list(dict.fromkeys(parent_task_ids)))]
+
+    batches: list[tuple[list[dict], list[str]]] = []
+    current: list[dict] = []
+    for candidate in candidates:
+        proposed = [*current, candidate]
+        proposed_parent_ids = _consolidation_parent_task_ids(
+            proposed, parent_task_ids
+        )
+        proposed_input = _format_consolidation_input(
+            segment_id,
+            segment_span,
+            windows,
+            proposed,
+            proposed_parent_ids,
+        )
+        over_budget = len(proposed_input) > MAX_CONSOLIDATION_INPUT_CHARS
+        over_count = len(proposed) > MAX_CONSOLIDATION_CANDIDATES
+        if current and (over_budget or over_count):
+            batch_parent_ids = _consolidation_parent_task_ids(
+                current, parent_task_ids
+            )
+            batches.append((current, batch_parent_ids))
+            current = [candidate]
+            single_input = _format_consolidation_input(
+                segment_id,
+                segment_span,
+                windows,
+                current,
+                _consolidation_parent_task_ids(current, parent_task_ids),
+            )
+            if len(single_input) > MAX_CONSOLIDATION_INPUT_CHARS:
+                raise PrepSourceError(
+                    f"semantic segment {segment_id} contains one candidate too large for consolidation"
+                )
+            continue
+        if not current and (over_budget or over_count):
+            raise PrepSourceError(
+                f"semantic segment {segment_id} contains one candidate too large for consolidation"
+            )
+        current = proposed
+
+    if current:
+        batches.append(
+            (
+                current,
+                _consolidation_parent_task_ids(current, parent_task_ids),
+            )
+        )
+    return batches
+
+
+def _consolidation_input(
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    candidates: list[dict],
+    *,
+    source_task_ids: list[str] | None = None,
+) -> str:
+    input_text = _format_consolidation_input(
+        segment_id,
+        segment_span,
+        windows,
+        candidates,
+        source_task_ids,
+    )
+    if len(input_text) <= MAX_CONSOLIDATION_INPUT_CHARS:
+        return input_text
+    raise PrepSourceError(
+        f"semantic segment {segment_id} has too many candidate details for consolidation"
+    )
+
+
+def _consolidation_prompt_messages(
+    job: PrepJob, segment_id: str, segment_span: PageSpan, input_text: str
+) -> list[dict[str, str]]:
+    system = (
+        "You consolidate source-bound TRPG fact candidates from transport windows. "
+        "Return exactly one JSON object with a candidates array. Merge candidates only "
+        "when they describe the same supported claim; combine partial cross-window "
+        "claims when the cited source pages support one complete statement. Preserve "
+        "distinct facts, all supporting source_refs, and unresolved open_questions. "
+        "Do not invent content, links, motives, or outcomes. Input source_refs contain "
+        "only page and optional locator because every input candidate inherits "
+        "SOURCE_FILE_JSON. Every output source_ref must explicitly use that exact source "
+        "file and a page in the semantic segment. An empty input may return an empty "
+        "candidates array. Do not add top-level open_questions; attach any unresolved "
+        "question to the relevant candidate instead."
+    )
+    user = (
+        "[TASK:prep:consolidate]\n"
+        f"SOURCE_FILE_JSON={json.dumps(job.scope.source_file, ensure_ascii=False)}\n"
+        f"SOURCE_VERSION_JSON={json.dumps(job.scope.source_version)}\n"
+        f"TARGET_PROFILE_JSON={json.dumps(job.scope.profile_id)}\n"
+        f"SEMANTIC_SEGMENT_ID_JSON={json.dumps(segment_id)}\n"
+        f"SEMANTIC_SEGMENT_PAGES_JSON={json.dumps(segment_span.pages())}\n"
+        f"{input_text}\n"
+        "Return {\"candidates\":[...]} and no markdown."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _fallback_segment_candidates(candidates: list[dict]) -> dict:
+    """Deterministic no-loss fallback when a reducer returns no candidates."""
+    merged: list[dict] = []
+    by_key: dict[tuple[str, str], dict] = {}
+    for raw in _compact_segment_candidates(candidates):
+        text = " ".join(str(raw.get("text") or "").split())
+        if not text:
+            continue
+        key = (str(raw.get("kind") or "clue"), text.casefold())
+        existing = by_key.get(key)
+        if existing is None:
+            item = dict(raw)
+            item.pop("candidate_id", None)
+            by_key[key] = item
+            merged.append(item)
+            continue
+        for field in ("source_refs", "possible_links", "open_questions"):
+            values = [*existing.get(field, []), *raw.get(field, [])]
+            if field == "source_refs":
+                keys = [json.dumps(value, sort_keys=True, ensure_ascii=False) for value in values]
+                existing[field] = [json.loads(value) for value in dict.fromkeys(keys)]
+            else:
+                existing[field] = list(dict.fromkeys(values))
+    if len(merged) > MAX_CONSOLIDATION_CANDIDATES:
+        raise PrepSourceError(
+            "deterministic consolidation would exceed the candidate limit"
+        )
+    return {"candidates": merged}
+
+
+def _consolidation_response_transform(
+    parsed: Any, raw_candidates: list[dict]
+) -> Any:
+    if isinstance(parsed, dict) and isinstance(parsed.get("candidates"), list):
+        if parsed["candidates"]:
+            return parsed
+        if raw_candidates:
+            return _fallback_segment_candidates(raw_candidates)
+    return parsed
+
+
+def _retry_shadow_task_spec(spec: ShadowTaskSpec) -> ShadowTaskSpec:
+    """Give a cancelled task a fresh idempotency key for the next attempt."""
+    retry_digest = hashlib.sha256(
+        f"{spec.idempotency_key}:{uuid.uuid4().hex}".encode("utf-8")
+    ).hexdigest()[:32]
+    return spec.model_copy(
+        update={
+            "idempotency_key": f"{spec.idempotency_key[:110]}:retry:{retry_digest}"
+        }
+    )
+
+
+def _retire_consolidation_tasks(
+    windows: list[ExtractionWindow], replacement_task_id: str | None
+) -> None:
+    """Hide superseded segment reducers while retaining their audit records."""
+    task_ids = {
+        window.consolidation_task_id
+        for window in windows
+        if window.consolidation_task_id and window.consolidation_task_id != replacement_task_id
+    }
+    for task_id in task_ids:
+        try:
+            shadow.set_shadow_task_visibility(task_id, "internal")
+        except shadow.ShadowTaskNotFoundError:
+            # A manually cleaned-up historical task does not block the new run.
+            pass
+
+
+def _consolidation_progress_signature(candidates: list[dict]) -> str:
+    comparable: list[dict] = []
+    for item in _compact_segment_candidates(candidates):
+        value = dict(item)
+        value.pop("candidate_id", None)
+        comparable.append(value)
+    return json.dumps(comparable, ensure_ascii=False, sort_keys=True)
+
+
+def _consolidation_task_key(
+    job: PrepJob,
+    segment_id: str,
+    input_text: str,
+    *,
+    version: str = CONSOLIDATION_PROMPT_VERSION,
+) -> str:
+    digest = hashlib.sha256(
+        "\x00".join(
+            (
+                job.id,
+                segment_id,
+                version,
+                job.schema_version,
+                job.model_id,
+                str(job.fake_model),
+                input_text,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    # The job id stays readable; the digest makes each exact reducer input
+    # reproducible while keeping the idempotency key well below the schema cap.
+    return f"{job.id}:consolidate:{digest}"
+
+
+def _deterministic_consolidation_input(
+    segment_id: str,
+    segment_span: PageSpan,
+    candidates: list[dict],
+    parent_task_ids: list[str],
+) -> str:
+    """Describe a no-loss aggregate through its durable parent results."""
+    signature = _consolidation_progress_signature(candidates)
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+    return (
+        'CONSOLIDATION_MODE_JSON="deterministic-no-loss-v1"\n'
+        f"SEMANTIC_SEGMENT_ID_JSON={json.dumps(segment_id)}\n"
+        f"SEMANTIC_SEGMENT_PAGES_JSON={json.dumps(segment_span.pages())}\n"
+        f"PARENT_TASK_IDS_JSON={json.dumps(list(dict.fromkeys(parent_task_ids)))}\n"
+        f"CANDIDATE_COUNT_JSON={json.dumps(len(candidates))}\n"
+        f"CANDIDATE_SIGNATURE_SHA256_JSON={json.dumps(digest)}"
+    )
+
+
+def _find_completed_consolidation_task(
+    job: PrepJob, segment_id: str, task_spec: ShadowTaskSpec
+) -> Any | None:
+    """Reuse an exact completed reducer result across retry-key variants."""
+    expected = task_spec.model_dump(mode="json")
+    for field_name in ("idempotency_key", "queue_visibility"):
+        expected.pop(field_name, None)
+    for task in shadow.list_shadow_tasks(include_internal=True):
+        if task.status != "completed":
+            continue
+        if task.task_kind != "semantic_consolidation":
+            continue
+        if task.semantic_segment_id != segment_id:
+            continue
+        if not task.idempotency_key.startswith(job.id + ":consolidate:"):
+            continue
+        values = {
+            field_name: getattr(task, field_name)
+            for field_name in ShadowTaskSpec.model_fields
+            if field_name not in {"idempotency_key", "queue_visibility"}
+        }
+        if values == expected:
+            return task
+    return None
+
+
+def _run_consolidation_task(
+    job: PrepJob,
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    input_text: str,
+    raw_candidates: list[dict],
+    parent_task_ids: list[str],
+    client,
+) -> tuple[Any, list[Any], str | None]:
+    task_spec = ShadowTaskSpec(
+        idempotency_key=_consolidation_task_key(job, segment_id, input_text),
+        source_file=job.scope.source_file,
+        source_version=job.scope.source_version,
+        source_pages=segment_span.pages(),
+        profile_id=job.scope.profile_id,
+        model_id=job.model_id,
+        prompt_version=CONSOLIDATION_PROMPT_VERSION,
+        schema_version=job.schema_version,
+        input_excerpt=input_text,
+        task_kind="semantic_consolidation",
+        queue_visibility="internal",
+        semantic_segment_id=segment_id,
+        parent_task_ids=list(dict.fromkeys(parent_task_ids)),
+    )
+    task = _find_completed_consolidation_task(job, segment_id, task_spec)
+    if task is None:
+        task, _ = shadow.create_shadow_task(task_spec)
+        if task.status == "cancelled":
+            task, _ = shadow.create_shadow_task(_retry_shadow_task_spec(task_spec))
+    # A reducer is never public while it is being built. This also hides a
+    # completed task from an earlier attempt before its replacement is ready.
+    shadow.set_shadow_task_visibility(task.id, "internal")
+
+    current = _job_from_store(job.id)
+    if current.status == "cancelled":
+        try:
+            shadow.cancel_shadow_task(task.id)
+        except shadow.ShadowTaskConflictError:
+            pass
+        return task, [], "semantic segment consolidation was cancelled"
+
+    current_windows = [
+        window for window in current.windows if window.semantic_segment_id == segment_id
+    ]
+    _set_segment_consolidation_state(
+        current,
+        current_windows or windows,
+        task_id=task.id,
+        status="running",
+        candidate_count=0,
+        error=None,
+    )
+
+    if task.status == "completed":
+        candidates = shadow.shadow_task_detail(task.id)["candidates"]
+        return task, candidates, None
+
+    try:
+        raw_response = client.chat(
+            _consolidation_prompt_messages(job, segment_id, segment_span, input_text),
+            temperature=0.1,
+            max_tokens=6000,
+        )
+    except Exception as error:  # noqa: BLE001
+        _, run, _ = shadow.submit_shadow_result(
+            task.id, transport_error=str(error)[:2000]
+        )
+        return task, [], run.transport_error or "semantic segment consolidation failed"
+
+    current = _job_from_store(job.id)
+    if current.status == "cancelled":
+        try:
+            shadow.cancel_shadow_task(task.id)
+        except shadow.ShadowTaskConflictError:
+            pass
+        return task, [], "semantic segment consolidation was cancelled"
+
+    completed_task, run, candidates = shadow.submit_shadow_result(
+        task.id,
+        raw_response=raw_response,
+        response_transform=lambda parsed, active_task: _consolidation_response_transform(
+            _normalize_prep_response(
+                parsed,
+                active_task,
+                core_pages=set(segment_span.pages()),
+            ),
+            raw_candidates,
+        ),
+    )
+    if run.status != "succeeded":
+        return (
+            completed_task,
+            [],
+            run.parse_error or "semantic segment consolidation failed",
+        )
+    return completed_task, candidates, None
+
+
+def _run_deterministic_consolidation_task(
+    job: PrepJob,
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    candidates: list[dict],
+    parent_task_ids: list[str],
+) -> tuple[Any, list[Any], str | None]:
+    """Publish a complete no-loss aggregate when model reduction has stalled."""
+    source_task_ids = _consolidation_parent_task_ids(candidates, parent_task_ids)
+    input_text = _deterministic_consolidation_input(
+        segment_id,
+        segment_span,
+        candidates,
+        source_task_ids,
+    )
+    task_spec = ShadowTaskSpec(
+        idempotency_key=_consolidation_task_key(
+            job,
+            segment_id,
+            input_text,
+            version=DETERMINISTIC_CONSOLIDATION_VERSION,
+        ),
+        source_file=job.scope.source_file,
+        source_version=job.scope.source_version,
+        source_pages=segment_span.pages(),
+        profile_id=job.scope.profile_id,
+        model_id=job.model_id,
+        prompt_version=DETERMINISTIC_CONSOLIDATION_VERSION,
+        schema_version=job.schema_version,
+        input_excerpt=input_text,
+        task_kind="semantic_consolidation",
+        queue_visibility="internal",
+        semantic_segment_id=segment_id,
+        parent_task_ids=source_task_ids,
+    )
+    task = _find_completed_consolidation_task(job, segment_id, task_spec)
+    if task is None:
+        task, _ = shadow.create_shadow_task(task_spec)
+        if task.status == "cancelled":
+            task, _ = shadow.create_shadow_task(_retry_shadow_task_spec(task_spec))
+    shadow.set_shadow_task_visibility(task.id, "internal")
+
+    current = _job_from_store(job.id)
+    if current.status == "cancelled":
+        try:
+            shadow.cancel_shadow_task(task.id)
+        except shadow.ShadowTaskConflictError:
+            pass
+        return task, [], "semantic segment consolidation was cancelled"
+
+    current_windows = [
+        window for window in current.windows if window.semantic_segment_id == segment_id
+    ]
+    _set_segment_consolidation_state(
+        current,
+        current_windows or windows,
+        task_id=task.id,
+        status="running",
+        candidate_count=0,
+        error=None,
+    )
+
+    if task.status == "completed":
+        return task, shadow.shadow_task_detail(task.id)["candidates"], None
+
+    completed_task, run, final_candidates = shadow.submit_shadow_result(
+        task.id,
+        raw_response=json.dumps({"candidates": candidates}, ensure_ascii=False),
+        response_transform=lambda parsed, active_task: _normalize_prep_response(
+            parsed,
+            active_task,
+            core_pages=set(segment_span.pages()),
+        ),
+    )
+    if run.status != "succeeded":
+        return (
+            completed_task,
+            [],
+            run.parse_error or "deterministic semantic consolidation failed",
+        )
+    return completed_task, final_candidates, None
+
+
+def _set_segment_consolidation_state(
+    job: PrepJob,
+    windows: list[ExtractionWindow],
+    *,
+    task_id: str | None,
+    status: str,
+    candidate_count: int = 0,
+    error: str | None = None,
+) -> PrepJob:
+    window_ids = {window.id for window in windows}
+    updated_windows: list[dict] = []
+    for window in job.windows:
+        data = window.model_dump(mode="json")
+        if window.id in window_ids:
+            data.update(
+                consolidation_task_id=task_id,
+                consolidation_status=status,
+                consolidation_candidate_count=candidate_count,
+                consolidation_error=error,
+            )
+        updated_windows.append(data)
+    return _save_job(job, windows=updated_windows)
+
+
+def _fail_semantic_segment(
+    job: PrepJob,
+    windows: list[ExtractionWindow],
+    error: str,
+    *,
+    task_id: str | None = None,
+) -> PrepJob:
+    """Leave an attempted segment terminal and keep every result internal."""
+    current = _job_from_store(job.id)
+    current_windows = [
+        window for window in current.windows
+        if window.semantic_segment_id == windows[0].semantic_segment_id
+    ] if windows else []
+    linked_task_ids = {
+        window.consolidation_task_id
+        for window in current_windows
+        if window.consolidation_task_id
+    }
+    selected_task_id = task_id or next(iter(linked_task_ids), None)
+    if selected_task_id is None:
+        # No reducer was created, so this segment has not started. Preserve
+        # the unstarted state instead of inventing a failed task.
+        return current
+    for linked_task_id in linked_task_ids:
+        try:
+            shadow.set_shadow_task_visibility(linked_task_id, "internal")
+        except shadow.ShadowTaskNotFoundError:
+            pass
+    return _set_segment_consolidation_state(
+        current,
+        current_windows or windows,
+        task_id=selected_task_id,
+        status="failed",
+        candidate_count=0,
+        error=error[:2000],
+    )
+
+
+def _fail_unfinished_semantic_segments(job: PrepJob, error: str) -> PrepJob:
+    """Reconcile reducer states when an outer worker exception escapes."""
+    current = _job_from_store(job.id)
+    for _segment_id, windows in _semantic_window_groups(current):
+        if all(window.consolidation_status == "succeeded" for window in windows):
+            continue
+        attempted = any(
+            window.consolidation_status == "running"
+            or window.consolidation_task_id is not None
+            for window in windows
+        )
+        if attempted:
+            current = _fail_semantic_segment(current, windows, error)
+    return current
+
+
+def _completed_segment_task_id(windows: list[ExtractionWindow]) -> str | None:
+    """Return a durable final reducer id when a segment is already complete."""
+    task_ids = {
+        window.consolidation_task_id
+        for window in windows
+        if window.consolidation_task_id
+    }
+    if (
+        len(task_ids) != 1
+        or any(window.consolidation_status != "succeeded" for window in windows)
+    ):
+        return None
+    task_id = next(iter(task_ids))
+    try:
+        task = shadow.shadow_task_detail(task_id)["task"]
+    except (shadow.ShadowTaskNotFoundError, shadow.ShadowResultValidationError):
+        return None
+    return task_id if task.status == "completed" else None
+
+
+def _consolidate_semantic_segment(
+    job: PrepJob,
+    segment_id: str,
+    windows: list[ExtractionWindow],
+    client,
+) -> tuple[PrepJob, bool, int]:
+    if any(window.status != "succeeded" for window in windows):
+        return job, False, 0
+    current = _job_from_store(job.id)
+    current_windows = [
+        window for window in current.windows if window.semantic_segment_id == segment_id
+    ]
+    raw_candidates = _raw_segment_candidates(current_windows)
+    segment_span = _semantic_segment_span(segment_id, windows)
+    _retire_consolidation_tasks(current_windows, None)
+    pending_candidates = raw_candidates
+    parent_task_ids = [
+        window.shadow_task_id
+        for window in current_windows
+        if window.shadow_task_id
+    ]
+    last_task_id: str | None = None
+    seen_signatures: set[str] = set()
+
+    for _round in range(MAX_CONSOLIDATION_ROUNDS):
+        try:
+            batches = _consolidation_candidate_batches(
+                segment_id,
+                segment_span,
+                current_windows,
+                pending_candidates,
+                parent_task_ids,
+            )
+        except Exception as error:  # noqa: BLE001
+            updated = _set_segment_consolidation_state(
+                _job_from_store(job.id),
+                current_windows,
+                task_id=last_task_id,
+                status="failed",
+                error=str(error)[:2000],
+            )
+            return updated, False, 0
+
+        round_candidates: list[dict] = []
+        round_task_ids: list[str] = []
+        failed_error: str | None = None
+        for batch, batch_parent_ids in batches:
+            try:
+                input_text = _consolidation_input(
+                    segment_id,
+                    segment_span,
+                    current_windows,
+                    batch,
+                    source_task_ids=batch_parent_ids,
+                )
+                task, candidates, error = _run_consolidation_task(
+                    job,
+                    segment_id,
+                    segment_span,
+                    current_windows,
+                    input_text,
+                    batch,
+                    batch_parent_ids,
+                    client,
+                )
+            except Exception as error:  # noqa: BLE001
+                failed_error = str(error)[:2000]
+                break
+            last_task_id = task.id
+            round_task_ids.append(task.id)
+            if error:
+                failed_error = error
+                break
+            round_candidates.extend(
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+                for item in candidates
+            )
+
+        if failed_error is not None:
+            updated = _set_segment_consolidation_state(
+                _job_from_store(job.id),
+                current_windows,
+                task_id=last_task_id,
+                status="failed",
+                error=failed_error[:2000],
+            )
+            return updated, False, 0
+
+        if len(batches) == 1:
+            _retire_consolidation_tasks(current_windows, last_task_id)
+            updated = _set_segment_consolidation_state(
+                _job_from_store(job.id),
+                current_windows,
+                task_id=last_task_id,
+                status="succeeded",
+                candidate_count=len(round_candidates),
+                error=None,
+            )
+            return updated, True, len(round_candidates)
+
+        if not round_candidates:
+            error = "semantic consolidation produced no reducible candidates"
+            updated = _set_segment_consolidation_state(
+                _job_from_store(job.id),
+                current_windows,
+                task_id=last_task_id,
+                status="failed",
+                error=error,
+            )
+            return updated, False, 0
+
+        current_signature = _consolidation_progress_signature(pending_candidates)
+        next_signature = _consolidation_progress_signature(round_candidates)
+        if next_signature in seen_signatures or next_signature == current_signature:
+            # A non-reducing model pass cannot converge. Try the deterministic
+            # exact-claim merge once; it preserves every distinct claim and all
+            # source references without clipping text.
+            deterministic = _fallback_segment_candidates(pending_candidates)[
+                "candidates"
+            ]
+            next_signature = _consolidation_progress_signature(deterministic)
+            if next_signature == current_signature:
+                # The model has already validated every batch, but no exact
+                # duplicate remains to merge. The final set is still within
+                # the review response cap, so aggregate it deterministically
+                # rather than treating complete source evidence as a failure.
+                final_task, final_candidates, final_error = (
+                    _run_deterministic_consolidation_task(
+                        job,
+                        segment_id,
+                        segment_span,
+                        current_windows,
+                        deterministic,
+                        round_task_ids,
+                    )
+                )
+                if final_error is not None:
+                    updated = _set_segment_consolidation_state(
+                        _job_from_store(job.id),
+                        current_windows,
+                        task_id=final_task.id,
+                        status="failed",
+                        error=final_error[:2000],
+                    )
+                    return updated, False, 0
+                _retire_consolidation_tasks(current_windows, final_task.id)
+                updated = _set_segment_consolidation_state(
+                    _job_from_store(job.id),
+                    current_windows,
+                    task_id=final_task.id,
+                    status="succeeded",
+                    candidate_count=len(final_candidates),
+                    error=None,
+                )
+                return updated, True, len(final_candidates)
+            round_candidates = deterministic
+
+        seen_signatures.add(current_signature)
+        pending_candidates = round_candidates
+        parent_task_ids = round_task_ids
+
+    error = f"semantic segment {segment_id} exceeded consolidation rounds"
+    updated = _set_segment_consolidation_state(
+        _job_from_store(job.id),
+        current_windows,
+        task_id=last_task_id,
+        status="failed",
+        error=error,
+    )
+    return updated, False, 0
+
+
+def _consolidate_semantic_segments(job: PrepJob, client) -> tuple[PrepJob, bool, int]:
+    total_candidates = 0
+    all_succeeded = True
+    current = job
+    for segment_id, windows in _semantic_window_groups(current):
+        current = _job_from_store(current.id)
+        if current.status == "cancelled":
+            return current, False, total_candidates
+        segment_windows = [
+            window for window in current.windows if window.semantic_segment_id == segment_id
+        ]
+        if _completed_segment_task_id(segment_windows) is not None:
+            total_candidates += segment_windows[0].consolidation_candidate_count
+            continue
+        try:
+            current, succeeded, count = _consolidate_semantic_segment(
+                current, segment_id, segment_windows, client
+            )
+        except Exception as error:  # noqa: BLE001
+            current = _fail_semantic_segment(
+                current,
+                segment_windows,
+                str(error),
+            )
+            succeeded, count = False, 0
+        total_candidates += count
+        all_succeeded = all_succeeded and succeeded
+    if all_succeeded:
+        current = _job_from_store(current.id)
+        if current.status == "cancelled":
+            return current, False, total_candidates
+        task_ids = list(
+            dict.fromkeys(
+                window.consolidation_task_id
+                for window in current.windows
+                if window.consolidation_task_id
+            )
+        )
+        for task_id in task_ids:
+            shadow.set_shadow_task_visibility(task_id, "review")
+    return current, all_succeeded, total_candidates
 
 
 def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) -> None:
@@ -1244,8 +2707,15 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
         prompt_version=job.prompt_version,
         schema_version=job.schema_version,
         input_excerpt=excerpt,
+        task_kind=("prep_window" if window.semantic_segment_id else "standalone"),
+        queue_visibility=("internal" if window.semantic_segment_id else "review"),
+        semantic_segment_id=window.semantic_segment_id,
+        segment_window_index=window.segment_window_index,
+        segment_window_count=window.segment_window_count,
     )
     task, _ = shadow.create_shadow_task(task_spec)
+    if task.status == "cancelled":
+        task, _ = shadow.create_shadow_task(_retry_shadow_task_spec(task_spec))
     current = _job_from_store(job.id)
     current = _replace_window(
         current,
@@ -1311,7 +2781,11 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
         response_transform=lambda parsed, active_task: _normalize_prep_response(
             parsed,
             active_task,
-            core_pages=set((window.core_span or window.page_span).pages()),
+            core_pages=(
+                None
+                if window.semantic_segment_id
+                else set((window.core_span or window.page_span).pages())
+            ),
         ),
     )
     current = _job_from_store(job.id)
@@ -1356,19 +2830,43 @@ def execute_prep_job(job_id: str) -> None:
         if final.status == "cancelled":
             return
         succeeded = sum(window.status == "succeeded" for window in final.windows)
-        failed = sum(window.status == "failed" for window in final.windows)
-        candidate_count = sum(window.candidate_count for window in final.windows)
-        if succeeded == len(final.windows):
-            status = "completed"
-        elif succeeded:
-            status = "partial"
+        if (
+            final.segmentation_strategy == "semantic-v2"
+            and final.segmentation_status == "succeeded"
+        ):
+            final, consolidated, candidate_count = _consolidate_semantic_segments(
+                final, client
+            )
+            if final.status == "cancelled":
+                return
+            if not consolidated:
+                # Segment results remain internal until every semantic segment
+                # has a complete reducer result.
+                candidate_count = 0
+            if succeeded == len(final.windows) and consolidated:
+                status = "completed"
+            elif succeeded or candidate_count:
+                status = "partial"
+            else:
+                status = "failed"
         else:
-            status = "failed"
+            candidate_count = sum(window.candidate_count for window in final.windows)
+            if succeeded == len(final.windows):
+                status = "completed"
+            elif succeeded:
+                status = "partial"
+            else:
+                status = "failed"
         _save_job(final, status=status, candidate_count=candidate_count)
     except Exception as error:  # noqa: BLE001
         try:
             job = _job_from_store(job_id)
             if job.status != "cancelled":
+                if (
+                    job.segmentation_strategy == "semantic-v2"
+                    and job.segmentation_status == "succeeded"
+                ):
+                    job = _fail_unfinished_semantic_segments(job, str(error))
                 windows = []
                 for window in job.windows:
                     data = window.model_dump(mode="json")
@@ -1392,9 +2890,43 @@ def list_prep_job_candidates(
 ) -> list[dict]:
     job = _job_from_store(job_id)
     candidates: list[dict] = []
-    for window in job.windows:
-        if window.shadow_task_id:
-            candidates.extend(
-                storage.list_shadow_candidates(window.shadow_task_id, review_state)
+    task_ids: list[str] = []
+    if (
+        job.segmentation_strategy == "semantic-v2"
+        and job.segmentation_status == "succeeded"
+        and any(window.semantic_segment_id for window in job.windows)
+    ):
+        groups = _semantic_window_groups(job)
+        task_ids = []
+        for _segment_id, windows in groups:
+            if any(window.status != "succeeded" for window in windows):
+                return []
+            segment_task_ids = {
+                window.consolidation_task_id
+                for window in windows
+                if window.consolidation_task_id
+            }
+            if (
+                len(segment_task_ids) != 1
+                or any(window.consolidation_status != "succeeded" for window in windows)
+            ):
+                # A failed or cancelled consolidation has no user-facing
+                # partial result. Keep the queue empty until every segment has
+                # a complete result.
+                return []
+            task_ids.append(next(iter(segment_task_ids)))
+    else:
+        task_ids = list(
+            dict.fromkeys(
+                window.shadow_task_id for window in job.windows if window.shadow_task_id
             )
+        )
+    for task_id in task_ids:
+        candidates.extend(
+            storage.list_shadow_candidates(
+                task_id,
+                review_state,
+                queue_visibility="review",
+            )
+        )
     return candidates

@@ -38,12 +38,17 @@ def analyze_chunk(client: LLMClient | FakeLLM, chunk: dict) -> dict:
     truncated = len(text) > CHUNK_LIMIT
     if truncated:
         text = text[:CHUNK_LIMIT]
+    schema = skill_loader.schema_text("knowledge")
+    output_constraints = (
+        "\n\n--- 输出约束 ---\n请精简输出以避免截断：每类实体最多 12 条，"
+        "timeline 只保留主线事件最多 20 条，事件描述每条不超过 80 字。只输出 JSON，不要解释。"
+    )
     user = (
         f"[TASK:analyze_chunk]\n"
         f"分块：{chunk['title']}（第 {chunk['pages']} 页，来源kind={chunk['kind']}）\n"
         + ("注意：此块文本过长已被截断。\n" if truncated else "")
         + f"\n--- 模组文本 ---\n{text}\n\n"
-        f"--- 输出 schema ---\n{skill_loader.schema_text('knowledge') + '\n\n--- 输出约束 ---\n请精简输出以避免截断：每类实体最多 12 条，timeline 只保留主线事件最多 20 条，事件描述每条不超过 80 字。只输出 JSON，不要解释。'}\n"
+        + f"--- 输出 schema ---\n{schema}{output_constraints}\n"
     )
     return client.chat_json(
         [

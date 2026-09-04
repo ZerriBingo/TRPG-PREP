@@ -2,11 +2,8 @@
 
 用法: python scripts/test_e2e.py [base_url]
 """
-import io
 import json
-import re
 import sys
-import time
 from pathlib import Path
 
 import httpx

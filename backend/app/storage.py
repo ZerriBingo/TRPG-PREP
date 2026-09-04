@@ -392,8 +392,11 @@ def delete_workspace_instances(workspace_ids: list[str]) -> int:
             matched_targets.add(row["id"] if row["id"] in target_set else nested_workspace_id)
             windows = raw.get("windows", []) if isinstance(raw, dict) else []
             for window in windows:
-                if isinstance(window, dict) and window.get("shadow_task_id"):
-                    shadow_task_ids.append(window["shadow_task_id"])
+                if not isinstance(window, dict):
+                    continue
+                for field_name in ("shadow_task_id", "consolidation_task_id"):
+                    if window.get(field_name):
+                        shadow_task_ids.append(window[field_name])
 
         for target in targets:
             checks = (
@@ -406,21 +409,11 @@ def delete_workspace_instances(workspace_ids: list[str]) -> int:
             if any(conn.execute(query, params).fetchone() is not None for query, params in checks):
                 matched_targets.add(target)
 
-        if shadow_task_ids:
-            task_ids = list(dict.fromkeys(shadow_task_ids))
-            task_placeholders = ",".join("?" for _ in task_ids)
-            conn.execute(
-                f"DELETE FROM shadow_candidates WHERE task_id IN ({task_placeholders})",
-                task_ids,
-            )
-            conn.execute(
-                f"DELETE FROM shadow_runs WHERE task_id IN ({task_placeholders})",
-                task_ids,
-            )
-            conn.execute(
-                f"DELETE FROM shadow_tasks WHERE id IN ({task_placeholders})",
-                task_ids,
-            )
+        _delete_shadow_tasks(
+            conn,
+            shadow_task_ids,
+            prep_job_ids=matched_prep_ids,
+        )
 
         conn.execute(
             f"DELETE FROM candidate_promotions WHERE workspace_id IN ({placeholders})",
@@ -542,25 +535,61 @@ def list_prep_jobs() -> list[dict]:
     return [json.loads(row["data"]) for row in rows]
 
 
-def delete_prep_job(job_id: str, shadow_task_ids: list[str]) -> bool:
+def _shadow_task_ids_for_prep_jobs(
+    conn: sqlite3.Connection, prep_job_ids: list[str]
+) -> list[str]:
+    prefixes = tuple(
+        f"{job_id}:" for job_id in dict.fromkeys(prep_job_ids) if job_id
+    )
+    if not prefixes:
+        return []
+    rows = conn.execute("SELECT id, idempotency_key FROM shadow_tasks").fetchall()
+    return [
+        row["id"]
+        for row in rows
+        if any(str(row["idempotency_key"]).startswith(prefix) for prefix in prefixes)
+    ]
+
+
+def _delete_shadow_tasks(
+    conn: sqlite3.Connection,
+    explicit_task_ids: list[str] | None = None,
+    *,
+    prep_job_ids: list[str] | None = None,
+) -> None:
+    task_ids = set(explicit_task_ids or [])
+    task_ids.update(
+        _shadow_task_ids_for_prep_jobs(conn, prep_job_ids or [])
+    )
+    normalized_ids = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+    if not normalized_ids:
+        return
+    placeholders = ",".join("?" for _ in normalized_ids)
+    conn.execute(
+        f"DELETE FROM shadow_candidates WHERE task_id IN ({placeholders})",
+        normalized_ids,
+    )
+    conn.execute(
+        f"DELETE FROM shadow_runs WHERE task_id IN ({placeholders})",
+        normalized_ids,
+    )
+    conn.execute(
+        f"DELETE FROM shadow_tasks WHERE id IN ({placeholders})",
+        normalized_ids,
+    )
+
+
+def delete_prep_job(
+    job_id: str, shadow_task_ids: list[str] | None = None
+) -> bool:
     """Delete one prep job and its isolated shadow rows in one transaction."""
-    task_ids = list(dict.fromkeys(shadow_task_ids))
     conn = _conn()
     try:
-        if task_ids:
-            placeholders = ",".join("?" for _ in task_ids)
-            conn.execute(
-                f"DELETE FROM shadow_candidates WHERE task_id IN ({placeholders})",
-                task_ids,
-            )
-            conn.execute(
-                f"DELETE FROM shadow_runs WHERE task_id IN ({placeholders})",
-                task_ids,
-            )
-            conn.execute(
-                f"DELETE FROM shadow_tasks WHERE id IN ({placeholders})",
-                task_ids,
-            )
+        _delete_shadow_tasks(
+            conn,
+            shadow_task_ids,
+            prep_job_ids=[job_id],
+        )
         cursor = conn.execute("DELETE FROM prep_jobs WHERE id = ?", (job_id,))
         conn.commit()
         return cursor.rowcount == 1
@@ -677,7 +706,9 @@ def list_shadow_runs(task_id: str) -> list[dict]:
 
 
 def list_shadow_candidates(
-    task_id: str | None = None, review_state: str | None = None
+    task_id: str | None = None,
+    review_state: str | None = None,
+    queue_visibility: str | None = "review",
 ) -> list[dict]:
     conditions: list[str] = []
     params: list[str] = []
@@ -694,7 +725,14 @@ def list_shadow_candidates(
         params,
     ).fetchall()
     conn.close()
-    return [json.loads(row["data"]) for row in rows]
+    candidates = [json.loads(row["data"]) for row in rows]
+    if queue_visibility is None:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.get("queue_visibility", "review") == queue_visibility
+    ]
 
 
 def load_shadow_candidate(candidate_id: str) -> dict | None:
@@ -727,6 +765,40 @@ def save_shadow_candidates(candidates: list[dict]) -> None:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"unknown shadow candidate: {candidate['id']}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_shadow_task_visibility(task_id: str, queue_visibility: str) -> None:
+    """Hide or expose a task and its candidates as one queue operation."""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT data FROM shadow_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown shadow task: {task_id}")
+        task = json.loads(row["data"])
+        task["queue_visibility"] = queue_visibility
+        task["updated_at"] = now()
+        conn.execute(
+            "UPDATE shadow_tasks SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(task, ensure_ascii=False), task["updated_at"], task_id),
+        )
+        rows = conn.execute(
+            "SELECT id, data FROM shadow_candidates WHERE task_id = ?", (task_id,)
+        ).fetchall()
+        for candidate_row in rows:
+            candidate = json.loads(candidate_row["data"])
+            candidate["queue_visibility"] = queue_visibility
+            conn.execute(
+                "UPDATE shadow_candidates SET data = ? WHERE id = ?",
+                (json.dumps(candidate, ensure_ascii=False), candidate_row["id"]),
+            )
         conn.commit()
     except Exception:
         conn.rollback()

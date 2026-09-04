@@ -1,21 +1,18 @@
 # Reassessment - 2026-08-31
 
-Status: active implementation direction after Q1-Q81.
+Status: active implementation direction, reviewed 2026-09-03.
 
 ## Product Boundary
 
-- New-project behavior is authoritative. Historical projects and artifacts are not migrated or given compatibility-only repair controls.
+- The current workflow is designed around new projects. Historical projects and artifacts inform diagnosis and testing; migration or repair is a deliberate product choice that must serve a current user workflow.
 - The three boards remain independent: reality-horror, fantasy/adventure, and general preparation.
-- Preparation tasks do not ask for a predicted session duration.
-- Semantic segmentation is the primary path. Pending jobs show only preparation state; a validated semantic plan owns the selected pages, while mechanical windows are a visible fallback after semantic failure.
+- Semantic segmentation owns logical grouping. Transport and recovery strategies may vary, provided they preserve selected-source coverage, ownership, and provenance.
 
 ## Review And Facts
 
-- Candidate review is a flat, paginated task queue with source-page filtering and bulk accept/reject/return actions.
+- Candidate review is organized around the current preparation task and current candidate records; its presentation should support scanning, source lookup, and efficient accept/reject/return actions.
 - Accepted candidates enter the bookshelf through the normal review workflow; the user does not maintain semantic clusters or conflict groups.
-- Candidate clustering, conflict workbench routes, and their persistence model are retired.
-- The facts page is search-only: keyword, type, visibility, and source-page filters plus full source-backed fact details.
-- Relationship graphs, LLM indexes, manual relationship maintenance, “prepare facts by page,” and fact creation from that page are retired.
+- The facts page is a source-backed retrieval view. Additional relationship or navigation aids are justified only when they improve a real preparation workflow without replacing review and provenance.
 
 ## Reality-Horror Artifacts
 
@@ -28,23 +25,21 @@ Status: active implementation direction after Q1-Q81.
 
 ## Runtime
 
-- Runtime is location-led and non-linear. The current location is the main surface; triggers may be unhandled, active, or resolved without rewriting the approved artifact.
-- Location granularity belongs to semantic whole-board planning. The bookshelf has no parallel source-check, missing-location warning, or location-exclusion workflow.
+- Runtime is location-led and non-linear. A current location can lead play; triggers may be unhandled, active, or resolved without rewriting the approved artifact.
+- Location granularity belongs to semantic whole-board planning and should be judged by investigation, interaction, help-seeking, revisit, clue, and event value.
 
 ## Runtime UI Principles
 
-- The runtime page is the complete table-side reference surface, not a launcher back to the artifact page.
-- Reality-horror plans expose the chapter overview, every approved location, NPCs, threats, clocks, and display materials from the runtime page.
-- The current location is the main surface; all other runtime material is reachable through search, type filters, and a compact related-material area.
-- Remove the visible current-board panel and runtime log panel. Persist only state that affects play, such as clue visibility, trigger state, and clocks.
-- Remove previous/next location controls and any route inferred from fact relationships.
+- The runtime page is the complete table-side reference surface, not a launcher back to the artifact page. It should make the chapter overview, approved locations, NPCs, threats, clocks, and display materials reachable during play.
+- Location cards may lead navigation, while the arrangement of panels, filters, history, and supporting views remains an implementation choice tested against table-side retrieval.
+- Persist state that affects play, such as clue visibility, trigger state, and clocks, separately from approved artifact content.
 - A location is independent when it has investigation, interaction, help-seeking, revisit, clue, or event value; purely descriptive room lists remain inside their parent location.
-- Candidate acceptance and bookshelf promotion are one user-facing action, even if the backend retains resumable internal stages.
+- Candidate acceptance and bookshelf promotion remain explicit and auditable; the interface may combine them when the state transition stays clear.
 
 ## Implementation Order
 
 1. Complete the location/overview artifact contract and location-led runtime flow.
-2. Remove retired cluster, graph, page-fact, duration, generic-scene, and beat-navigation interfaces end to end.
+2. Audit existing interfaces against current preparation and table-side workflows; simplify or remove surfaces that do not earn their complexity.
 3. Finish display-material embedding in the artifact and runtime workflows.
 4. Run offline contract tests and browser smoke tests without invoking a real long-running upstream task.
 5. Ask the GM to run a fresh small reality-horror project, then the p96-p180 chapter, and report omissions and table-side retrieval friction.

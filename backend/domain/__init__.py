@@ -1,7 +1,7 @@
 """Rule-agnostic domain models and validation for the rebuilt prep tool."""
 
 from .models import ArtifactDraftJob, CardGeneration, DisplayMaterial, DisplayMaterialLink, EvidenceStatus, DerivedCard, FactProvenance, RuleProfile, SceneBeat, ScenePlan, SessionLogEntry, SessionState, SourceFact, SourceRef
-from .prep import ExtractionWindow, PageSpan, PrepJob, PrepJobCreate, PrepScope, parse_page_spans
+from .prep import CoreTextSlice, ExtractionWindow, PageSpan, PrepJob, PrepJobCreate, PrepScope, parse_page_spans
 from .shadow import (
     ShadowCandidate,
     ShadowCandidateDraft,
@@ -38,6 +38,7 @@ __all__ = [
     "EvidenceStatus",
     "FactProvenance",
     "ExtractionWindow",
+    "CoreTextSlice",
     "DomainValidationError",
     "ExampleBundle",
     "PageSpan",

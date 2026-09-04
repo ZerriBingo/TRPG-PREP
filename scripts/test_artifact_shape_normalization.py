@@ -7,8 +7,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.artifacts import _materialization_messages, _validate_and_build  # noqa: E402
-from backend.domain import ExampleBundle, SourceFact, SourceRef, load_profiles  # noqa: E402
+from backend.app.artifacts import (  # noqa: E402
+    ArtifactGenerationError,
+    _materialization_messages,
+    _validate_global_plan,
+    _validate_local_digest,
+    _validate_and_build,
+    _validate_materialized_card,
+)
+from backend.domain import (  # noqa: E402
+    ExampleBundle,
+    RuleProfile,
+    SourceFact,
+    SourceRef,
+    load_profiles,
+)
 
 
 bundle = ExampleBundle(
@@ -54,16 +67,17 @@ raw = {
             "return_changes": ["原文未说明变化"],
         },
         "field_sources": {
-            "relevant_characters": ["fact_shape", "fact_shape_supporting"],
+            "relevant_characters": [["fact_shape"], ["fact_shape_supporting"]],
         },
-        "open_questions": [],
+        "open_questions": ["卡片级问题"],
     }],
-    "open_questions": [],
+    "open_questions": ["响应级问题"],
 }
-cards, _ = _validate_and_build(raw, bundle, profile, model_id="shape-test")
+cards, questions = _validate_and_build(raw, bundle, profile, model_id="shape-test")
 assert cards[0].fields["relevant_characters"] == ["暂无在场人物"]
 assert "fact_shape_supporting" in cards[0].fact_ids
 assert set(cards[0].field_sources["relevant_characters"]).issubset(cards[0].fact_ids)
+assert questions == ["响应级问题", "卡片级问题"]
 minimal_location = {
     "cards": [{
         "type": "location",
@@ -79,6 +93,128 @@ minimal_location = {
 minimal_cards, _ = _validate_and_build(minimal_location, bundle, profile, model_id="shape-test")
 assert minimal_cards[0].type == "location"
 assert "relevant_characters" not in minimal_cards[0].fields
+
+unknown_source = {
+    "cards": [{
+        "type": "location",
+        "title": "未知来源测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": "门开着",
+            "arrival_description": "屋外有脚印",
+        },
+        "field_sources": {"normal_state": [["fact_missing"]]},
+    }],
+}
+try:
+    _validate_and_build(unknown_source, bundle, profile, model_id="shape-test")
+except ArtifactGenerationError as error:
+    assert "未提升或不存在的事实" in str(error)
+else:
+    raise AssertionError("unknown field source must remain a hard validation error")
+
+unknown_field = {
+    "cards": [{
+        "type": "location",
+        "title": "未知字段测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": "门开着",
+            "arrival_description": "屋外有脚印",
+            "unsupported_detail": "不能静默保留",
+        },
+        "field_sources": {},
+    }],
+}
+try:
+    _validate_and_build(unknown_field, bundle, profile, model_id="shape-test")
+except ArtifactGenerationError as error:
+    assert "包含未定义字段" in str(error)
+else:
+    raise AssertionError("unknown card fields must remain a hard validation error")
+
+planned_card = _validate_materialized_card(
+    {
+        "cards": [{
+            "type": "location",
+            "title": "计划闭包测试",
+            "subtitle": "测试",
+            "fact_ids": ["fact_shape"],
+            "fields": {
+                "normal_state": "门开着",
+                "arrival_description": "可以检查门锁",
+            },
+            "field_sources": {"normal_state": ["fact_shape"]},
+            "open_questions": [],
+        }],
+        "open_questions": [],
+    },
+    bundle,
+    profile,
+    {
+        "id": "plan_shape_closure",
+        "type": "location",
+        "title": "计划闭包测试",
+        "fact_ids": ["fact_shape", "fact_shape_supporting"],
+    },
+    model_id="shape-test",
+)
+assert planned_card["cards"][0]["fact_ids"] == [
+    "fact_shape",
+    "fact_shape_supporting",
+]
+
+plan_profile = RuleProfile.model_validate({
+    "id": "shape-plan-profile",
+    "name": "Shape plan profile",
+    "version": "1",
+    "profile_kind": "runtime",
+    "card_definitions": [{
+        "type": "location",
+        "display_name": "地点",
+        "required_fields": [],
+        "optional_fields": [],
+    }],
+})
+validated_plan = _validate_global_plan(
+    {
+        "cards": [{
+            "type": "location",
+            "title": "计划形状测试",
+            "purpose": "验证标量 focus",
+            "fact_ids": ["fact_shape"],
+            "focus": "调查入口",
+            "open_questions": [],
+        }],
+        "open_questions": [],
+    },
+    [{"fact_ids": ["fact_shape"]}],
+    [bundle.facts[0]],
+    plan_profile,
+)
+assert validated_plan["cards"][0]["focus"] == ["调查入口"]
+
+local_units = _validate_local_digest(
+    {
+        "units": [
+            {
+                "kind": "clue_cluster",
+                "title": f"局部单元 {index}",
+                "summary": "保留该局部单元",
+                "fact_ids": ["fact_shape"],
+                "entity_keys": [],
+                "relationship_hints": [],
+                "open_questions": [],
+            }
+            for index in range(33)
+        ],
+        "open_questions": [],
+    },
+    [bundle.facts[0]],
+    batch_index=1,
+)
+assert len(local_units["units"]) == 33
+
 location_definition = next(item for item in profile.card_definitions if item.type == "location")
 location_plan = {
     "id": "plan_location_prompt",

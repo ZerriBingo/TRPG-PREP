@@ -340,9 +340,28 @@ class ArtifactDraftJob(BaseModel):
     input_fingerprint: str | None = Field(default=None, max_length=160)
     budget_method: str = Field(default="conservative-cjk-v1", min_length=1, max_length=80)
     open_questions: list[str] = Field(default_factory=list, max_length=50)
+    open_question_count: int = Field(default=0, ge=0)
+    open_question_overflow_count: int = Field(default=0, ge=0)
     error: str | None = Field(default=None, max_length=2000)
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_question_summary(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        raw_questions = data.get("open_questions")
+        preview = (
+            list(dict.fromkeys(item.strip() for item in raw_questions if isinstance(item, str) and item.strip()))
+            if isinstance(raw_questions, list)
+            else []
+        )
+        count = data.setdefault("open_question_count", len(preview))
+        if "open_question_overflow_count" not in data and isinstance(count, int):
+            data["open_question_overflow_count"] = max(0, count - len(preview))
+        return data
 
     @field_validator("model_id", "error")
     @classmethod
@@ -360,6 +379,12 @@ class ArtifactDraftJob(BaseModel):
             raise ValueError("completed_batches cannot exceed batch_count")
         if self.completed_cards > self.planned_card_count:
             raise ValueError("completed_cards cannot exceed planned_card_count")
+        if self.open_question_count < len(self.open_questions):
+            raise ValueError("open_question_count cannot be below the displayed preview")
+        if self.open_question_overflow_count != (
+            self.open_question_count - len(self.open_questions)
+        ):
+            raise ValueError("open question overflow count must match the displayed preview")
         return self
 
 

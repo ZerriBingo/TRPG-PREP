@@ -1,0 +1,44 @@
+[project]
+name = "trpg-prep"
+version = "0.1.3"
+description = "Offline-first TRPG preparation workspace for game masters."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "curl-cffi>=0.16.2",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "pymupdf>=1.24",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5",
+    "ty>=0.0.77",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+python-preference = "managed"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["backend", "scripts"]
+extend-exclude = ["data", "output", "Resource", ".playwright-cli"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.rules]
+# Start with a useful, low-noise baseline for the existing legacy annotations.
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-return-type = "ignore"
+not-subscriptable = "ignore"
+unresolved-attribute = "ignore"

@@ -17,4 +17,13 @@ assert 'const key = prepJobId ? `prep:${prepJobId}` : "shadow";' in batch
 assert "await loadReviewQueue({waitForExisting: true});" in SOURCE
 assert "for (let attempt = 0; attempt < 200 && state.review.loading; attempt += 1)" in SOURCE
 
+prep_render_start = SOURCE.index("function renderPrep()")
+prep_render_end = SOURCE.index("async function loadPrepConfig", prep_render_start)
+prep_render = SOURCE[prep_render_start:prep_render_end]
+assert "const windowAction = window.shadow_task_id && window.candidate_count" not in prep_render
+assert "window.consolidation_status === \"succeeded\"" in prep_render
+assert "window.segment_window_index === window.segment_window_count" in prep_render
+assert "window.consolidation_candidate_count > 0" in prep_render
+assert "job.status === \"completed\"" in prep_render
+
 print("PASS: review batch routes prep candidates through promotion endpoint")

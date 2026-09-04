@@ -33,7 +33,9 @@ MAX_SINGLE_FACT_CHARS = MAX_FACT_BATCH_CHARS
 MAX_FACT_BATCH_TOKENS = 22_000
 MAX_SINGLE_FACT_TOKENS = MAX_FACT_BATCH_TOKENS
 MAX_DRAFT_CARDS = 50
-MAX_LOCAL_UNITS = 32
+MAX_LOCAL_UNITS = 120
+MAX_LOCAL_OPEN_QUESTIONS = 120
+MAX_JOB_OPEN_QUESTION_PREVIEW = 50
 MAX_CARD_FACT_INPUT_CHARS = 72_000
 MAX_CARD_FACT_INPUT_TOKENS = 22_000
 LOCAL_DIGEST_MAX_TOKENS = 7000
@@ -80,6 +82,41 @@ class ArtifactGenerationError(ValueError):
 
 class ArtifactJobConflictError(RuntimeError):
     """Raised when another incompatible artifact job is already active."""
+
+
+class _OpenQuestionSummary:
+    """Keep a bounded job preview while retaining an exact run-local total."""
+
+    def __init__(self) -> None:
+        self._questions: dict[str, None] = {}
+
+    def add(self, values: list[str]) -> None:
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            question = value.strip()
+            if question:
+                self._questions.setdefault(question, None)
+
+    @property
+    def preview(self) -> list[str]:
+        return list(self._questions)[:MAX_JOB_OPEN_QUESTION_PREVIEW]
+
+    @property
+    def count(self) -> int:
+        return len(self._questions)
+
+    @property
+    def overflow_count(self) -> int:
+        return self.count - len(self.preview)
+
+
+def _question_summary_fields(summary: _OpenQuestionSummary) -> dict[str, Any]:
+    return {
+        "open_questions": summary.preview,
+        "open_question_count": summary.count,
+        "open_question_overflow_count": summary.overflow_count,
+    }
 
 
 def _stable_hash(value: Any) -> str:
@@ -325,7 +362,10 @@ def select_artifact_job(
     if not jobs:
         return None
     status_rank = {"running": 0, "queued": 1, "failed": 2, "completed": 3}
-    profile_rank = lambda job: 0 if profile_id is None or job.profile_id == profile_id else 1
+
+    def profile_rank(job: ArtifactDraftJob) -> int:
+        return 0 if profile_id is None or job.profile_id == profile_id else 1
+
     return min(
         enumerate(jobs),
         key=lambda pair: (
@@ -501,6 +541,8 @@ def execute_artifact_job(
             input_fingerprint=input_fingerprint,
             budget_method="conservative-cjk-v1",
             open_questions=[],
+            open_question_count=0,
+            open_question_overflow_count=0,
         )
 
         # Runtime boards always pass through the planner so location coverage
@@ -508,23 +550,25 @@ def execute_artifact_job(
         # cards. The compact direct path is reserved for non-runtime boards.
         if len(batches) == 1 and profile.profile_kind != "runtime":
             job = _save_job(job, phase="direct_generation")
-            generated_cards, open_questions = _generate_direct_step(
+            generated_cards, questions = _generate_direct_step(
                 job,
                 bundle,
                 profile,
                 client,
                 scoped_facts,
             )
+            question_summary = _OpenQuestionSummary()
+            question_summary.add(questions)
             job = _save_job(
                 _job_from_store(job_id),
                 completed_batches=1,
                 planned_card_count=len(generated_cards),
                 completed_cards=len(generated_cards),
                 card_count=len(generated_cards),
-                open_questions=open_questions,
+                **_question_summary_fields(question_summary),
             )
         else:
-            generated_cards, open_questions, job = _generate_hierarchical_artifacts(
+            generated_cards, question_summary, job = _generate_hierarchical_artifacts(
                 job,
                 bundle,
                 profile,
@@ -570,7 +614,7 @@ def execute_artifact_job(
             completed_batches=len(batches),
             planned_card_count=len(generated_cards),
             completed_cards=len(generated_cards),
-            open_questions=open_questions,
+            **_question_summary_fields(question_summary),
             error=None,
         )
     except Exception as error:  # noqa: BLE001
@@ -686,7 +730,9 @@ class LocalDigestResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     units: list[LocalUnitPayload] = Field(min_length=1, max_length=MAX_LOCAL_UNITS)
-    open_questions: list[str] = Field(default_factory=list, max_length=50)
+    open_questions: list[str] = Field(
+        default_factory=list, max_length=MAX_LOCAL_OPEN_QUESTIONS
+    )
 
     @field_validator("open_questions")
     @classmethod
@@ -735,6 +781,39 @@ def _nonempty(value: Any) -> bool:
     if isinstance(value, (list, dict, tuple, set)):
         return bool(value)
     return True
+
+
+def _flatten_one_level(value: Any) -> Any:
+    """Flatten one JSON list wrapper while leaving deeper invalid shapes strict."""
+    if not isinstance(value, list) or not any(isinstance(item, list) for item in value):
+        return value
+    flattened: list[Any] = []
+    for item in value:
+        flattened.extend(item if isinstance(item, list) else [item])
+    return flattened
+
+
+def _normalize_global_plan_shape(raw: Any) -> Any:
+    """Repair scalar list fields without weakening the plan schema."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("cards"), list):
+        return raw
+    normalized = dict(raw)
+    cards: list[Any] = []
+    for item in raw["cards"]:
+        if not isinstance(item, dict):
+            cards.append(item)
+            continue
+        card = dict(item)
+        focus = card.get("focus")
+        if isinstance(focus, str):
+            card["focus"] = [focus.strip()] if focus.strip() else []
+        cards.append(card)
+    normalized["cards"] = cards
+    return normalized
+
+
+def _unique_questions(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(item.strip() for item in values if item.strip()))
 
 
 def _fact_payload_from_facts(facts: list[Any]) -> list[dict[str, Any]]:
@@ -865,9 +944,6 @@ def _validate_local_digest(
     *,
     batch_index: int,
 ) -> dict[str, Any]:
-    if isinstance(raw, dict) and isinstance(raw.get("open_questions"), list):
-        raw = dict(raw)
-        raw["open_questions"] = raw["open_questions"][:50]
     try:
         payload = LocalDigestResponsePayload.model_validate(raw)
     except ValidationError as error:
@@ -985,7 +1061,9 @@ def _validate_global_plan(
     profile: RuleProfile,
 ) -> dict[str, Any]:
     try:
-        payload = GlobalPlanResponsePayload.model_validate(raw)
+        payload = GlobalPlanResponsePayload.model_validate(
+            _normalize_global_plan_shape(raw)
+        )
     except ValidationError as error:
         raise ArtifactGenerationError(f"全局卡片计划 JSON 不符合约定: {error}") from error
 
@@ -1121,6 +1199,27 @@ def _validate_materialized_card(
     *,
     model_id: str,
 ) -> dict[str, Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("cards"), list):
+        # The global plan owns the card's fact closure. Models may omit a
+        # supporting fact while rereading the card, but that omission must not
+        # shrink the canonical set selected by the planner.
+        normalized = dict(raw)
+        normalized_cards: list[Any] = []
+        for item in raw["cards"]:
+            if not isinstance(item, dict):
+                normalized_cards.append(item)
+                continue
+            card = dict(item)
+            declared_ids = card.get("fact_ids")
+            if isinstance(declared_ids, list):
+                card["fact_ids"] = list(
+                    dict.fromkeys([*declared_ids, *plan["fact_ids"]])
+                )
+            elif declared_ids is None:
+                card["fact_ids"] = list(plan["fact_ids"])
+            normalized_cards.append(card)
+        normalized["cards"] = normalized_cards
+        raw = normalized
     cards, questions = _validate_and_build(
         raw,
         bundle,
@@ -1211,14 +1310,14 @@ def _generate_hierarchical_artifacts(
     client: Any,
     scoped_facts: list[Any],
     batches: list[list[Any]],
-) -> tuple[list[DerivedCard], list[str], ArtifactDraftJob]:
+) -> tuple[list[DerivedCard], _OpenQuestionSummary, ArtifactDraftJob]:
     job = _save_job(job, phase="local_digest")
     local_units: list[dict[str, Any]] = []
-    open_questions: list[str] = []
+    question_summary = _OpenQuestionSummary()
     for batch_index, batch_facts in enumerate(batches, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
-            return [], open_questions, current
+            return [], question_summary, current
         fact_payload = _fact_payload_from_facts(batch_facts)
         try:
             output = _run_json_step(
@@ -1250,14 +1349,12 @@ def _generate_hierarchical_artifacts(
                 f"第 {batch_index}/{len(batches)} 批局部整理失败：{error}"
             ) from error
         local_units.extend(output["units"])
-        open_questions = _merge_questions(
-            open_questions, list(output.get("open_questions") or [])
-        )
+        question_summary.add(list(output.get("open_questions") or []))
         job = _save_job(
             _job_from_store(job.id),
             completed_batches=batch_index,
             unit_count=len(local_units),
-            open_questions=open_questions,
+            **_question_summary_fields(question_summary),
         )
 
     serialized_units = json.dumps(local_units, ensure_ascii=False)
@@ -1313,21 +1410,18 @@ def _generate_hierarchical_artifacts(
             ) from error
         raise ArtifactGenerationError(f"全局规划失败：{error}") from error
     plans = plan_output["cards"]
-    open_questions = _merge_questions(
-        open_questions, list(plan_output.get("open_questions") or [])
-    )
+    question_summary.add(list(plan_output.get("open_questions") or []))
     uncovered = list(plan_output.get("uncovered_fact_ids") or [])
     if uncovered:
-        open_questions = _merge_questions(
-            open_questions,
-            [f"全局计划未使用 {len(uncovered)} 条已提升事实；请在产物复核时检查覆盖范围。"],
+        question_summary.add(
+            [f"全局计划未使用 {len(uncovered)} 条已提升事实；请在产物复核时检查覆盖范围。"]
         )
     job = _save_job(
         _job_from_store(job.id),
         phase="materializing",
         planned_card_count=len(plans),
         completed_cards=0,
-        open_questions=open_questions,
+        **_question_summary_fields(question_summary),
     )
 
     generated_cards: list[DerivedCard] = []
@@ -1335,7 +1429,7 @@ def _generate_hierarchical_artifacts(
     for card_index, plan in enumerate(plans, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
-            return generated_cards, open_questions, current
+            return generated_cards, question_summary, current
         selected_facts = [facts_by_id[fact_id] for fact_id in plan["fact_ids"]]
         fact_payload = _fact_payload_from_facts(selected_facts)
         subset_bundle = bundle.model_copy(
@@ -1377,20 +1471,18 @@ def _generate_hierarchical_artifacts(
                 _job_from_store(job.id),
                 completed_cards=card_index,
                 card_count=len(generated_cards),
-                open_questions=open_questions,
+                **_question_summary_fields(question_summary),
             )
             continue
         generated_cards.extend(
             DerivedCard.model_validate(card) for card in output["cards"]
         )
-        open_questions = _merge_questions(
-            open_questions, list(output.get("open_questions") or [])
-        )
+        question_summary.add(list(output.get("open_questions") or []))
         job = _save_job(
             _job_from_store(job.id),
             completed_cards=card_index,
             card_count=len(generated_cards),
-            open_questions=open_questions,
+            **_question_summary_fields(question_summary),
         )
     if failed_cards:
         preview = "；".join(failed_cards[:5])
@@ -1400,11 +1492,7 @@ def _generate_hierarchical_artifacts(
             f"本轮 {len(plans)} 张计划卡已全部尝试，其中 {len(failed_cards)} 项失败。"
             f"请使用‘重试失败项’；已成功步骤会复用。{preview}"
         )
-    return generated_cards, open_questions, job
-
-
-def _merge_questions(existing: list[str], incoming: list[str]) -> list[str]:
-    return list(dict.fromkeys([*existing, *incoming]))[:50]
+    return generated_cards, question_summary, job
 
 
 def _prompt_messages(
@@ -1508,6 +1596,12 @@ def _validate_and_build(
                     if isinstance(value, str) and value.strip():
                         fields[field_name] = [value.strip()]
                 card["fields"] = fields
+                field_sources = card.get("field_sources")
+                if isinstance(field_sources, dict):
+                    card["field_sources"] = {
+                        field_name: _flatten_one_level(refs)
+                        for field_name, refs in field_sources.items()
+                    }
             normalized_cards.append(card)
         raw = dict(raw)
         raw["cards"] = normalized_cards
@@ -1613,4 +1707,10 @@ def _validate_and_build(
         card.type in RUNTIME_ANCHOR_TYPES for card in cards
     ):
         raise ArtifactGenerationError("运行板块的产物缺少场景或环境卡")
-    return cards, payload.open_questions
+    response_questions = _unique_questions(
+        [
+            *payload.open_questions,
+            *[question for draft in payload.cards for question in draft.open_questions],
+        ]
+    )
+    return cards, response_questions

@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 
 import curl_cffi.requests as creq
-from curl_cffi.requests.errors import RequestsError
 
 from . import storage
 
@@ -248,6 +247,14 @@ class LLMClient:
             return f"API worker 执行失败：{detail}\nURL: {self._url()}"
         if kind == "response":
             return f"API 响应解析失败\nURL: {self._url()}\n详情: {detail}"
+        if kind == "http" and status == 403:
+            account_muted = "account_muted" in detail.casefold()
+            label = "API 账号访问被暂停（account_muted）" if account_muted else "API 访问被拒绝（HTTP 403）"
+            return (
+                f"{label}\nURL: {self._url()}\n"
+                "请检查账号、密钥、代理或供应商状态；该错误不会自动重试。\n"
+                f"响应: {detail}"
+            )
         status_label = str(status) if status is not None else "未知"
         return f"API 请求失败 HTTP {status_label}\nURL: {self._url()}\n响应: {detail}"
 
@@ -394,6 +401,47 @@ def _fake_prep_output(messages: list[dict]) -> dict:
             }
         ]
     }
+
+
+def _fake_consolidation_output(messages: list[dict]) -> dict:
+    """Keep the offline workflow lossless while exercising segment reduction."""
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    candidates_match = re.search(
+        r"^WINDOW_CANDIDATES_JSON=(.+)$", content, re.MULTILINE
+    )
+    raw_candidates = json.loads(candidates_match.group(1)) if candidates_match else []
+    if not isinstance(raw_candidates, list):
+        return {"candidates": []}
+
+    merged: list[dict] = []
+    by_key: dict[tuple[str, str], dict] = {}
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate = dict(raw)
+        candidate.pop("candidate_id", None)
+        key = (
+            str(candidate.get("kind", "clue")),
+            " ".join(str(candidate.get("text", "")).split()).casefold(),
+        )
+        if not key[1]:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            candidate["source_refs"] = list(candidate.get("source_refs") or [])
+            candidate["possible_links"] = list(candidate.get("possible_links") or [])
+            candidate["open_questions"] = list(candidate.get("open_questions") or [])
+            by_key[key] = candidate
+            merged.append(candidate)
+            continue
+        for field in ("source_refs", "possible_links", "open_questions"):
+            values = [*existing.get(field, []), *candidate.get(field, [])]
+            existing[field] = list(
+                dict.fromkeys(json.dumps(item, sort_keys=True, ensure_ascii=False) if field == "source_refs" else str(item) for item in values)
+            )
+            if field == "source_refs":
+                existing[field] = [json.loads(item) for item in existing[field]]
+    return {"candidates": merged[:50]}
 
 
 def _fake_artifact_output(messages: list[dict]) -> dict:
@@ -634,6 +682,10 @@ class FakeLLM:
             return json.dumps(_fake_segment_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:fact_extract":
             return json.dumps(_fake_prep_output(messages), ensure_ascii=False, indent=2)
+        if task == "prep:consolidate":
+            return json.dumps(
+                _fake_consolidation_output(messages), ensure_ascii=False, indent=2
+            )
         if task == "prep:artifact_draft":
             return json.dumps(_fake_artifact_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_local_digest":

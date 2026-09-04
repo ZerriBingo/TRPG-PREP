@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 
 TEXT_THRESHOLD = 300      # 字符数 >= 此值视为文本页
 LIGHT_THRESHOLD = 50      # 字符数 < 此值视为扫描/空白页

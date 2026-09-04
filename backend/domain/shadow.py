@@ -13,6 +13,7 @@ ShadowRunStatus = Literal["running", "succeeded", "failed", "cancelled"]
 ShadowErrorKind = Literal[
     "model_format",
     "upstream_unavailable",
+    "account_access",
     "input_config",
     "worker",
     "cancelled",
@@ -20,6 +21,9 @@ ShadowErrorKind = Literal[
 ShadowReviewState = Literal["needs_review", "accepted", "rejected"]
 ShadowReviewAction = Literal["review", "edit", "split", "merge"]
 CandidateContentBasis = Literal["model_candidate", "source_fact", "inference", "gm_authored"]
+ShadowTaskKind = Literal["standalone", "prep_window", "semantic_consolidation"]
+QueueVisibility = Literal["review", "internal"]
+CandidateRole = Literal["standalone", "window_observation", "segment_result"]
 
 
 class ShadowTaskSpec(BaseModel):
@@ -30,12 +34,20 @@ class ShadowTaskSpec(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=160)
     source_file: str = Field(min_length=1, max_length=500)
     source_version: str = Field(min_length=1, max_length=160)
-    source_pages: list[int] = Field(min_length=1, max_length=100)
+    source_pages: list[int] = Field(min_length=1, max_length=240)
     profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     model_id: str = Field(min_length=1, max_length=160)
     prompt_version: str = Field(min_length=1, max_length=80)
     schema_version: str = Field(min_length=1, max_length=80)
     input_excerpt: str = Field(min_length=1, max_length=16000)
+    task_kind: ShadowTaskKind = "standalone"
+    queue_visibility: QueueVisibility = "review"
+    semantic_segment_id: str | None = Field(
+        default=None, pattern=r"^semantic_segment_[a-z0-9_-]+$"
+    )
+    segment_window_index: int | None = Field(default=None, ge=1)
+    segment_window_count: int | None = Field(default=None, ge=1)
+    parent_task_ids: list[str] = Field(default_factory=list, max_length=120)
 
     @field_validator(
         "idempotency_key",
@@ -46,10 +58,11 @@ class ShadowTaskSpec(BaseModel):
         "prompt_version",
         "schema_version",
         "input_excerpt",
+        "semantic_segment_id",
     )
     @classmethod
-    def strip_text(cls, value: str) -> str:
-        return value.strip()
+    def strip_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
     @field_validator("source_pages")
     @classmethod
@@ -60,6 +73,34 @@ class ShadowTaskSpec(BaseModel):
         if not pages:
             raise ValueError("shadow task needs at least one source page")
         return pages
+
+    @field_validator("parent_task_ids")
+    @classmethod
+    def normalize_parent_task_ids(cls, value: list[str]) -> list[str]:
+        values = [item.strip() for item in value if item.strip()]
+        if len(values) != len(set(values)):
+            raise ValueError("shadow task parent ids must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def semantic_task_metadata_is_consistent(self) -> "ShadowTaskSpec":
+        indexed = self.segment_window_index is not None
+        counted = self.segment_window_count is not None
+        window_index = self.segment_window_index
+        window_count = self.segment_window_count
+        if indexed != counted:
+            raise ValueError(
+                "segment window index and count must be provided together"
+            )
+        if indexed and self.semantic_segment_id is None:
+            raise ValueError("segment window numbering requires a semantic segment id")
+        if window_index is not None and window_count is not None and window_index > window_count:
+            raise ValueError("segment window index cannot exceed its count")
+        if self.task_kind == "semantic_consolidation" and self.semantic_segment_id is None:
+            raise ValueError("semantic consolidation tasks require a semantic segment id")
+        if self.task_kind == "prep_window" and self.queue_visibility != "internal":
+            raise ValueError("prep window tasks must remain internal to the review queue")
+        return self
 
 
 class ShadowTask(ShadowTaskSpec):
@@ -189,6 +230,11 @@ class ShadowCandidate(ShadowCandidateDraft):
     task_id: str = Field(pattern=r"^shadow_task_[a-z0-9_-]+$")
     run_id: str = Field(pattern=r"^shadow_run_[a-z0-9_-]+$")
     evidence_status: Literal["model_candidate"] = "model_candidate"
+    queue_visibility: QueueVisibility = "review"
+    candidate_role: CandidateRole = "standalone"
+    semantic_segment_id: str | None = Field(
+        default=None, pattern=r"^semantic_segment_[a-z0-9_-]+$"
+    )
     # The candidate remains unpromoted, while this field records the basis of
     # the current editable claim for promotion validation.
     content_basis: CandidateContentBasis = "model_candidate"
