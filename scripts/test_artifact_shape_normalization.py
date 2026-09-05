@@ -78,6 +78,52 @@ assert cards[0].fields["relevant_characters"] == ["暂无在场人物"]
 assert "fact_shape_supporting" in cards[0].fact_ids
 assert set(cards[0].field_sources["relevant_characters"]).issubset(cards[0].fact_ids)
 assert questions == ["响应级问题", "卡片级问题"]
+
+nested_provenance = {
+    "cards": [{
+        "type": "npc",
+        "title": "嵌套来源人物",
+        "fact_ids": ["fact_shape", "fact_shape_supporting"],
+        "fields": {
+            "role": {
+                "value": "门的看守者",
+                "field_sources": ["fact_shape"],
+            },
+            "wants": "寻找开门的人",
+            "offers": "提供门锁的线索",
+            "pressure_point": "担心门后内容曝光",
+            "refusal_consequence": "拒绝后不再提供线索",
+        },
+        "field_sources": {"wants": ["fact_shape_supporting"]},
+    }],
+}
+nested_cards, _ = _validate_and_build(
+    nested_provenance, bundle, profile, model_id="shape-test", require_runtime_anchor=False
+)
+assert nested_cards[0].fields["role"] == "门的看守者"
+assert nested_cards[0].field_sources["role"] == ["fact_shape"]
+assert nested_cards[0].field_sources["wants"] == ["fact_shape_supporting"]
+
+deep_nested_provenance = {
+    "cards": [{
+        "type": "location",
+        "title": "深层来源测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": {
+                "value": {"text": "门开着"},
+                "field_sources": ["fact_shape"],
+            },
+            "arrival_description": "屋外有脚印",
+        },
+    }],
+}
+try:
+    _validate_and_build(deep_nested_provenance, bundle, profile, model_id="shape-test")
+except ArtifactGenerationError as error:
+    assert "字段必须是字符串" in str(error)
+else:
+    raise AssertionError("deeply nested field values must remain rejected")
 minimal_location = {
     "cards": [{
         "type": "location",
@@ -193,6 +239,28 @@ validated_plan = _validate_global_plan(
     plan_profile,
 )
 assert validated_plan["cards"][0]["focus"] == ["调查入口"]
+
+many_cards = {
+    "cards": [
+        {
+            "type": "location",
+            "title": f"独立地点 {index}",
+            "purpose": "验证技术安全阈值不决定产品分组",
+            "fact_ids": ["fact_shape"],
+            "focus": [],
+            "open_questions": [],
+        }
+        for index in range(53)
+    ],
+    "open_questions": [],
+}
+validated_many = _validate_global_plan(
+    many_cards,
+    [{"fact_ids": ["fact_shape"]}],
+    [bundle.facts[0]],
+    plan_profile,
+)
+assert len(validated_many["cards"]) == 53
 
 local_units = _validate_local_digest(
     {

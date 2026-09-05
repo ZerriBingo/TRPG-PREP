@@ -40,14 +40,17 @@ MAX_REFERENCE_PAGE_COUNT = 8
 MAX_WINDOW_INPUT_CHARS = 14000
 MAX_SEMANTIC_PAGE_SIGNATURE_CHARS = 220
 MAX_SEMANTIC_INPUT_CHARS = 18000
+MAX_SEMANTIC_SEGMENT_WINDOWS = 3
+MAX_SEMANTIC_REFINEMENT_ROUNDS = 2
 SEMANTIC_SLICE_MIN_BREAK_RATIO = 0.45
-PROMPT_VERSION = "prep-fact-extract-v4"
+PROMPT_VERSION = "prep-fact-extract-v5"
 SCHEMA_VERSION = "shadow-candidate-v1"
 CONSOLIDATION_PROMPT_VERSION = "prep-fact-consolidate-v4"
 DETERMINISTIC_CONSOLIDATION_VERSION = "prep-fact-consolidate-deterministic-v1"
 MAX_CONSOLIDATION_INPUT_CHARS = 15000
 MAX_CONSOLIDATION_CANDIDATES = 50
 MAX_CONSOLIDATION_ROUNDS = 8
+MAX_CONSOLIDATION_TIMEOUT_SPLIT_DEPTH = 2
 INTERRUPTED_CONSOLIDATION_ERROR = "segment consolidation was interrupted before completion"
 
 PROFILE_OBJECTIVES = {
@@ -550,25 +553,104 @@ def _semantic_page_signatures(path: Path, spans: list[PageSpan]) -> list[dict[st
     return signatures
 
 
-def _semantic_prompt_messages(job: PrepJob, signatures: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _semantic_prompt_messages(
+    job: PrepJob,
+    signatures: list[dict[str, Any]],
+    *,
+    refine: bool = False,
+) -> list[dict[str, str]]:
     pages = [item["page"] for item in signatures]
     system = (
         "You are a page-boundary planner for a source-backed TRPG preparation task. "
         "Return exactly one JSON object with a segments array. Group adjacent selected "
-        "PDF pages that belong to the same semantic unit such as a location, event, "
-        "character, clue chain, or transition. Preserve every selected page exactly "
+        "PDF pages into the smallest coherent preparation units such as one location, "
+        "event, character, clue chain, or transition. A chapter or city section is a "
+        "container, not one semantic unit, when it contains several usable places, "
+        "people, events, or investigations. Preserve every selected page exactly "
         "once; never include an unselected page; never overlap segments. A segment "
         "must be an object {start, end, label}. Labels are short GM-facing descriptions, "
         "not rules or invented content. This is only a planning hint: do not extract facts."
     )
+    if refine:
+        system += (
+            " The previous plan made this range too broad for reliable processing. "
+            "Subdivide it only at meaningful source transitions visible in the page "
+            "signatures; do not divide it into arbitrary equal page ranges."
+        )
+    task = "prep:segment:refine" if refine else "prep:segment"
     user = (
-        "[TASK:prep:segment]\n"
+        f"[TASK:{task}]\n"
         f"SOURCE_FILE_JSON={json.dumps(job.scope.source_file, ensure_ascii=False)}\n"
         f"SELECTED_PAGES_JSON={json.dumps(pages)}\n"
         f"PAGE_SIGNATURES_JSON={json.dumps(signatures, ensure_ascii=False)}\n"
         "Return {\"segments\":[{\"start\":1,\"end\":2,\"label\":\"...\"}]} and no markdown."
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _refine_broad_semantic_segments(
+    job: PrepJob,
+    path: Path,
+    client,
+    signatures: list[dict[str, Any]],
+    segments: list[PageSpan],
+) -> tuple[list[PageSpan], list[ExtractionWindow]]:
+    """Ask for semantic sub-units when one plan would own too many windows."""
+    token = job.id.removeprefix("prep_job_")
+    current = segments
+    for _round in range(MAX_SEMANTIC_REFINEMENT_ROUNDS + 1):
+        windows = _build_windows(
+            path,
+            current,
+            token,
+            semantic_boundaries=True,
+            lossless_semantic=job.segmentation_strategy == "semantic-v2",
+        )
+        window_counts: dict[str, int] = {}
+        for window in windows:
+            if window.semantic_segment_id:
+                window_counts[window.semantic_segment_id] = (
+                    window_counts.get(window.semantic_segment_id, 0) + 1
+                )
+        broad_indexes = {
+            index
+            for index in range(len(current))
+            if window_counts.get(f"semantic_segment_{token}_{index + 1}", 0)
+            > MAX_SEMANTIC_SEGMENT_WINDOWS
+        }
+        if not broad_indexes or _round == MAX_SEMANTIC_REFINEMENT_ROUNDS:
+            return current, windows
+
+        refined_segments: list[PageSpan] = []
+        changed = False
+        for index, segment in enumerate(current):
+            if index not in broad_indexes:
+                refined_segments.append(segment)
+                continue
+            segment_signatures = [
+                item
+                for item in signatures
+                if segment.start <= int(item["page"]) <= segment.end
+            ]
+            try:
+                raw = client.chat(
+                    _semantic_prompt_messages(job, segment_signatures, refine=True),
+                    temperature=0.0,
+                    max_tokens=3000,
+                )
+                refined = _normalize_semantic_segments(parse_json(raw), [segment])
+            except Exception:  # noqa: BLE001
+                refined = [segment]
+            if len(refined) > 1:
+                refined_segments.extend(refined)
+                changed = True
+            else:
+                refined_segments.append(segment)
+        if not changed:
+            return current, windows
+        current = refined_segments
+
+    raise AssertionError("semantic refinement loop did not return")
 
 
 def _normalize_semantic_segments(parsed: Any, scope_spans: list[PageSpan]) -> list[PageSpan]:
@@ -632,12 +714,12 @@ def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
         segments = _normalize_semantic_segments(
             parse_json(raw), job.scope.page_spans
         )
-        windows = _build_windows(
+        segments, windows = _refine_broad_semantic_segments(
+            job,
             path,
+            client,
+            signatures,
             segments,
-            job.id.removeprefix("prep_job_"),
-            semantic_boundaries=True,
-            lossless_semantic=job.segmentation_strategy == "semantic-v2",
         )
         return _save_job(
             job,
@@ -2295,6 +2377,79 @@ def _run_consolidation_task(
     return completed_task, candidates, None
 
 
+def _is_consolidation_timeout(error: str | None) -> bool:
+    text = str(error or "").casefold()
+    return "timeout" in text or "timed out" in text or "超时" in text
+
+
+def _run_resilient_consolidation_batch(
+    job: PrepJob,
+    segment_id: str,
+    segment_span: PageSpan,
+    windows: list[ExtractionWindow],
+    batch: list[dict],
+    parent_task_ids: list[str],
+    client,
+    *,
+    depth: int = 0,
+) -> tuple[Any, list[Any], str | None, list[str], bool]:
+    """Retry only timed-out reducers with smaller, lossless candidate batches."""
+    input_text = _consolidation_input(
+        segment_id,
+        segment_span,
+        windows,
+        batch,
+        source_task_ids=parent_task_ids,
+    )
+    task, candidates, error = _run_consolidation_task(
+        job,
+        segment_id,
+        segment_span,
+        windows,
+        input_text,
+        batch,
+        parent_task_ids,
+        client,
+    )
+    if (
+        error is None
+        or not _is_consolidation_timeout(error)
+        or depth >= MAX_CONSOLIDATION_TIMEOUT_SPLIT_DEPTH
+        or len(batch) <= 1
+    ):
+        return task, candidates, error, [task.id], False
+
+    midpoint = max(1, len(batch) // 2)
+    child_batches = (batch[:midpoint], batch[midpoint:])
+    child_candidates: list[Any] = []
+    child_task_ids: list[str] = []
+    for child_batch in child_batches:
+        child_parent_ids = _consolidation_parent_task_ids(
+            child_batch, parent_task_ids
+        )
+        (
+            child_task,
+            reduced,
+            child_error,
+            task_ids,
+            _child_split,
+        ) = _run_resilient_consolidation_batch(
+            job,
+            segment_id,
+            segment_span,
+            windows,
+            child_batch,
+            child_parent_ids,
+            client,
+            depth=depth + 1,
+        )
+        child_task_ids.extend(task_ids)
+        if child_error is not None:
+            return child_task, [], child_error, child_task_ids, True
+        child_candidates.extend(reduced)
+    return task, child_candidates, None, child_task_ids, True
+
+
 def _run_deterministic_consolidation_task(
     job: PrepJob,
     segment_id: str,
@@ -2522,22 +2677,21 @@ def _consolidate_semantic_segment(
 
         round_candidates: list[dict] = []
         round_task_ids: list[str] = []
+        round_used_timeout_split = False
         failed_error: str | None = None
         for batch, batch_parent_ids in batches:
             try:
-                input_text = _consolidation_input(
-                    segment_id,
-                    segment_span,
-                    current_windows,
-                    batch,
-                    source_task_ids=batch_parent_ids,
-                )
-                task, candidates, error = _run_consolidation_task(
+                (
+                    task,
+                    candidates,
+                    error,
+                    task_ids,
+                    used_timeout_split,
+                ) = _run_resilient_consolidation_batch(
                     job,
                     segment_id,
                     segment_span,
                     current_windows,
-                    input_text,
                     batch,
                     batch_parent_ids,
                     client,
@@ -2546,7 +2700,10 @@ def _consolidate_semantic_segment(
                 failed_error = str(error)[:2000]
                 break
             last_task_id = task.id
-            round_task_ids.append(task.id)
+            round_task_ids.extend(task_ids)
+            round_used_timeout_split = (
+                round_used_timeout_split or used_timeout_split
+            )
             if error:
                 failed_error = error
                 break
@@ -2565,7 +2722,7 @@ def _consolidate_semantic_segment(
             )
             return updated, False, 0
 
-        if len(batches) == 1:
+        if len(batches) == 1 and not round_used_timeout_split:
             _retire_consolidation_tasks(current_windows, last_task_id)
             updated = _set_segment_consolidation_state(
                 _job_from_store(job.id),

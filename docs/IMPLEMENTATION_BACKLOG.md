@@ -20,7 +20,7 @@ The current product direction is `REASSESSMENT_2026-08-31.md`. New projects are 
 
 ## Next Engineering Work
 
-1. Resolve the grouped `0.1.3a` artifact follow-ups recorded in `MAINTENANCE_2026-09-04_RELEASE_0.1.3.md`: run-state presentation, two schema-valid formatting defects, and the unjustified 50-card planning limit.
+1. Complete the real-upstream semantic-analysis and artifact smoke gate for the `0.1.4a0` changes recorded in `MAINTENANCE_2026-09-04_RELEASE_0.1.3.md`.
 2. Browser smoke-test the full new-project UI without invoking a real long-running model job.
 3. Review reality-horror runtime wording and controls against location-led play; keep the interaction model flexible while preserving non-linear retrieval.
 4. Add focused HTTP regression coverage for location-bound display-material updates.

@@ -333,6 +333,7 @@ FAKE_OUTPUTS: dict[str, dict] = {}
 
 def _fake_segment_output(messages: list[dict]) -> dict:
     content = "\n".join(str(message.get("content", "")) for message in messages)
+    refining = find_task(messages) == "prep:segment:refine"
     match = re.search(r"^SELECTED_PAGES_JSON=(.+)$", content, re.MULTILINE)
     pages = json.loads(match.group(1)) if match else [1]
     if not pages:
@@ -341,7 +342,7 @@ def _fake_segment_output(messages: list[dict]) -> dict:
     start = previous = int(pages[0])
     for raw_page in pages[1:]:
         page = int(raw_page)
-        if page != previous + 1:
+        if page != previous + 1 or (refining and previous - start + 1 >= 3):
             segments.append({"start": start, "end": previous, "label": "离线语义段"})
             start = page
         previous = page
@@ -678,7 +679,7 @@ class FakeLLM:
 
     def _output(self, messages: list[dict]) -> str:
         task = find_task(messages)
-        if task == "prep:segment":
+        if task in {"prep:segment", "prep:segment:refine"}:
             return json.dumps(_fake_segment_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:fact_extract":
             return json.dumps(_fake_prep_output(messages), ensure_ascii=False, indent=2)

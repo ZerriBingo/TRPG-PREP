@@ -30,3 +30,12 @@ The run is sufficient evidence for the `0.1.3` release. The observations below a
 ## Known 0.1.3 Limit
 
 `0.1.3` retains the current 50-card planning ceiling and the two observed formatting imperfections. Every generated card remains a GM-reviewable draft; neither observation caused source-fact loss in the accepted smoke result.
+
+## 0.1.4a0 Implementation Status
+
+- The artifact planner safety bound is now 120. It is documented in code as a technical guard and no longer acts as a reasonable-use grouping rule.
+- Materialized card validation now flattens one `{value, field_sources}` wrapper emitted by some gateways. Unknown wrapper keys and deeper non-string scalar values remain hard validation errors.
+- The browser ignores a stale non-terminal response when the same artifact job has already reached `completed` or `failed`, preventing an old queued response from replacing a terminal state.
+- Semantic planning now asks for the smallest coherent preparation units and semantically refines a plan whose chapter-sized segment would own more than three transport windows. A failed or unchanged refinement preserves the original semantic ownership instead of mechanically cutting it.
+- A timed-out reducer batch retries at smaller lossless candidate sizes to a bounded depth. Other failures retain their existing behavior, and the UI distinguishes completed transport windows from the semantic reduction result.
+- Offline regressions cover these behaviors. Real upstream semantic-analysis and artifact smoke remain the release gate for `0.1.4a0`.

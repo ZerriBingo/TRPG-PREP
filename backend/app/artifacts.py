@@ -32,7 +32,9 @@ MAX_FACT_BATCH_CHARS = 80_000
 MAX_SINGLE_FACT_CHARS = MAX_FACT_BATCH_CHARS
 MAX_FACT_BATCH_TOKENS = 22_000
 MAX_SINGLE_FACT_TOKENS = MAX_FACT_BATCH_TOKENS
-MAX_DRAFT_CARDS = 50
+# This is a technical guard against an accidentally unbounded model response,
+# not a product rule that may force useful entities into one card.
+MAX_DRAFT_CARDS = 120
 MAX_LOCAL_UNITS = 120
 MAX_LOCAL_OPEN_QUESTIONS = 120
 MAX_JOB_OPEN_QUESTION_PREVIEW = 50
@@ -791,6 +793,39 @@ def _flatten_one_level(value: Any) -> Any:
     for item in value:
         flattened.extend(item if isinstance(item, list) else [item])
     return flattened
+
+
+def _normalize_nested_field_provenance(card: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one common gateway shape without accepting unknown structures."""
+    fields = card.get("fields")
+    if not isinstance(fields, dict):
+        return card
+    normalized = dict(card)
+    normalized_fields = dict(fields)
+    normalized_sources = dict(card.get("field_sources") or {})
+    changed = False
+    for field_name, value in fields.items():
+        if not isinstance(value, dict) or "value" not in value:
+            continue
+        if set(value) - {"value", "field_sources"}:
+            continue
+        normalized_fields[field_name] = value["value"]
+        nested_sources = value.get("field_sources")
+        if nested_sources is not None:
+            existing_sources = normalized_sources.get(field_name)
+            if existing_sources is None:
+                normalized_sources[field_name] = nested_sources
+            elif isinstance(existing_sources, list) and isinstance(nested_sources, list):
+                normalized_sources[field_name] = [*existing_sources, *nested_sources]
+            else:
+                # Leave malformed provenance for the strict Pydantic validator.
+                normalized_sources[field_name] = nested_sources
+        changed = True
+    if not changed:
+        return card
+    normalized["fields"] = normalized_fields
+    normalized["field_sources"] = normalized_sources
+    return normalized
 
 
 def _normalize_global_plan_shape(raw: Any) -> Any:
@@ -1589,7 +1624,7 @@ def _validate_and_build(
         normalized_cards = []
         for card in raw["cards"]:
             if isinstance(card, dict) and isinstance(card.get("fields"), dict):
-                card = dict(card)
+                card = _normalize_nested_field_provenance(dict(card))
                 fields = dict(card["fields"])
                 for field_name in LIST_FIELDS:
                     value = fields.get(field_name)
@@ -1651,6 +1686,16 @@ def _validate_and_build(
                 raise ArtifactGenerationError(
                     f"产物 {draft.title} 的 {field_name} 必须是数组"
                 )
+        scalar_fields = set(draft.fields) - LIST_FIELDS
+        invalid_scalar_fields = sorted(
+            field_name
+            for field_name in scalar_fields
+            if not isinstance(draft.fields[field_name], str)
+        )
+        if invalid_scalar_fields:
+            raise ArtifactGenerationError(
+                f"产物 {draft.title} 的字段必须是字符串: {invalid_scalar_fields}"
+            )
 
         # Some upstreams correctly cite a fact in `field_sources` but omit the
         # same id from the card-level closure.  When that fact is part of this

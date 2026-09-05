@@ -24,6 +24,7 @@ const state = {
   selectedCardIds: new Set(),
   artifacts: {
     generating: false,
+    retryingJobId: null,
     reviewing: false,
     error: "",
     job: null,
@@ -471,10 +472,10 @@ function renderPrep() {
         ? " · 截断 " + window.truncated_pages.map((page) => "p" + page).join(", ")
         : "";
       const segmentLabel = window.semantic_segment_id
-        ? " · 语义单元窗口 " + (window.segment_window_index || "?") + "/" + (window.segment_window_count || "?")
+        ? " · 传输窗口 " + (window.segment_window_index || "?") + "/" + (window.segment_window_count || "?")
         : "";
       const consolidationLabel = segmentSummaryWindow && window.consolidation_status
-        ? " · 段级归并 " + (prepWindowStatusLabels[window.consolidation_status] || window.consolidation_status) +
+        ? " · 全部传输窗口已完成 · 语义段归并 " + (prepWindowStatusLabels[window.consolidation_status] || window.consolidation_status) +
           (window.consolidation_candidate_count ? " · " + window.consolidation_candidate_count + " 条结果" : "")
         : "";
       const consolidationError = segmentSummaryWindow && window.consolidation_error
@@ -1282,9 +1283,32 @@ function artifactJobInFlight(job = state.artifacts.job) {
   return Boolean(job && ["queued", "running"].includes(job.status));
 }
 
-function setArtifactJob(job) {
+function artifactJobUpdatedAt(job) {
+  const value = Date.parse(job?.updated_at || job?.created_at || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function setArtifactJob(job, {allowRetryTransition = false} = {}) {
   if (!job) return;
+  const current = state.artifacts.job;
+  if (current?.id === job.id) {
+    if (current.status === "completed" && job.status !== "completed") return;
+    const currentUpdatedAt = artifactJobUpdatedAt(current);
+    const updatedAt = artifactJobUpdatedAt(job);
+    if (updatedAt < currentUpdatedAt) return;
+    if (
+      current.status === "failed" &&
+      ["queued", "running"].includes(job.status) &&
+      !allowRetryTransition &&
+      state.artifacts.retryingJobId !== job.id
+    ) {
+      return;
+    }
+  }
   state.artifacts.job = job;
+  if (["completed", "failed"].includes(job.status) && state.artifacts.retryingJobId === job.id) {
+    state.artifacts.retryingJobId = null;
+  }
 }
 
 function artifactJobMatchesCurrentBoard(job = state.artifacts.job) {
@@ -1422,6 +1446,7 @@ async function draftArtifacts() {
   if (!availability.ready) return;
   state.artifacts.generating = true;
   state.artifacts.error = "";
+  state.artifacts.retryingJobId = null;
   renderAll();
   try {
     const response = await fetch(
@@ -1450,6 +1475,7 @@ async function draftArtifacts() {
 async function retryArtifactJob(job) {
   if (!job?.id || state.artifacts.generating) return;
   state.artifacts.generating = true;
+  state.artifacts.retryingJobId = job.id;
   state.artifacts.error = "";
   if (state.artifacts.pollTimer) clearTimeout(state.artifacts.pollTimer);
   state.artifacts.pollTimer = null;
@@ -1463,12 +1489,13 @@ async function retryArtifactJob(job) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "重试产物任务失败"));
     if (!payload.job) throw new Error("服务器没有返回重试后的产物任务");
-    setArtifactJob(payload.job);
+    setArtifactJob(payload.job, {allowRetryTransition: true});
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     updateWorkStatus("已重新排队" + ARTIFACT_JOB_LABEL);
     renderAll();
     await pollArtifactJob();
   } catch (error) {
+    state.artifacts.retryingJobId = null;
     state.artifacts.generating = false;
     state.artifacts.error = userFacingError(error, "重试产物任务失败");
     renderAll();
@@ -1899,6 +1926,7 @@ async function refreshWorkbenchData() {
       state.data = null;
       state.artifacts.job = null;
       state.artifacts.generating = false;
+      state.artifacts.retryingJobId = null;
       fillWorkspaceSelector();
       renderEmptyWorkspace();
       return;
@@ -1915,7 +1943,11 @@ async function refreshWorkbenchData() {
     state.data = payload;
     state.savedAt = payload.saved_at;
     state.savedState = payload.saved_state;
-    state.artifacts.job = payload.artifact_job || null;
+    if (payload.artifact_job) setArtifactJob(payload.artifact_job);
+    else {
+      state.artifacts.job = null;
+      state.artifacts.retryingJobId = null;
+    }
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     scheduleArtifactPoll();
     fillSelectors();
@@ -4150,7 +4182,11 @@ async function init() {
     state.data = await response.json();
     state.savedAt = state.data.saved_at;
     state.savedState = state.data.saved_state;
-    state.artifacts.job = state.data.artifact_job || null;
+    if (state.data.artifact_job) setArtifactJob(state.data.artifact_job);
+    else {
+      state.artifacts.job = null;
+      state.artifacts.retryingJobId = null;
+    }
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     scheduleArtifactPoll();
     await Promise.all([

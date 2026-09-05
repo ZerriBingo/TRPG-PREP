@@ -43,7 +43,7 @@ job = PrepJob(
 )
 messages = prep._prompt_messages(job, job.windows[0], "--- PDF p1 ---\n地点与人物")
 system = messages[0]["content"]
-assert prep.PROMPT_VERSION == "prep-fact-extract-v4"
+assert prep.PROMPT_VERSION == "prep-fact-extract-v5"
 for kind in (
     "clue",
     "npc",
