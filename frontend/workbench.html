@@ -173,7 +173,7 @@
           <option value="gm_suggestion">GM 建议</option>
         </select>
       </section>
-      <div id="fact-grid" class="card-grid"></div>
+      <div id="fact-grid" class="card-grid masonry-grid"></div>
     </section>
 
     <section id="view-cards" class="view">
@@ -191,7 +191,7 @@
         <button id="create-card" class="edit-button toolbar-action" type="button" hidden>新建产物</button>
         <div id="card-review-error" class="review-detail-error"></div>
       </section>
-      <div id="work-card-grid" class="card-grid"></div>
+      <div id="work-card-grid" class="card-grid masonry-grid"></div>
     </section>
 
     <section id="view-review" class="view">
@@ -258,16 +258,20 @@
         <div class="panel-head"><h2>章节总览</h2><span class="muted">跨地点情势、真相、主要线索与结局</span></div>
         <div id="runtime-overview"></div>
       </section>
+      <section class="panel runtime-clocks-panel">
+        <div class="panel-head"><h2>推进钟</h2><span class="muted">每次推进都写入运行日志</span></div>
+        <div id="runtime-clocks" class="runtime-list"></div>
+      </section>
       <section class="panel runtime-exploration-panel">
         <div class="panel-head"><h2>可探索地点</h2><span class="muted">自由切换，不预设玩家路线</span></div>
-        <div class="runtime-reference-toolbar"><input id="runtime-reference-search" type="search" placeholder="搜索地点、人物、威胁、时钟或展示材料"><select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="npc">人物</option><option value="threat">威胁</option><option value="clock">时钟</option><option value="handout">展示材料</option></select></div>
+        <div class="runtime-reference-toolbar"><input id="runtime-reference-search" type="search" placeholder="搜索地点、人物、威胁或展示材料"><select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="npc">人物</option><option value="threat">威胁</option><option value="handout">展示材料</option></select></div>
         <div id="runtime-exploration-list" class="runtime-exploration-list"></div>
       </section>
       <div id="scene-holder"></div>
       <div id="beat-holder"></div>
       <section class="panel runtime-reference-panel">
         <div class="panel-head"><h2>运行资料</h2><span class="muted">当前运行计划中的全部已批准卡片</span></div>
-        <div id="runtime-reference-list" class="runtime-reference-list"></div>
+        <div id="runtime-reference-list" class="runtime-reference-list masonry-grid"></div>
       </section>
       <section class="panel runtime-materials-panel">
         <div class="panel-head"><h2>未关联展示材料</h2><span class="muted">已确认但尚未绑定地点或遭遇的来源材料</span></div>
@@ -293,10 +297,6 @@
         </div>
       </section>
       <section class="runtime-columns">
-        <section class="panel">
-          <div class="panel-head"><h2>推进钟</h2><span class="muted">每次推进都写入运行日志</span></div>
-          <div id="runtime-clocks" class="runtime-list"></div>
-        </section>
         <section class="panel">
           <div class="panel-head"><h2>运行日志</h2><span id="session-log-count" class="muted"></span></div>
           <div id="session-log" class="session-log"></div>

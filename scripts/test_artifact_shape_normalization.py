@@ -104,6 +104,52 @@ assert nested_cards[0].fields["role"] == "门的看守者"
 assert nested_cards[0].field_sources["role"] == ["fact_shape"]
 assert nested_cards[0].field_sources["wants"] == ["fact_shape_supporting"]
 
+list_item_provenance = {
+    "cards": [{
+        "type": "location",
+        "title": "列表项来源测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": "门开着",
+            "arrival_description": "可以检查门锁",
+            "relevant_characters": [{
+                "text": "门的看守者",
+                "field_sources": ["fact_shape_supporting"],
+            }],
+        },
+        "field_sources": {},
+    }],
+}
+list_item_cards, _ = _validate_and_build(
+    list_item_provenance, bundle, profile, model_id="shape-test"
+)
+assert list_item_cards[0].fields["relevant_characters"] == ["门的看守者"]
+assert list_item_cards[0].field_sources["relevant_characters"] == ["fact_shape_supporting"]
+assert "fact_shape_supporting" in list_item_cards[0].fact_ids
+
+unknown_list_item_key = {
+    "cards": [{
+        "type": "location",
+        "title": "列表项未知键测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": "门开着",
+            "arrival_description": "可以检查门锁",
+            "relevant_characters": [{
+                "text": "门的看守者",
+                "field_sources": ["fact_shape"],
+                "unsupported": "拒绝",
+            }],
+        },
+    }],
+}
+try:
+    _validate_and_build(unknown_list_item_key, bundle, profile, model_id="shape-test")
+except ArtifactGenerationError as error:
+    assert "必须是字符串" in str(error)
+else:
+    raise AssertionError("unknown list item keys must remain rejected")
+
 deep_nested_provenance = {
     "cards": [{
         "type": "location",

@@ -828,6 +828,52 @@ def _normalize_nested_field_provenance(card: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_list_item_provenance(card: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap one common object shape emitted for list-valued card fields."""
+    fields = card.get("fields")
+    if not isinstance(fields, dict):
+        return card
+    normalized = dict(card)
+    normalized_fields = dict(fields)
+    normalized_sources = dict(card.get("field_sources") or {})
+    changed = False
+    for field_name, value in fields.items():
+        if not isinstance(value, list):
+            continue
+        unwrapped: list[Any] = []
+        item_sources: list[Any] = []
+        field_changed = False
+        for item in value:
+            if not isinstance(item, dict) or "text" not in item:
+                unwrapped.append(item)
+                continue
+            if set(item) - {"text", "field_sources"}:
+                unwrapped.append(item)
+                continue
+            unwrapped.append(item["text"])
+            if "field_sources" in item:
+                item_sources.append(item["field_sources"])
+            field_changed = True
+        if not field_changed:
+            continue
+        normalized_fields[field_name] = unwrapped
+        existing_sources = normalized_sources.get(field_name)
+        flattened_existing = _flatten_one_level(existing_sources)
+        flattened_items = _flatten_one_level(item_sources)
+        if existing_sources is None:
+            normalized_sources[field_name] = flattened_items
+        elif isinstance(flattened_existing, list) and isinstance(flattened_items, list):
+            normalized_sources[field_name] = [*flattened_existing, *flattened_items]
+        else:
+            normalized_sources[field_name] = existing_sources
+        changed = True
+    if not changed:
+        return card
+    normalized["fields"] = normalized_fields
+    normalized["field_sources"] = normalized_sources
+    return normalized
+
+
 def _normalize_global_plan_shape(raw: Any) -> Any:
     """Repair scalar list fields without weakening the plan schema."""
     if not isinstance(raw, dict) or not isinstance(raw.get("cards"), list):
@@ -1625,11 +1671,18 @@ def _validate_and_build(
         for card in raw["cards"]:
             if isinstance(card, dict) and isinstance(card.get("fields"), dict):
                 card = _normalize_nested_field_provenance(dict(card))
+                card = _normalize_list_item_provenance(card)
                 fields = dict(card["fields"])
                 for field_name in LIST_FIELDS:
                     value = fields.get(field_name)
                     if isinstance(value, str) and value.strip():
                         fields[field_name] = [value.strip()]
+                    elif isinstance(value, list) and any(
+                        not isinstance(item, str) for item in value
+                    ):
+                        raise ArtifactGenerationError(
+                            f"产物 {card.get('title', '未命名')} 的 {field_name} 必须是字符串数组"
+                        )
                 card["fields"] = fields
                 field_sources = card.get("field_sources")
                 if isinstance(field_sources, dict):

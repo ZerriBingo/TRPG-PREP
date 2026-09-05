@@ -3499,6 +3499,13 @@ function renderRuntime() {
       '<div class="row-actions"><button class="edit-button" data-clock-action="' + esc(clock.id) + '" data-clock-delta="-1" ' + (stage <= 0 ? 'disabled' : '') + '>退回</button><button class="edit-button" data-clock-action="' + esc(clock.id) + '" data-clock-delta="1" ' + (stage >= stages.length - 1 ? 'disabled' : '') + '>推进</button></div></article>';
   }).join("") || '<div class="empty-state">当前板块暂无推进钟。</div>';
 
+  document.querySelectorAll("#runtime-clocks .runtime-clock").forEach((element, index) => {
+    const clock = clocks[index];
+    const actions = element.querySelector(".row-actions");
+    if (clock && actions) {
+      actions.insertAdjacentHTML("beforebegin", runtimeCardFieldsHtml(clock) + sourceHtml(clock.fact_ids));
+    }
+  });
   const lookupGapCount = state.session.log.filter((entry) => entry.kind === 'lookup_missing').length;
   $("session-log-count").textContent = state.session.log.length + ' 条记录' + (lookupGapCount ? ' · ' + lookupGapCount + ' 个缺口' : '');
   $("session-log").innerHTML = state.session.log.slice().reverse().map((entry) => {
@@ -3549,8 +3556,8 @@ function renderRuntimeReferenceCards() {
   const query = ($("runtime-reference-search")?.value || '').trim().toLowerCase();
   const type = $("runtime-reference-filter")?.value || 'all';
   const cards = runtimePlanCards().filter((card) => {
-    if (card.type === 'location' || card.type === 'environment' || card.type === 'chapter_overview') return false;
-    if (type !== 'all' && !(type === 'clock' ? ['clock', 'operation_clock', 'encounter_clock'].includes(card.type) : card.type === type)) return false;
+    if (card.type === 'location' || card.type === 'environment' || card.type === 'chapter_overview' || ['clock', 'operation_clock', 'encounter_clock'].includes(card.type)) return false;
+    if (type !== 'all' && card.type !== type) return false;
     if (!query) return true;
     return [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(' ').toLowerCase().includes(query);
   });

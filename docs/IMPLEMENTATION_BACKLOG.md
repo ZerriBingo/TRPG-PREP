@@ -20,10 +20,10 @@ The current product direction is `REASSESSMENT_2026-08-31.md`. New projects are 
 
 ## Next Engineering Work
 
-1. Complete the real-upstream semantic-analysis and artifact smoke gate for the `0.1.4a0` changes recorded in `MAINTENANCE_2026-09-04_RELEASE_0.1.3.md`.
-2. Browser smoke-test the full new-project UI without invoking a real long-running model job.
-3. Review reality-horror runtime wording and controls against location-led play; keep the interaction model flexible while preserving non-linear retrieval.
-4. Add focused HTTP regression coverage for location-bound display-material updates.
+1. Complete the desktop and mobile browser gate for the `0.1.4` card layout and location-led runtime changes.
+2. Add focused HTTP regression coverage for location-bound display-material updates.
+3. Rebuild the player package with the allowlisted package script and verify that development fixtures remain excluded.
+4. Review reality-horror runtime wording and controls against location-led play; keep the interaction model flexible while preserving non-linear retrieval.
 5. Review fantasy/adventure generation against environment-led combat units, out-of-combat hubs, and optional travel material.
 6. Define and implement the independent general-preparation artifact contract without turning it into a conversion stage for the other boards.
 7. Run a two-axis standards/spec review from baseline `b83e380` and resolve findings.
