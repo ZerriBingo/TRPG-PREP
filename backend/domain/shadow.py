@@ -25,6 +25,10 @@ ShadowTaskKind = Literal["standalone", "prep_window", "semantic_consolidation"]
 QueueVisibility = Literal["review", "internal"]
 CandidateRole = Literal["standalone", "window_observation", "segment_result"]
 
+# A transport window can legitimately contain a dense run of source-bound
+# observations. The workbench paginates review results separately.
+MAX_SHADOW_RESPONSE_CANDIDATES = 120
+
 
 class ShadowTaskSpec(BaseModel):
     """Reproducible inputs for a model run that cannot affect play directly."""
@@ -175,7 +179,9 @@ class ShadowResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[ShadowCandidateDraft] = Field(default_factory=list, max_length=50)
+    candidates: list[ShadowCandidateDraft] = Field(
+        default_factory=list, max_length=MAX_SHADOW_RESPONSE_CANDIDATES
+    )
 
 
 class ShadowReviewEvent(BaseModel):

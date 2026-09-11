@@ -27,10 +27,17 @@ Reality-horror runtime is a complete table-side reference surface: chapter overv
 - **Display material**: a source-backed item a GM may show or hand to players (map, letter, photograph, newspaper, log, or similar). It keeps source pages and display notes; the tool does not crop or rewrite it.
 - **Fact closure**: the complete set of promoted facts a card is allowed to cite. Every field citation must stay inside this set.
 - **Runtime snapshot**: the state created when a scene starts; it can change during play without rewriting the artifact draft.
+- **Fantasy environment**: a runnable situation shaped by a place, activity, background characters, and active forces. It may support exploration, social conflict, traversal, combat, or an event; it is not synonymous with a battle map.
+- **Fantasy runtime relation**: an optional retrieval link between an environment and relevant NPC, adversary, or countdown support. It never requires those elements to appear together or fixes encounter order.
+- **Party context**: optional GM-authored information used to connect prepared situations to the current characters. It remains separate from source facts and never changes source provenance.
 - **Semantic segment**: one logically coherent unit of source material selected for preparation. Its scope determines which facts belong together and where source ownership is anchored.
 - **Transport window**: a request-sized reading view of one semantic segment. It may repeat nearby context or divide an oversized segment, but it is not an independent fact unit.
 - **Window observation**: a model candidate produced while reading one transport window. It is internal evidence for later consolidation, not a user-facing review item.
 - **Segment result**: the consolidated, source-bound candidate projection for one semantic segment. This is the reviewable output exposed to the GM.
+- **Adventure chapter**: a reviewed narrative preparation scope containing possible beats and applicable facts. It is not a page range, source partition, session count, or mandatory runtime route.
+- **Story beat**: a proposed narrative focus for a possible game within one chapter. It explains what each selected story thread may change in that game, what remains open afterward, and how those developments interact. It is not an environment or a list of scene visits, and never requires a fixed runtime order or game count. Story threads, rather than beats, may cross chapters.
+- **Story thread**: a reviewed storyline such as a faction, truth chain, objective, or character fate. It can be introduced, developed, resolved, or remain background in several chapters; these roles are organizational suggestions rather than source facts.
+- **Fact disposition**: the explicit reviewed use of one promoted fact: applicable to one or more chapters, retained as global reference, recognized as display material, or deliberately deferred with a reason. It prevents structure planning from silently dropping material.
 
 ## Engineering Principles
 
@@ -44,26 +51,29 @@ Reality-horror runtime is a complete table-side reference surface: chapter overv
 
 ## Current Product Direction
 
-- The first release gate is one complete chapter workflow, not whole-book automation.
+- Each board earns completion through its own end-to-end vertical slice rather than whole-book automation. The current fantasy/adventure slice targets one complete short adventure.
 - The bookshelf-to-runtime path is primary; facts remain source-backed material for review and retrieval.
 - An artifact build represents one coherent result for one selected preparation task. It is reviewable, and a rerun must preserve clear ownership rather than silently append conflicting material.
 - Important locations may form a non-linear network; runtime navigation must not force a route.
 - Acceptance criteria are board-specific. The complete single-chapter runtime gate applies to the reality-horror board; other boards require their own confirmed criteria.
 - A location is runtime-relevant when players may investigate it, return to it, seek help there, or use it to advance the fiction. Evidence-only locations may still need a compact independently visible scene treatment so the GM does not have to leave runtime mode to recover context.
 - Long-running work exposes enough state for a user to understand progress, failure, recovery, and ownership.
-- Fantasy/adventure preparation is split by play function: out-of-combat story material, in-combat scene material, and travel/transition material. A short adventure may need only a few strong beats; a city-based adventure may need a wider web of recurring places, factions, and social consequences.
+- Fantasy/adventure preparation is organized around narrative function rather than separate combat, travel, or world-map products. A short adventure may need only a few strong beats; a long adventure may need reviewed chapters and cross-chapter threads.
 - The fantasy board may borrow organizational principles from the supplied homebrew reference (clear campaign distinctions, inciting situation, GM-facing principles, locations, and concise adversary/environment support) while ignoring its system-specific numeric guidance and terminology in product output.
 - In fantasy/adventure, an environment card can be the primary combat-scene operating surface, not merely an attachment. It should carry the scene's pressure, changing conditions, tactical/narrative prompts, and escalation cues; adversary cards are read alongside it and should stay concise.
-- Fantasy artifact layout therefore follows function: a scene may have one environment card plus zero or more adversary/support cards, while out-of-combat and travel material remain separate. The generator must not produce a generic scene card that hides or duplicates the environment card's job.
-- A fantasy combat scene is a grouped runtime unit: one environment-led operating card, optional adversary/support cards, and optional clocks or phase changes.
-- City-scale fantasy preparation uses a hub-and-entity shape: a situation hub plus independently searchable recurring locations, people, factions, and consequences. One-off minor material may stay in a beat or hub.
+- Fantasy artifact layout follows narrative function. An environment may support exploration, social interaction, traversal, combat, or an event without becoming separate cards for each mode. Related adversaries and clocks are optional retrieval links, not a preassembled encounter.
 - Travel and transition material is optional, supports detours, and never encodes a mandatory route.
 - Source statistics are preserved only as cited source material. Any cross-board conversion is a GM-reviewable suggestion, never an automatic rewrite.
+- The first fantasy/adventure slice organizes narrative function, motives, environment pressure, responses, phase changes, and nonviolent outcomes. It does not generate replacement combat statistics or attempt to balance encounters automatically.
+- Character-specific connections initially appear as questions or unresolved preparation prompts. A later party-context input may answer them without turning character details into source facts.
 - Display materials use one shared model across boards, while board-specific recognition and presentation notes may differ. They are source-page records, not LLM-authored player text or crop uploads.
-- Runtime is location-led and keeps non-linear exploration optional; it does not infer a mandatory route from page order.
+- Reality-horror runtime is location-led and keeps non-linear exploration optional; fantasy/adventure runtime is environment-led. Neither infers a mandatory route from page order.
 - Reality-horror generates independent `location` cards for every named, visitable, returnable, investigable, or help-providing place. One-use triggers, display-material references, consequences, and revisit changes live inside the location card.
 - Reality-horror generates a `chapter_overview` for cross-location background, truth, major threads, endings, and chapter-wide consequences. It does not generate an independent generic scene card.
 - Display-material facts require explicit source evidence, and clock artifacts describe situation changes and progression without silently importing unrelated rule mechanics.
+- Long-form preparation may be organized on two reviewed axes: adventure chapters provide narrative preparation scopes and story threads describe cross-chapter applicability. Facts may support several chapters or remain global reference material. Structure is proposed after fact review through bounded local observations and global consolidation; it is not added to semantic extraction and is never inferred from page cuts alone.
+- Beats are chapter-local combinations of applicable story threads. The product does not classify threads as main or sub, and does not ask the user to manually assemble chapters or beats before generation.
+- Once the fantasy/adventure structure is approved, one artifact build covers every approved chapter. Chapter-sized internal planning keeps model requests bounded, while cross-chapter threads and fact dispositions remain visible to each scope; chapter selection is a review and retrieval concern, not a way to omit chapters from generation.
 
 ## Verification
 

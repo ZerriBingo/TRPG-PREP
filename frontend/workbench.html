@@ -116,12 +116,33 @@
         </div>
       <div id="bundle-detail"></div>
       </section>
+      <section id="adventure-structure-panel" class="panel" hidden>
+        <div class="panel-head">
+          <div>
+            <h2>冒险结构</h2>
+            <p id="structure-guidance" class="muted">从已审核事实整理叙事章节、跨章节支线和可能发生的拍。</p>
+          </div>
+          <div class="row-actions">
+            <button id="draft-structure" class="edit-button" type="button">整理冒险结构</button>
+            <button id="approve-structure" class="action-link" type="button" hidden>确认整套结构</button>
+          </div>
+        </div>
+        <div id="structure-progress" class="artifact-job-progress" hidden>
+          <div class="artifact-job-progress-head">
+            <span id="structure-progress-label">冒险结构整理</span>
+            <span id="structure-progress-value">0%</span>
+          </div>
+          <progress id="structure-progress-bar" class="artifact-job-progress-bar" max="100" value="0" aria-label="冒险结构整理进度"></progress>
+        </div>
+        <div id="structure-summary" class="workflow-stage-summary"></div>
+        <div id="structure-board" class="structure-board"></div>
+      </section>
       <section class="panel">
         <div class="panel-head">
           <div><h2>备团产物</h2><p id="artifact-draft-guidance" class="muted">从已提升事实生成可复核的多种桌边产物。</p></div>
           <div class="row-actions">
             <button id="open-artifacts" class="edit-button" type="button">打开产物复核</button>
-            <button id="draft-artifacts" class="action-link" type="button">生成备团产物草案</button>
+            <button id="draft-artifacts" class="action-link" type="button">生成全部章节产物</button>
           </div>
         </div>
         <div id="artifact-stage-summary" class="workflow-stage-summary"></div>
@@ -172,6 +193,9 @@
           <option value="inferred">推断</option>
           <option value="gm_suggestion">GM 建议</option>
         </select>
+        <select id="fact-structure" aria-label="按冒险结构筛选事实">
+          <option value="all">全部结构归属</option>
+        </select>
       </section>
       <div id="fact-grid" class="card-grid masonry-grid"></div>
     </section>
@@ -183,6 +207,9 @@
         </select>
         <select id="card-type">
           <option value="all">全部卡型</option>
+        </select>
+        <select id="card-chapter" aria-label="按冒险章节筛选产物">
+          <option value="all">全部章节</option>
         </select>
         <span id="card-count" class="muted"></span>
         <label class="card-select-all"><input id="card-select-all" type="checkbox">选择当前列表</label>
@@ -245,7 +272,7 @@
         <div class="panel-head">
           <div>
             <h2>桌边运行</h2>
-            <p class="muted">以当前地点为主界面，随时切换地点、查线索、处理触发与推进时钟；原文仍可从卡片来源回溯。</p>
+            <p id="runtime-mode-description" class="muted">按当前板块的运行锚点组织场景、资料与推进状态；原文仍可从卡片来源回溯。</p>
           </div>
           <span id="session-status" class="status">运行状态加载中…</span>
         </div>
@@ -255,16 +282,21 @@
         <div id="runtime-plan-status" class="runtime-plan-status" hidden></div>
       </section>
       <section class="panel runtime-overview-panel">
-        <div class="panel-head"><h2>章节总览</h2><span class="muted">跨地点情势、真相、主要线索与结局</span></div>
+        <div class="panel-head"><h2 id="runtime-overview-title">运行总览</h2><span id="runtime-overview-description" class="muted">当前范围的整体情势与可能结果</span></div>
+        <div id="runtime-narrative-controls" class="runtime-reference-toolbar" hidden>
+          <label>章节 <select id="runtime-chapter"></select></label>
+          <label>可能节拍 <select id="runtime-story-beat"></select></label>
+        </div>
         <div id="runtime-overview"></div>
+        <div id="runtime-chapter-reference"></div>
       </section>
       <section class="panel runtime-clocks-panel">
         <div class="panel-head"><h2>推进钟</h2><span class="muted">每次推进都写入运行日志</span></div>
         <div id="runtime-clocks" class="runtime-list"></div>
       </section>
       <section class="panel runtime-exploration-panel">
-        <div class="panel-head"><h2>可探索地点</h2><span class="muted">自由切换，不预设玩家路线</span></div>
-        <div class="runtime-reference-toolbar"><input id="runtime-reference-search" type="search" placeholder="搜索地点、人物、威胁或展示材料"><select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="npc">人物</option><option value="threat">威胁</option><option value="handout">展示材料</option></select></div>
+        <div class="panel-head"><h2 id="runtime-anchor-title">运行场景</h2><span id="runtime-anchor-description" class="muted">自由切换，不预设行动路线</span></div>
+        <div class="runtime-reference-toolbar"><input id="runtime-reference-search" type="search" placeholder="搜索当前运行资料"><select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="environment">环境</option><option value="npc">人物</option><option value="threat">威胁</option><option value="enemy">对手</option><option value="handout">展示材料</option></select></div>
         <div id="runtime-exploration-list" class="runtime-exploration-list"></div>
       </section>
       <div id="scene-holder"></div>

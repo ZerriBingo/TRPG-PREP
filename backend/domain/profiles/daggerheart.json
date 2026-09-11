@@ -1,43 +1,55 @@
 {
   "id": "daggerheart",
   "name": "Daggerheart 叙事档案",
-  "version": "0.2",
-  "summary": "以环境调度、敌人意图、压力与硬选择为核心的奇幻冒险档案。",
+  "version": "0.3",
+  "summary": "以可运行局势、环境调度、人物动机、压力与硬选择为核心的奇幻冒险档案。",
+  "runtime_anchor_type": "environment",
+  "runtime_navigation_mode": "environment",
   "card_definitions": [
     {
       "type": "environment",
       "display_name": "环境卡",
-      "description": "把可利用物、危险物和非战斗出口组织成战斗与遭遇舞台。",
-      "required_fields": ["opening_image", "usable_features", "hazards", "positioning", "environment_changes", "noncombat_exits"],
-      "optional_fields": ["distance_notes", "sensory_details"]
+      "description": "把探索、社交、穿越、战斗或事件组织成一个可运行局势。",
+      "required_fields": ["environment_type", "opening_image", "narrative_function", "impulses", "usable_features"],
+      "optional_fields": ["hazards", "gm_responses", "phase_changes", "exit_outcomes", "positioning", "sensory_details", "triggers", "potential_adversaries", "source_statistics"]
+    },
+    {
+      "type": "npc",
+      "display_name": "人物卡",
+      "description": "记录非敌对或立场可变人物的目标、交换内容、关系压力和态度变化。",
+      "required_fields": ["short_term_goal", "long_term_goal", "offers", "relationship_pressure", "attitude_changes"],
+      "optional_fields": ["first_impression", "secret", "voice_notes"]
     },
     {
       "type": "enemy",
-      "display_name": "意图敌人卡",
-      "description": "记录敌人想做什么、如何暴露危险，以及哪些解决方式成立。",
-      "required_fields": ["intention", "signature_actions", "danger_signs", "damaged_behavior", "resolutions"],
-      "optional_fields": ["statblock_ref", "retreat_condition"]
+      "display_name": "对手卡",
+      "description": "记录明确对抗者的动机、当前目标、行动、前兆、受创变化和多种解决方式。",
+      "required_fields": ["motives", "current_objective", "signature_actions", "danger_signs", "damaged_behavior", "resolutions"],
+      "optional_fields": ["source_statblock", "retreat_condition", "narrative_role"]
     },
     {
       "type": "encounter_clock",
       "display_name": "遭遇钟",
-      "description": "追踪援军、警报、崩塌或追击等遭遇级推进。",
+      "description": "追踪援军、警报、崩塌、追击、谈判耐心、仪式或阶段变化。",
       "required_fields": ["name", "stages", "advance_condition"],
       "optional_fields": ["current_stage", "final_consequence"]
     }
   ],
-  "risk_axes": ["hp", "stress", "positioning", "attention"],
-  "failure_moves": ["cost_forward", "worsen_position", "enemy_advances"],
-  "gm_moves": ["telegraph_danger", "change_the_environment", "show_enemy_intention", "offer_a_hard_choice"],
+  "risk_axes": ["stress", "positioning", "attention", "relationships"],
+  "failure_moves": ["cost_forward", "worsen_position", "reveal_information", "opposition_advances"],
+  "gm_moves": ["telegraph_danger", "change_the_environment", "show_opposition_intention", "offer_a_hard_choice", "cut_to_action"],
   "prompts": {
-    "environment": "这个空间会奖励冒险，还是惩罚鲁莽？谁占据有利位置？",
-    "enemy": "它此刻想要什么？玩家看到哪个信号后应该改变计划？"
+    "environment": "这个局势承担什么叙事功能，如何通过环境、人物和活动推动选择？",
+    "npc": "这个人物眼下想得到什么，长期又在保护或追求什么？",
+    "enemy": "对手此刻要完成什么，什么迹象会让玩家改变计划？",
+    "traversal": "这段穿行是否真的包含值得运行的选择、发现或代价？"
   },
   "scene_guidance": {
-    "arrival": "先描述可利用物、危险和位置关系，让空间成为可回应的现场，不给玩家念战术菜单。",
-    "investigation": "把玩家的行动变成改变位置、资源或关系的机会；不要把每个障碍写成只有一个正确解。",
-    "pressure": "用环境变化、援军、追击或时钟把遭遇往前推，并先让玩家看见危险信号。",
-    "confrontation": "展示敌人的意图和标志动作，保留环境利用与非战斗解法；按叙事后果推进，不套模拟引擎式敌人数值。",
-    "aftermath": "处理场地变化、压力、敌人撤退与新的硬选择，让下一拍从已发生的后果自然长出来。"
+    "arrival": "用感官细节、正在发生的活动和可回应的压力建立局势，再把决定权交给玩家。",
+    "investigation": "自由提供角色容易感知的信息；只有结果存在重要不确定性时才要求检定。",
+    "pressure": "失败也推动局势，以环境反应、关系代价、新信息或对手推进改变现场。",
+    "confrontation": "展示动机和危险前兆，让目标超越消灭全部对手，并保留谈判、撤退、绕过或改变条件的空间。",
+    "aftermath": "记录环境、关系和目标如何改变，再根据已经发生的后果决定下一拍。",
+    "transition": "无选择的移动直接跳过；只有旅途本身具有戏剧功能时才展开。"
   }
 }

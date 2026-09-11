@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from . import artifacts, analyze, extract, generate, llm, prep, shadow, storage
+from . import artifacts, analyze, extract, generate, llm, prep, shadow, storage, structure
 from ..domain import (
     DomainValidationError,
     DisplayMaterial,
@@ -67,7 +67,7 @@ PUBLIC_PROFILE_NAMES = {
 }
 PUBLIC_PROFILE_SUMMARIES = {
     "cthulhu-dark-2e": "线索、调查压力、恐怖递进与不可逆代价",
-    "daggerheart": "场景、环境、意图、压力与动态后果",
+    "daggerheart": "可运行局势、环境调度、人物动机、压力与动态后果",
     "module-prep": "章节地图、人物功能、线索、威胁与时间线",
 }
 PUBLIC_PROFILE_IDS = {
@@ -81,9 +81,10 @@ PUBLIC_CARD_DESCRIPTIONS = {
     ("cthulhu-dark-2e", "npc"): "记录人物在调查中的功能、诉求、交换和施压后果。",
     ("cthulhu-dark-2e", "threat"): "描述威胁如何被感知、升级与绕过，不制作数值面板。",
     ("cthulhu-dark-2e", "clock"): "把时间、暴露和仪式后果变成可见的推进阶段。",
-    ("daggerheart", "environment"): "把可利用物、危险和非战斗出口组织成遭遇舞台。",
-    ("daggerheart", "enemy"): "记录对手意图、危险信号、受创变化和可行解法。",
-    ("daggerheart", "encounter_clock"): "追踪援军、警报、崩塌或追击等遭遇级推进。",
+    ("daggerheart", "environment"): "把探索、社交、穿越、战斗或事件组织成可运行局势。",
+    ("daggerheart", "npc"): "记录立场可变人物的目标、交换内容、关系压力和态度变化。",
+    ("daggerheart", "enemy"): "记录对手动机、当前目标、危险信号、受创变化和可行解法。",
+    ("daggerheart", "encounter_clock"): "追踪援军、警报、崩塌、追击、谈判耐心或仪式推进。",
     ("module-prep", "scene_extract"): "提取地点状况、调查入口、发现、压力与离场条件，供后续备团整理。",
     ("module-prep", "character_function"): "保留人物身份、目的、可提供内容和施压后果，供后续备团解释。",
     ("module-prep", "threat_logic"): "整理威胁的表现、意图、前兆、升级和可行解法，不制作数值面板。",
@@ -119,6 +120,8 @@ def public_profiles(profiles: dict) -> dict:
         PUBLIC_PROFILE_IDS.get(profile_id, profile_id): {
             "display_name": public_profile_name(profile_id),
             "profile_kind": profile.profile_kind,
+            "runtime_anchor_type": profile.runtime_anchor_type,
+            "runtime_navigation_mode": profile.runtime_navigation_mode,
             "summary": PUBLIC_PROFILE_SUMMARIES.get(
                 profile_id, "按当前工作区契约组织备团产物"
             ),
@@ -148,6 +151,7 @@ async def lifespan(_: FastAPI):
     """Run persistence maintenance only when the service actually starts."""
     remove_seed_workspace_instances()
     artifacts.recover_interrupted_artifact_jobs()
+    structure.recover_interrupted_structure_jobs()
     yield
 
 
@@ -338,7 +342,8 @@ class CardReviewBatchIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    card_ids: list[str] = Field(min_length=1, max_length=100)
+    # A review may select the entire workspace, independent of generation budgets.
+    card_ids: list[str] = Field(min_length=1)
     action: Literal["approve", "reopen"]
 
     @field_validator("card_ids")
@@ -613,6 +618,7 @@ def get_domain_workbench(
             "has_seed": False,
             "prep_context": None,
             "artifact_job": None,
+            "structure_job": None,
             "handout_fact_ids": [],
             "display_materials": [],
             "display_material_pages": [],
@@ -637,6 +643,11 @@ def get_domain_workbench(
             ],
             "profile_id": prep_job.scope.profile_id,
             "status": prep_job.status,
+            "units": [
+                unit.model_dump(mode="json")
+                for unit in bundle.prep_units
+                if unit.profile_id == prep_job.scope.profile_id
+            ],
         }
     artifact_jobs = artifacts.list_artifact_jobs(
         example,
@@ -646,6 +657,7 @@ def get_domain_workbench(
         artifact_jobs,
         profile_id=prep_job.scope.profile_id if prep_job is not None else None,
     )
+    structure_job = structure.latest_structure_job(example)
     display_material_pages = prep.display_material_source_pages(prep_job) if prep_job else []
     return {
         "bundle": bundle.model_dump(mode="json", by_alias=True),
@@ -655,6 +667,7 @@ def get_domain_workbench(
         "has_seed": (DOMAIN_DIR / "examples" / f"{example}.json").is_file(),
         "prep_context": prep_context,
         "artifact_job": artifact_job.model_dump(mode="json") if artifact_job else None,
+        "structure_job": structure_job.model_dump(mode="json") if structure_job else None,
         # This derived index lets the browser label explicitly classified
         # display-material facts without changing their stored classification.
         "handout_fact_ids": [fact.id for fact in handout_facts],
@@ -671,9 +684,24 @@ def get_domain_workspaces():
     # Seed bundles remain in the repository for automated fixtures, but are
     # intentionally absent from the user bookshelf.
     for raw_bundle, updated_at in storage.list_domain_bundles():
+        validation_error = None
         try:
             bundle = ExampleBundle.model_validate(raw_bundle)
         except ValidationError:
+            # A broken downstream structure must not hide an existing bookshelf.
+            workspace_id = raw_bundle.get("id")
+            if not isinstance(workspace_id, str) or workspace_id in SEED_DOMAIN_WORKSPACES:
+                continue
+            workspaces[workspace_id] = {
+                "id": workspace_id,
+                "name": str(raw_bundle.get("name") or workspace_id),
+                "description": str(raw_bundle.get("description") or ""),
+                "kind": "prep" if workspace_id.startswith("prep_job_") else "saved",
+                "updated_at": updated_at,
+                "can_rename": False,
+                "can_delete": True,
+                "validation_error": "工作区数据需要修复；事实记录仍保留，请勿重复送入书架。",
+            }
             continue
         if bundle.id in SEED_DOMAIN_WORKSPACES:
             # Repository fixtures remain addressable by explicit test URLs,
@@ -692,6 +720,7 @@ def get_domain_workspaces():
             "updated_at": updated_at,
             "can_rename": kind != "seed",
             "can_delete": kind != "seed",
+            "validation_error": validation_error,
         }
     return {
         "workspaces": sorted(
@@ -1434,7 +1463,11 @@ def cancel_domain_shadow_task(task_id: str):
 
 
 @app.post("/api/domain/examples/{example}/cards/draft", status_code=202)
-def draft_domain_cards(example: str, background_tasks: BackgroundTasks):
+def draft_domain_cards(
+    example: str,
+    background_tasks: BackgroundTasks,
+    body: artifacts.ArtifactDraftRequest | None = None,
+):
     """Queue source-bound card draft generation after an explicit GM request."""
     profiles = load_profiles(DOMAIN_DIR / "profiles")
     bundle, _, _ = load_runtime_domain_example(example)
@@ -1448,11 +1481,25 @@ def draft_domain_cards(example: str, background_tasks: BackgroundTasks):
     profile_id = prep_job.scope.profile_id
     if profile_id is None or profile_id not in profiles:
         raise HTTPException(422, "当前书架没有可用的备团板块")
+    if body is not None:
+        artifacts.ArtifactDraftRequest.model_validate(body)
     if artifacts.has_profile_artifacts(bundle, profile_id):
         raise HTTPException(
             409,
             "当前板块已经有备团产物；请先完成现有草案的复核，不重复生成一套平行卡片",
         )
+    if profile_id == "daggerheart":
+        if not bundle.adventure_chapters:
+            raise HTTPException(422, "请先整理并确认冒险章节与跨章节支线")
+        if any(
+            item.review_state != "approved"
+            for item in [
+                *bundle.adventure_chapters,
+                *bundle.story_threads,
+                *bundle.story_beats,
+            ]
+        ):
+            raise HTTPException(422, "请先确认全部冒险结构，再生成全部章节产物")
     config = storage.get_config()
     try:
         job, created = artifacts.create_artifact_job(
@@ -1460,6 +1507,7 @@ def draft_domain_cards(example: str, background_tasks: BackgroundTasks):
             profile_id,
             model_id=config["model"],
             fake_model=config["fake"],
+            prep_unit_id=None,
         )
     except artifacts.ArtifactJobConflictError as error:
         raise HTTPException(409, str(error)) from error
@@ -1474,6 +1522,74 @@ def draft_domain_cards(example: str, background_tasks: BackgroundTasks):
         "ok": True,
         "created": created,
         "job": job.model_dump(mode="json"),
+    }
+
+
+@app.post("/api/domain/examples/{example}/structure/draft", status_code=202)
+def draft_adventure_structure(example: str, background_tasks: BackgroundTasks):
+    """Propose one reviewable narrative structure for the full promoted fact scope."""
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    bundle, _, _ = load_runtime_domain_example(example)
+    validate_bundle(bundle, profiles)
+    prep_job = prep.find_prep_job_by_workspace(example)
+    if prep_job is None or prep_job.scope.profile_id != "daggerheart":
+        raise HTTPException(422, "冒险结构整理需要已完成的奇幻冒险备团任务")
+    if bundle.adventure_chapters:
+        if any(
+            item.review_state == "approved"
+            for item in [
+                *bundle.adventure_chapters,
+                *bundle.story_threads,
+                *bundle.story_beats,
+            ]
+        ):
+            raise HTTPException(409, "已确认的冒险结构不能被重新整理")
+        if artifacts.has_profile_artifacts(bundle, prep_job.scope.profile_id):
+            raise HTTPException(409, "已有备团产物时不能替换冒险结构")
+        bundle.adventure_chapters = []
+        bundle.story_threads = []
+        bundle.story_beats = []
+        bundle.fact_dispositions = []
+        storage.save_domain_bundle(
+            example, bundle.model_dump(mode="json", by_alias=True)
+        )
+    config = storage.get_config()
+    job, created = structure.create_structure_job(
+        example,
+        prep_job.scope.profile_id,
+        model_id=config["model"],
+        fake_model=config["fake"],
+    )
+    if created:
+        background_tasks.add_task(structure.execute_structure_job, job.id)
+    return {"ok": True, "created": created, "job": job.model_dump(mode="json")}
+
+
+@app.get("/api/domain/examples/{example}/structure/jobs/{job_id}")
+def get_adventure_structure_job(example: str, job_id: str):
+    try:
+        job = structure.get_structure_job(job_id)
+    except structure.StructureGenerationError as error:
+        raise HTTPException(404, str(error)) from error
+    if job.workspace_id != example:
+        raise HTTPException(404, "未找到该工作区的冒险结构任务")
+    return {"job": job.model_dump(mode="json")}
+
+
+@app.post("/api/domain/examples/{example}/structure/approve")
+def approve_adventure_structure(example: str):
+    try:
+        bundle = structure.approve_structure(example)
+    except structure.StructureGenerationError as error:
+        raise HTTPException(422, str(error)) from error
+    return {
+        "ok": True,
+        "chapters": [item.model_dump(mode="json") for item in bundle.adventure_chapters],
+        "threads": [item.model_dump(mode="json") for item in bundle.story_threads],
+        "beats": [item.model_dump(mode="json") for item in bundle.story_beats],
+        "fact_dispositions": [
+            item.model_dump(mode="json") for item in bundle.fact_dispositions
+        ],
     }
 
 
@@ -1582,7 +1698,9 @@ def delete_domain_card(example: str, card_id: str):
 
 
 @app.post("/api/domain/examples/{example}/plans/draft")
-def draft_domain_plan(example: str):
+def draft_domain_plan(
+    example: str,
+):
     profiles = load_profiles(DOMAIN_DIR / "profiles")
     bundle, saved_at, _ = load_runtime_domain_example(example)
     validate_bundle(bundle, profiles)
@@ -1604,6 +1722,7 @@ def draft_domain_plan(example: str):
             profile_id=prep_job.scope.profile_id if prep_job is not None else None,
             source_file=source_file,
             source_pages=source_pages,
+            prep_unit_id=None,
         )
     except DomainValidationError as error:
         raise HTTPException(422, str(error)) from error

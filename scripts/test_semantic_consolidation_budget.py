@@ -31,8 +31,9 @@ def make_source(path: Path) -> None:
 
 
 class DenseSegmentClient:
-    def __init__(self, source_file: str) -> None:
+    def __init__(self, source_file: str, *, observation_count: int = 37) -> None:
         self.source_file = source_file
+        self.observation_count = observation_count
         self.consolidation_inputs: list[dict] = []
 
     @staticmethod
@@ -88,7 +89,7 @@ class DenseSegmentClient:
                         **self._observation(index),
                         "source_refs": [{"file": self.source_file, "page": 1}],
                     }
-                    for index in range(1, 38)
+                    for index in range(1, self.observation_count + 1)
                 ]
             },
             ensure_ascii=False,
@@ -161,7 +162,9 @@ def main() -> None:
             # each batch, while the complete segment result still fits the
             # review response contract.
             prep.MAX_CONSOLIDATION_INPUT_CHARS = 6000
-            batched_client = DenseSegmentClient(relative_source)
+            batched_client = DenseSegmentClient(
+                relative_source, observation_count=63
+            )
             batched_job = prep.create_prep_job(
                 PrepJobCreate(
                     source_file=relative_source,
@@ -185,7 +188,7 @@ def main() -> None:
             assert batched_completed.status == "completed", batched_completed
             assert len(batched_client.consolidation_inputs) > 1
             batched_candidates = prep.list_prep_job_candidates(batched_job.id)
-            assert len(batched_candidates) == 37
+            assert len(batched_candidates) == 63
             assert all(
                 candidate["candidate_role"] == "segment_result"
                 for candidate in batched_candidates

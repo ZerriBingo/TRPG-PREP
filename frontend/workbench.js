@@ -17,8 +17,10 @@ const state = {
   factSourcePage: "",
   factKind: "all",
   factVisibility: "all",
+  factStructure: "all",
   cardProfile: "all",
   cardType: "all",
+  cardChapter: "all",
   selectedFactId: null,
   selectedCardId: null,
   selectedCardIds: new Set(),
@@ -26,6 +28,13 @@ const state = {
     generating: false,
     retryingJobId: null,
     reviewing: false,
+    error: "",
+    job: null,
+    pollTimer: null
+  },
+  structure: {
+    generating: false,
+    approving: false,
     error: "",
     job: null,
     pollTimer: null
@@ -197,6 +206,12 @@ const fieldLabels = {
   return_changes: "回访变化", situation: "当前情势", truth: "真相",
   major_threads: "主要线索链", endings: "结局", key_people: "重要人物",
   cross_location_clues: "跨地点线索",
+  premise: "冒险前提", current_situation: "当前局势", major_conflicts: "主要矛盾",
+  opening_conditions: "开场条件", possible_endings: "可能结局", factions: "重要阵营",
+  cross_environment_consequences: "跨局势后果", environment_type: "环境倾向",
+  narrative_function: "叙事功能", impulses: "环境冲动", gm_responses: "GM 响应",
+  phase_changes: "阶段变化", exit_outcomes: "退出结果", triggers: "触发条件",
+  potential_adversaries: "可能对手", source_statistics: "原文数值参考",
   opening_image: "开场画面", immediate_actions: "现场入口（GM 内部）", direct_clues: "直接线索",
   hidden_clues: "隐藏线索", gm_moves: "GM 移动", risk_if_pressed: "施压风险",
   exit_conditions: "退场条件", role: "身份", wants: "想要", offers: "能给什么",
@@ -204,7 +219,12 @@ const fieldLabels = {
   intention: "意图", danger_signs: "危险前兆", escalation: "升级",
   noncombat_exits: "非战斗解法", usable_features: "可利用物", hazards: "危险物",
   positioning: "距离与位置", environment_changes: "环境变化", signature_actions: "标志行动",
-  damaged_behavior: "受创行为", resolutions: "解决方式", official_framing: "官方说法",
+  short_term_goal: "短期目标", long_term_goal: "长期目标",
+  relationship_pressure: "关系压力", attitude_changes: "态度变化",
+  motives: "动机", current_objective: "当前目标", narrative_role: "叙事职能",
+  source_statblock: "原文数值参考", damaged_behavior: "受创行为", resolutions: "解决方式",
+  choices: "可选路径", discoveries: "可能发现", complications: "旅途复杂状况",
+  bypass: "跳过方式", official_framing: "官方说法",
   anomaly_signs: "异常迹象", direct_observations: "直接观察", evidence_chain: "证据链",
   available_procedures: "可用程序", escalation_condition: "升级条件",
   observed_behavior: "观察行为", working_hypothesis: "工作假设",
@@ -221,7 +241,9 @@ const runtimeLabels = {
   containment_integrity: "收容完整性", operational_security: "行动保密",
   resources: "资源", timeline: "时间", cost_forward: "代价前移",
   reveal_pressure: "揭示压力", threat_advance: "威胁推进",
-  worsen_position: "恶化站位", enemy_advances: "敌人推进",
+  worsen_position: "恶化站位", enemy_advances: "敌人推进", opposition_advances: "对手推进",
+  reveal_information: "揭示信息", show_opposition_intention: "展示对手意图",
+  cut_to_action: "切入关键场面",
   evidence_compromised: "证据受损", procedure_backfires: "程序反噬",
   escalate_classification: "提高分级", ask_a_question: "提出问题",
   expose_a_cost: "暴露代价", advance_the_clock: "推进时钟",
@@ -1242,6 +1264,26 @@ function artifactDraftAvailability() {
   if (!usableFacts.length) {
     return {ready: false, profileId, cards, counts, guidance: "请先把已接受候选送入书架，形成可追溯事实。"};
   }
+  if (profileId === "daggerheart") {
+    const chapters = state.data.bundle.adventure_chapters || [];
+    const structureItems = [
+      ...chapters,
+      ...(state.data.bundle.story_threads || []),
+      ...(state.data.bundle.story_beats || [])
+    ];
+    if (!chapters.length) {
+      return {
+        ready: false, profileId, cards, counts,
+        guidance: "请先整理并确认冒险结构，再生成全部章节产物。"
+      };
+    }
+    if (structureItems.some((item) => item.review_state !== "approved")) {
+      return {
+        ready: false, profileId, cards, counts,
+        guidance: "冒险结构等待确认；确认后将一次生成全部章节及跨章节剧情线所需产物。"
+      };
+    }
+  }
   if (cards.length) {
     const pending = counts.generated + counts.edited;
     return {
@@ -1259,8 +1301,262 @@ function artifactDraftAvailability() {
     profileId,
     cards,
     counts,
-    guidance: `将使用书架中的 ${usableFacts.length} 条已提升事实和${profileDisplayName(profileId)}契约生成草案；不会自动批准。`
+    guidance: profileId === "daggerheart"
+      ? "将使用 " + usableFacts.length + " 条已提升事实，一次生成全部已确认章节；跨章节剧情线保持共享，不会自动批准。"
+      : "将使用书架中的 " + usableFacts.length + " 条已提升事实和" + profileDisplayName(profileId) + "契约生成草案；不会自动批准。"
   };
+}
+
+const structurePhaseLabels = {
+  queued: "等待开始",
+  local_observations: "局部观察",
+  consolidating: "整理章节与剧情线",
+  assigning_facts: "分配事实去向",
+  validating: "确定性校验",
+  completed: "已完成"
+};
+
+function structureJobInFlight(job = state.structure.job) {
+  return Boolean(job && ["queued", "running"].includes(job.status));
+}
+
+function scheduleStructurePoll() {
+  if (state.structure.pollTimer) clearTimeout(state.structure.pollTimer);
+  state.structure.pollTimer = null;
+  if (structureJobInFlight()) {
+    state.structure.pollTimer = setTimeout(() => {
+      pollStructureJob().catch(() => {});
+    }, 1400);
+  }
+}
+
+async function pollStructureJob() {
+  const job = state.structure.job;
+  if (!job?.id || !state.exampleId) return;
+  try {
+    const response = await fetch(
+      "/api/domain/examples/" + encodeURIComponent(state.exampleId) +
+      "/structure/jobs/" + encodeURIComponent(job.id),
+      {cache: "no-store"}
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "冒险结构任务状态读取失败"));
+    state.structure.job = payload.job;
+    state.structure.generating = structureJobInFlight(payload.job);
+    if (payload.job.status === "completed") {
+      state.structure.error = "";
+      await refreshWorkbenchData();
+    } else if (payload.job.status === "failed") {
+      state.structure.error = payload.job.error || "冒险结构整理失败，请重新尝试。";
+    } else {
+      scheduleStructurePoll();
+    }
+  } catch (error) {
+    state.structure.error = userFacingError(error, "冒险结构任务状态读取失败");
+    scheduleStructurePoll();
+  }
+  renderAdventureStructure();
+}
+
+async function draftAdventureStructure() {
+  if (state.structure.generating || !state.exampleId) return;
+  const chapters = state.data.bundle.adventure_chapters || [];
+  if (chapters.length && !confirm("重新整理会替换尚未确认的冒险结构，继续吗？")) return;
+  state.structure.generating = true;
+  state.structure.error = "";
+  renderAdventureStructure();
+  try {
+    const response = await fetch(
+      "/api/domain/examples/" + encodeURIComponent(state.exampleId) + "/structure/draft",
+      {method: "POST"}
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "冒险结构整理启动失败"));
+    state.structure.job = payload.job;
+    state.structure.generating = structureJobInFlight(payload.job);
+    scheduleStructurePoll();
+  } catch (error) {
+    state.structure.error = userFacingError(error, "冒险结构整理启动失败");
+    state.structure.generating = false;
+  }
+  renderAdventureStructure();
+}
+
+async function approveAdventureStructure() {
+  if (state.structure.approving || !state.exampleId) return;
+  state.structure.approving = true;
+  state.structure.error = "";
+  renderAdventureStructure();
+  try {
+    const response = await fetch(
+      "/api/domain/examples/" + encodeURIComponent(state.exampleId) + "/structure/approve",
+      {method: "POST"}
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "冒险结构确认失败"));
+    await refreshWorkbenchData();
+  } catch (error) {
+    state.structure.error = userFacingError(error, "冒险结构确认失败");
+  } finally {
+    state.structure.approving = false;
+    renderAdventureStructure();
+  }
+}
+
+function structureProgress(job) {
+  if (!job) return 0;
+  if (job.status === "completed") return 100;
+  if (job.phase === "local_observations") {
+    return Math.round(((job.completed_batches || 0) / Math.max(job.batch_count || 1, 1)) * 40);
+  }
+  if (job.phase === "consolidating") return 50;
+  if (job.phase === "assigning_facts") {
+    return 55 + Math.round(((job.completed_batches || 0) / Math.max(job.batch_count || 1, 1)) * 38);
+  }
+  if (job.phase === "validating") return 97;
+  return 0;
+}
+
+function renderAdventureStructure() {
+  const panel = $("adventure-structure-panel");
+  if (!panel || !state.data?.bundle) return;
+  const isFantasy = artifactProfileId() === "daggerheart";
+  panel.hidden = !isFantasy;
+  if (!isFantasy) return;
+  const bundle = state.data.bundle;
+  const chapters = bundle.adventure_chapters || [];
+  const threads = bundle.story_threads || [];
+  const beats = bundle.story_beats || [];
+  const dispositions = bundle.fact_dispositions || [];
+  const approved = chapters.length > 0 &&
+    [...chapters, ...threads, ...beats].every((item) => item.review_state === "approved");
+  const job = state.structure.job;
+  const progress = structureProgress(job);
+  $("structure-progress").hidden = !job;
+  $("structure-progress-bar").value = progress;
+  $("structure-progress-value").textContent = progress + "%";
+  $("structure-progress-label").textContent =
+    "冒险结构整理 · " + (structurePhaseLabels[job?.phase] || job?.status || "等待");
+  $("structure-guidance").textContent = state.structure.error ||
+    (structureJobInFlight(job)
+      ? "正在处理完整事实范围：" + (job.completed_batches || 0) + "/" + (job.batch_count || 0) + " 批"
+      : approved
+        ? "结构已确认。备团产物将一次生成全部章节，并保留跨章节剧情线的共享关系。"
+        : chapters.length
+          ? "检查章节、跨章节剧情线、章内拍与事实去向；确认后才能生成产物。"
+          : "从已审核事实整理叙事章节、跨章节剧情线和章内拍。");
+  const draftButton = $("draft-structure");
+  draftButton.disabled = state.structure.generating || approved;
+  draftButton.textContent = state.structure.generating
+    ? "正在整理…"
+    : chapters.length ? "重新整理" : "整理冒险结构";
+  const approveButton = $("approve-structure");
+  approveButton.hidden = !chapters.length || approved;
+  approveButton.disabled = state.structure.approving || structureJobInFlight(job);
+  approveButton.textContent = state.structure.approving ? "正在确认…" : "确认整套结构";
+  const dispositionCounts = dispositions.reduce((counts, item) => {
+    counts[item.kind] = (counts[item.kind] || 0) + 1;
+    return counts;
+  }, {});
+  const promotedCount = bundle.facts.filter(
+    (fact) => factEvidenceStatus(fact) !== "model_candidate"
+  ).length;
+  $("structure-summary").innerHTML = [
+    "<span><strong>" + chapters.length + "</strong> 章节</span>",
+    "<span><strong>" + threads.length + "</strong> 剧情线</span>",
+    "<span><strong>" + beats.length + "</strong> 可能拍</span>",
+    "<span><strong>" + dispositions.length + "/" + promotedCount + "</strong> 事实已归位</span>",
+    "<span><strong>" + (dispositionCounts.global_reference || 0) + "</strong> 全局参考</span>",
+    "<span><strong>" + (dispositionCounts.display_material || 0) + "</strong> 展示材料</span>",
+    "<span><strong>" + (dispositionCounts.deferred || 0) + "</strong> 明确暂缓</span>"
+  ].join("");
+  if (!chapters.length) {
+    $("structure-board").innerHTML = '<div class="empty-state">尚未整理冒险结构。</div>';
+    return;
+  }
+  const chapterCards = chapters.map((chapter) => {
+    const chapterThreads = threads.filter((thread) => thread.chapter_roles?.[chapter.id]);
+    const chapterBeats = beats.filter((beat) => beat.chapter_id === chapter.id);
+    const threadTags = chapterThreads.map((thread) =>
+      badge(storyThreadRoleLabel(thread.chapter_roles[chapter.id]) + " · " + thread.title, "accent")
+    ).join("");
+    const beatList = chapterBeats.map((beat) =>
+      '<section class="structure-beat"><strong>' + esc(beat.title) + "</strong><p>" + esc(beat.summary) + "</p>" +
+      beatThreadDevelopmentHtml(beat, threads) + "</section>"
+    ).join("");
+    const overview = chapter.overview || null;
+    const overviewFields = overview
+      ? Object.fromEntries(Object.entries(overview).filter(([key]) =>
+        !["fact_ids", "field_sources", "open_questions"].includes(key)
+      ))
+      : {};
+    const overviewHtml = overview
+      ? '<details class="structure-overview"><summary>章节运行摘要</summary>' +
+        runtimeCardFieldsHtml({fields: overviewFields}) + sourceHtml(overview.fact_ids || []) +
+        "</details>"
+      : "";
+    return '<article class="structure-chapter">' +
+      '<div class="card-title-row"><strong>' + esc(chapter.title) + "</strong>" +
+      badge(chapter.review_state === "approved" ? "已确认" : "待确认",
+        chapter.review_state === "approved" ? "completed" : "needs_review") + "</div>" +
+      "<p>" + esc(chapter.summary) + "</p>" +
+      '<div class="tag-row">' + badge((chapter.fact_ids?.length || 0) + " 条适用事实", "neutral") +
+      threadTags + "</div>" +
+      '<button class="edit-button structure-facts-button" type="button" data-structure-facts="' +
+      esc(chapter.id) + '">查看适用事实</button>' +
+      (chapterBeats.length
+        ? "<details><summary>章内节奏 · " + chapterBeats.length +
+          '</summary><div class="structure-beat-list">' + beatList + "</div></details>"
+        : "") +
+      overviewHtml +
+      chapterThreadDistributionHtml(chapter, threads, chapterBeats) +
+      "</article>";
+  }).join("");
+  const threadRows = threads.map((thread) => {
+    const roleTags = Object.entries(thread.chapter_roles || {}).map(([chapterId, role]) => {
+      const chapter = chapters.find((item) => item.id === chapterId);
+      return badge(storyThreadRoleLabel(role) + " · " + (chapter?.title || chapterId), "neutral");
+    }).join("");
+    return '<div class="structure-thread"><div><strong>' + esc(thread.title) +
+      "</strong><span>" + esc(thread.summary) + '</span></div><div class="tag-row">' +
+      roleTags + "</div></div>";
+  }).join("");
+  $("structure-board").innerHTML =
+    '<div class="structure-chapters">' + chapterCards + "</div>" +
+    '<details class="structure-threads" open><summary>剧情线 · ' + threads.length +
+    "</summary>" + (threadRows || '<p class="muted">没有独立剧情线。</p>') + "</details>";
+}
+
+function beatThreadDevelopmentHtml(beat, threads) {
+  const developments = beat.thread_developments || {};
+  const selected = threads.filter((thread) => (beat.thread_ids || []).includes(thread.id));
+  return '<div class="beat-thread-development">' + selected.map((thread) => {
+    const progress = developments[thread.id];
+    return '<div><strong>' + esc(thread.title) + '</strong>' +
+      (progress ? '<p><b>本拍变化</b> ' + esc(progress.development) + '</p><p><b>后续悬念</b> ' + esc(progress.carry_forward) + '</p>'
+        : '<p class="muted">尚无本拍展开说明</p>') + '</div>';
+  }).join('') + (beat.interplay ? '<p><b>交织与选择</b> ' + esc(beat.interplay) + '</p>' : '') + '</div>';
+}
+
+function storyThreadRoleLabel(role) {
+  return ({introduce: '引入', develop: '推进', resolve: '回收', background: '背景'})[role] || role;
+}
+
+function chapterThreadDistributionHtml(chapter, threads, beats) {
+  const applicable = threads.filter((thread) => thread.chapter_roles?.[chapter.id]);
+  if (!applicable.length) return '';
+  return '<details class="chapter-thread-distribution"><summary>剧情线在本章的展开</summary>' +
+    applicable.map((thread) => {
+      const appearances = beats.filter((beat) => beat.chapter_id === chapter.id && (beat.thread_ids || []).includes(thread.id));
+      return '<section><h4>' + esc(thread.title) + ' · ' + esc(storyThreadRoleLabel(thread.chapter_roles[chapter.id])) + '</h4>' +
+        '<p>' + esc(thread.summary || '') + '</p>' +
+        (appearances.length ? appearances.map((beat) => {
+          const progress = beat.thread_developments?.[thread.id];
+          return '<div><strong>' + esc(beat.title) + '</strong>' +
+            (progress ? '<p>' + esc(progress.development) + '</p><p class="muted">后续悬念：' + esc(progress.carry_forward) + '</p>'
+              : '<p class="muted">尚无本拍展开说明</p>') + '</div>';
+        }).join('') : '<p class="muted">本章尚未安排到具体拍</p>') + '</section>';
+    }).join('') + '</details>';
 }
 
 const artifactJobStatusLabels = {
@@ -1332,7 +1628,7 @@ function artifactJobProgress(job = state.artifacts.job) {
   } else if (job.phase === "local_digest") {
     value = ratio(job.completed_batches, job.batch_count) * 50;
   } else if (job.phase === "global_plan") {
-    value = 50 + (Number(job.unit_count) > 0 ? 8 : 0);
+    value = 50 + ratio(job.completed_planning_scopes, job.planning_scope_count) * 8;
   } else if (job.phase === "materializing") {
     value = 58 + ratio(job.completed_cards, job.planned_card_count) * 37;
   } else if (job.phase === "validating") {
@@ -1451,7 +1747,11 @@ async function draftArtifacts() {
   try {
     const response = await fetch(
       "/api/domain/examples/" + encodeURIComponent(state.exampleId) + "/cards/draft",
-      {method: "POST"}
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}"
+      }
     );
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "备团产物生成失败"));
@@ -1618,11 +1918,13 @@ function openDisplayMaterialEditor(materialId) {
   ));
   const options = [];
   for (const plan of state.data.bundle.plans || []) {
-    for (const cardId of plan.location_card_ids || []) {
+    const anchorIds = [...(plan.location_card_ids || []), ...(plan.environment_card_ids || [])];
+    for (const cardId of anchorIds) {
       const card = state.data.bundle.cards.find((item) => item.id === cardId);
       if (!card) continue;
       const value = `${plan.id}::card::${card.id}`;
-      options.push(`<option value="${esc(value)}" ${selectedLinks.has(value) ? "selected" : ""}>${esc(plan.title)} · 地点：${esc(card.title)}</option>`);
+      const anchorLabel = card.type === "environment" ? "局势" : "地点";
+      options.push(`<option value="${esc(value)}" ${selectedLinks.has(value) ? "selected" : ""}>${esc(plan.title)} · ${anchorLabel}：${esc(card.title)}</option>`);
     }
     for (const beat of plan.beats || []) {
       const value = `${plan.id}::beat::${beat.id}`;
@@ -1688,6 +1990,20 @@ function badge(text, cssClass = "") {
   return `<span class="badge ${cssClass}">${esc(text)}</span>`;
 }
 
+function localDateTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ").slice(0, 16);
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 function csvValues(value) {
   return value.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 }
@@ -1696,7 +2012,7 @@ function updateWorkStatus(message = "") {
   const status = $("connection-status");
   const suffix = message || (state.dirty ? "未保存" : "");
   const savedText = state.savedState === "saved" && state.savedAt
-    ? `已保存 ${state.savedAt.replace("T", " ").slice(0, 16)}`
+    ? `已保存 ${localDateTime(state.savedAt)}`
     : state.savedState === "invalid" ? "存档无效" : "种子包";
   status.className = `status ${state.dirty ? "loading" : "ok"}`;
   status.textContent = suffix ? `${savedText} · ${suffix}` : savedText;
@@ -1948,6 +2264,9 @@ async function refreshWorkbenchData() {
       state.artifacts.job = null;
       state.artifacts.retryingJobId = null;
     }
+    state.structure.job = payload.structure_job || null;
+    state.structure.generating = structureJobInFlight(state.structure.job);
+    scheduleStructurePoll();
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     scheduleArtifactPoll();
     fillSelectors();
@@ -2004,7 +2323,7 @@ function fillWorkspaceSelector() {
     workspaces.unshift(current);
   }
   select.innerHTML = '<option value="">请选择书架工作区</option>' + workspaces.map((item) =>
-    `<option value="${esc(item.id)}">${esc(item.name)}${item.kind === "prep" ? " · 备团" : ""}</option>`
+    `<option value="${esc(item.id)}">${esc(item.name)}${item.validation_error ? " · 数据需修复" : item.kind === "prep" ? " · 备团" : ""}</option>`
   ).join("");
   select.value = state.exampleId || "";
   const renameButton = $("rename-workspace");
@@ -2132,7 +2451,9 @@ async function submitPlanDraft(event) {
   submitButton.disabled = true;
   try {
     const response = await fetch('/api/domain/examples/' + encodeURIComponent(state.exampleId) + '/plans/draft', {
-      method: 'POST'
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: "{}"
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "运行场景组装失败"));
@@ -2483,7 +2804,7 @@ function cardOpenQuestionsHtml(card) {
 
 function cardGenerationHtml(card) {
   if (!card.generation) return "";
-  const generatedAt = String(card.generation.generated_at || "").replace("T", " ").slice(0, 16);
+  const generatedAt = localDateTime(card.generation.generated_at);
   return `<div class="card-generation-note">模型草案 · ${esc(card.generation.model_id)} · ${esc(generatedAt)}</div>`;
 }
 
@@ -2508,13 +2829,19 @@ function runtimeCards(cardTypes) {
   const planCardIds = plan ? new Set(plan.card_ids) : null;
   return state.data.bundle.cards.filter((card) =>
     card.profile_id === state.runtimeProfileId &&
-    cardTypes.includes(card.type) &&
+    cardTypes.includes(card.type) && runtimeChapterIncludes(card) &&
     (!planCardIds || planCardIds.has(card.id))
   );
 }
 
-function runtimeSceneCards() {
-  return runtimeCards(["location", "environment"]);
+function anchorLed(plan) {
+  return ["location", "environment"].includes(plan?.navigation_mode);
+}
+
+function planAnchorIds(plan) {
+  if (plan?.navigation_mode === "environment") return plan.environment_card_ids || [];
+  if (plan?.navigation_mode === "location") return plan.location_card_ids || [];
+  return [];
 }
 
 function runtimeConfirmedSceneCards() {
@@ -2524,9 +2851,12 @@ function runtimeConfirmedSceneCards() {
   const planCards = (state.data?.bundle?.cards || []).filter((card) =>
     card.profile_id === state.runtimeProfileId && planCardIds.has(card.id)
   );
-  if (plan.navigation_mode === "location") {
-    const locationIds = new Set(plan.location_card_ids || []);
-    return planCards.filter((card) => locationIds.has(card.id));
+  if (anchorLed(plan)) {
+    const anchorIds = new Set(planAnchorIds(plan));
+    const chapterCards = planCards.filter((card) => anchorIds.has(card.id) && runtimeChapterIncludes(card));
+    if (plan.navigation_mode !== "environment" || runtimeNarrative.beat === "all") return chapterCards;
+    const beat = (state.data.bundle.story_beats || []).find((item) => item.id === runtimeNarrative.beat);
+    return chapterCards.filter((card) => (card.chapter_ids || []).includes(beat?.chapter_id));
   }
   const beat = currentBeat();
   if (!beat) return planCards;
@@ -2629,8 +2959,28 @@ function clueHtml(card, group, values) {
 }
 
 function currentRuntimeCard() {
-  const cards = runtimeSceneCards();
-  return cards.find((card) => card.id === state.session?.current_card_id) || cards[0] || null;
+  const cards = runtimeConfirmedSceneCards();
+  return cards.find((card) => card.id === state.session?.current_card_id) || cards.find(runtimeBeatIncludes) || null;
+}
+
+function runtimeGroupCards(anchor) {
+  if (!anchor || !Array.isArray(anchor.runtime_group_ids)) return [];
+  const groups = new Set(anchor.runtime_group_ids);
+  return runtimePlanCards().filter((card) =>
+    card.id !== anchor.id &&
+    Array.isArray(card.runtime_group_ids) &&
+    card.runtime_group_ids.some((groupId) => groups.has(groupId))
+  );
+}
+
+function runtimeGroupHtml(anchor) {
+  const cards = runtimeGroupCards(anchor).filter((card) =>
+    !["clock", "operation_clock", "encounter_clock"].includes(card.type)
+  );
+  if (!cards.length) return "";
+  return '<section class="runtime-section"><h3>同组人物与对手</h3><div class="runtime-reference-list masonry-grid">' +
+    cards.map((card) => '<article class="domain-card runtime-reference-card"><div class="card-title-row"><div class="card-title">' + esc(card.title) + '</div>' + badge(profileDefinition(card.profile_id, card.type).display_name, 'neutral') + '</div>' + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids) + '</article>').join('') +
+    '</div></section>';
 }
 
 function currentPlan() {
@@ -2653,10 +3003,11 @@ function planReviewHtml(plan) {
   const cardsById = new Map(state.data.bundle.cards.map((card) => [card.id, card]));
   const factsById = new Map(state.data.bundle.facts.map((fact) => [fact.id, fact]));
   const materialsById = new Map((state.data.bundle.display_materials || []).map((material) => [material.id, material]));
-  if (plan.navigation_mode === "location") {
-    const locations = (plan.location_card_ids || []).map((id) => cardsById.get(id)).filter(Boolean);
-    return '<details class="plan-review"><summary>审阅 ' + locations.length + ' 个地点</summary><div class="plan-beat-list">' +
-      (locations.length ? locations.map((card) => '<article class="plan-beat-preview"><div class="plan-beat-head"><strong>' + esc(card.title) + '</strong><span class="page-ref">地点卡</span></div><p>' + esc(card.fields?.arrival_description || card.fields?.normal_state || '') + '</p></article>').join('') : '<p class="muted">尚未纳入地点卡。</p>') +
+  if (anchorLed(plan)) {
+    const anchors = planAnchorIds(plan).map((id) => cardsById.get(id)).filter(Boolean);
+    const noun = plan.navigation_mode === "environment" ? "局势" : "地点";
+    return '<details class="plan-review"><summary>审阅 ' + anchors.length + ' 个' + noun + '</summary><div class="plan-beat-list">' +
+      (anchors.length ? anchors.map((card) => '<article class="plan-beat-preview"><div class="plan-beat-head"><strong>' + esc(card.title) + '</strong><span class="page-ref">' + esc(profileDefinition(card.profile_id, card.type).display_name) + '</span></div><p>' + esc(card.fields?.opening_image || card.fields?.arrival_description || card.fields?.normal_state || '') + '</p></article>').join('') : '<p class="muted">尚未纳入' + noun + '卡。</p>') +
       '</div></details>';
   }
   return '<details class="plan-review"><summary>审阅 ' + plan.beats.length + ' 个节拍</summary><div class="plan-beat-list">' +
@@ -2690,7 +3041,7 @@ function renderPlans() {
     '<article class="plan-item ' + (plan.id === state.session?.current_plan_id ? 'selected' : '') + '">' +
       '<div class="plan-item-body"><div><strong>' + esc(plan.title) + '</strong><p class="muted">' + esc(plan.premise) + '</p><div class="plan-source-summary">来源：' + esc(plan.source_file) + (plan.source_pages?.length ? ' · ' + plan.source_pages.map((page) => 'p' + esc(page)).join(' ') : '') + '</div></div>' +
         planReviewHtml(plan) + '</div>' +
-      '<div class="row-actions"><span class="badge accent">' + (plan.navigation_mode === "location" ? (plan.location_card_ids || []).length + ' 地点' : plan.beats.length + ' 节拍') + '</span>' +
+      '<div class="row-actions"><span class="badge accent">' + (anchorLed(plan) ? planAnchorIds(plan).length + (plan.navigation_mode === "environment" ? ' 局势' : ' 地点') : plan.beats.length + ' 节拍') + '</span>' +
         (plan.id === state.session?.current_plan_id ? '<span class="badge">当前运行</span>' : '<span class="badge">待开始</span>') +
         '<button class="edit-button danger" data-delete-plan="' + esc(plan.id) + '">删除场景</button>' +
         (plan.id === state.session?.current_plan_id ? '<button class="edit-button" data-resume-plan="' + esc(plan.id) + '">回到运行</button><button class="edit-button" data-start-plan="' + esc(plan.id) + '">重新开始</button>' : '<button class="edit-button" data-start-plan="' + esc(plan.id) + '">开始运行</button>') +
@@ -2717,7 +3068,7 @@ async function deletePlan(planId) {
 function renderBeat() {
   const beat = currentBeat();
   const plan = currentPlan();
-  if (plan?.navigation_mode === "location") {
+  if (anchorLed(plan)) {
     $("beat-holder").innerHTML = '';
     return;
   }
@@ -2805,7 +3156,7 @@ async function startPlan(planId) {
   state.session.log = [];
   state.session.notes = '';
   state.session.current_plan_id = plan.id;
-  state.session.current_beat_id = plan.navigation_mode === "location" ? null : (plan.beats[0]?.id || null);
+  state.session.current_beat_id = anchorLed(plan) ? null : (plan.beats[0]?.id || null);
   const sceneCard = plan.card_ids
     .map((cardId) => state.data.bundle.cards.find((card) => card.id === cardId))
     .find((card) => card && ["location", "environment"].includes(card.type));
@@ -2833,7 +3184,7 @@ function resumePlan(planId) {
 function changeBeat(delta) {
   const plan = currentPlan();
   const beat = currentBeat();
-  if (plan?.navigation_mode === "location") return;
+  if (anchorLed(plan)) return;
   if (!plan || !beat || !state.session) return;
   const index = plan.beats.findIndex((item) => item.id === beat.id);
   const next = plan.beats[index + delta];
@@ -2882,7 +3233,10 @@ function renderArtifactStage() {
   button.disabled = state.artifacts.generating || (!retryable && !availability.ready);
   button.textContent = state.artifacts.generating
     ? "正在生成草案…"
-    : retryable ? "重试失败项" : "生成备团产物草案";
+    : retryable ? "重试失败项"
+      : availability.profileId === "daggerheart"
+        ? "生成全部章节产物"
+        : "生成备团产物草案";
   button.title = availability.ready
     ? retryable
       ? "在当前生成队列中统一重试失败项；成功步骤会复用"
@@ -2892,7 +3246,7 @@ function renderArtifactStage() {
   const phaseProgress = job?.phase === "local_digest"
     ? ` · ${job.completed_batches || 0}/${job.batch_count || 0} 个局部批次 · ${job.unit_count || 0} 个整理单元`
     : job?.phase === "global_plan"
-      ? ` · ${job.unit_count || 0} 个整理单元`
+      ? ` · ${job.completed_planning_scopes || 0}/${job.planning_scope_count || 1} 个章节规划`
       : job?.phase === "materializing"
         ? ` · ${job.completed_cards || 0}/${job.planned_card_count || 0} 张计划卡`
         : job?.phase === "direct_generation"
@@ -2959,20 +3313,44 @@ function renderShelf() {
     `;
   }).join("");
   renderArtifactStage();
+  renderAdventureStructure();
   renderPlanDraftAvailability();
 }
 
 function renderFacts() {
+  const chapters = state.data.bundle.adventure_chapters || [];
+  const structureSelect = $("fact-structure");
+  const options = [
+    ["all", "全部结构归属"],
+    ...chapters.map((chapter) => [chapter.id, chapter.title]),
+    ["global_reference", "全局参考"],
+    ["display_material", "结构：展示材料"],
+    ["deferred", "明确暂缓"]
+  ];
+  structureSelect.innerHTML = options.map(([value, text]) =>
+    '<option value="' + esc(value) + '">' + esc(text) + "</option>"
+  ).join("");
+  if (!options.some(([value]) => value === state.factStructure)) state.factStructure = "all";
+  structureSelect.value = state.factStructure;
+  structureSelect.hidden = !chapters.length;
+  const dispositionByFact = new Map(
+    (state.data.bundle.fact_dispositions || []).map((item) => [item.fact_id, item])
+  );
   const query = state.factSearch.trim().toLowerCase();
   const sourcePage = parseReviewPageRanges(state.factSourcePage);
   const matches = state.data.bundle.facts.filter((fact) => {
     const kindOk = state.factKind === "all" || (state.factKind === "handout" ? isHandoutFact(fact) : fact.kind === state.factKind && !isHandoutFact(fact));
     const visibleOk = state.factVisibility === "all" || fact.visibility === state.factVisibility;
+    const disposition = dispositionByFact.get(fact.id);
+    const structureOk = state.factStructure === "all" ||
+      (state.factStructure.startsWith("chapter_")
+        ? (disposition?.chapter_ids || []).includes(state.factStructure)
+        : disposition?.kind === state.factStructure);
     const haystack = [fact.id, fact.text, fact.notes || "", factEvidenceStatus(fact), factSourceLabel(fact), ...factTagsForDisplay(fact)].join(" ").toLowerCase();
     const pageOk = !sourcePage.ranges.length || factSourceRefs(fact).some((source) =>
       sourcePage.ranges.some(([start, end]) => source.page >= start && source.page <= end)
     );
-    return sourcePage.valid && kindOk && visibleOk && pageOk && (!query || haystack.includes(query));
+    return sourcePage.valid && kindOk && visibleOk && structureOk && pageOk && (!query || haystack.includes(query));
   });
 
   $("fact-grid").innerHTML = matches.map((fact) => {
@@ -3090,6 +3468,18 @@ async function saveReviewSourceRefs(candidateId) {
 }
 
 function renderCards() {
+  const chapters = state.data.bundle.adventure_chapters || [];
+  const chapterById = new Map(chapters.map((chapter) => [chapter.id, chapter]));
+  const chapterSelect = $("card-chapter");
+  chapterSelect.innerHTML = [
+    '<option value="all">全部章节</option>',
+    ...chapters.map((chapter) =>
+      '<option value="' + esc(chapter.id) + '">' + esc(chapter.title) + "</option>"
+    )
+  ].join("");
+  if (!chapters.some((chapter) => chapter.id === state.cardChapter)) state.cardChapter = "all";
+  chapterSelect.value = state.cardChapter;
+  chapterSelect.hidden = !chapters.length;
   const allCardIds = new Set(state.data.bundle.cards.map((card) => card.id));
   state.selectedCardIds = new Set(
     [...state.selectedCardIds].filter((cardId) => allCardIds.has(cardId))
@@ -3097,7 +3487,9 @@ function renderCards() {
   const cards = state.data.bundle.cards.filter((card) => {
     const profileOk = state.cardProfile === "all" || card.profile_id === state.cardProfile;
     const typeOk = state.cardType === "all" || card.type === state.cardType;
-    return profileOk && typeOk;
+    const chapterOk = state.cardChapter === "all" ||
+      (card.chapter_ids || []).includes(state.cardChapter);
+    return profileOk && typeOk && chapterOk;
   });
   const referencedCardIds = new Set(
     state.data.bundle.plans.flatMap((plan) => plan.card_ids || [])
@@ -3140,7 +3532,7 @@ function renderCards() {
             ${card.edit_state !== "approved" || state.editMode ? `<button class="edit-button danger" data-delete-card="${esc(card.id)}" ${isReferenced ? 'disabled title="已被运行场景引用"' : ""}>删除</button>` : ""}
           </span>
         </div>
-        <div class="tag-row">${badge(profileDisplayName(card.profile_id))}</div>
+        <div class="tag-row">${badge(profileDisplayName(card.profile_id))}${(card.chapter_ids || []).map((chapterId) => badge(chapterById.get(chapterId)?.title || chapterId, "accent")).join("")}</div>
         ${fieldsHtml(card)}
         ${cardOpenQuestionsHtml(card)}
         ${sourceHtml(card.fact_ids)}
@@ -3261,7 +3653,7 @@ function renderReview() {
   const selectedLabel = reviewCandidateLabel(selected, selectedIndex < 0 ? null : selectedIndex);
   const historyHtml = history.map((event) => `
     <div class="review-history-item">
-      <div class="tag-row">${badge(event.action || "review")} ${badge(reviewStateLabels[event.review_state] || event.review_state, event.review_state)} <span class="muted">${esc(String(event.created_at || "").replace("T", " ").slice(0, 16))}</span></div>
+      <div class="tag-row">${badge(event.action || "review")} ${badge(reviewStateLabels[event.review_state] || event.review_state, event.review_state)} <span class="muted">${esc(localDateTime(event.created_at))}</span></div>
       ${event.note ? `<p><strong>说明：</strong>${esc(event.note)}</p>` : ""}
       ${event.field_paths?.length ? `<p class="muted">字段：${esc(event.field_paths.join(", "))}</p>` : ""}
       ${event.related_candidate_ids?.length > 1 ? `<p class="muted">关联候选：${esc(event.related_candidate_ids.map(reviewCandidateHistoryLabel).join("、"))}</p>` : ""}
@@ -3286,7 +3678,7 @@ function renderReview() {
           ${selected.confidence != null ? badge(`置信度 ${Number(selected.confidence).toFixed(2)}`) : ""}
         </div>
       </div>
-      <span class="muted">${esc(String(selected.created_at || "").replace("T", " ").slice(0, 16))}</span>
+      <span class="muted">${esc(localDateTime(selected.created_at))}</span>
     </div>
     <section class="review-text-block">
       <div class="field-label">当前候选内容</div>
@@ -3368,7 +3760,8 @@ function renderRuntimeLegacy() {
 
 function runtimeCardFieldsHtml(card) {
   return Object.entries(card.fields)
-    .filter(([key]) => !["direct_clues", "hidden_clues", "current_stage", "first_triggers"].includes(key))
+    .filter(([key]) => !["direct_clues", "hidden_clues", "current_stage", "first_triggers", "fact_ids", "field_sources", "open_questions"].includes(key))
+    .filter(([, value]) => String(formatValue(value)).trim())
     .map(([key, value]) =>
       '<div class="field"><div class="field-label">' + esc(label(key)) + '</div><div class="field-value">' + esc(formatValue(value)) + '</div></div>'
     ).join("");
@@ -3422,6 +3815,18 @@ function renderRuntime() {
   if (activePlan) state.runtimeProfileId = activePlan.profile_id;
   const item = profile(state.runtimeProfileId);
   if (!item || !state.session) return;
+  const environmentLed = activePlan?.navigation_mode === "environment";
+  $("runtime-mode-description").textContent = environmentLed
+    ? "以当前局势为主界面，切换环境并调用同组人物、对手与推进钟；原文仍可从卡片来源回溯。"
+    : "以当前地点为主界面，随时切换地点、查线索、处理触发与推进时钟；原文仍可从卡片来源回溯。";
+  $("runtime-overview-title").textContent = environmentLed ? "冒险总览" : "章节总览";
+  $("runtime-overview-description").textContent = environmentLed
+    ? "冒险前提、当前局势、主要矛盾与可能结局"
+    : "跨地点情势、真相、主要线索与结局";
+  $("runtime-anchor-title").textContent = environmentLed ? "可运行局势" : "可探索地点";
+  $("runtime-anchor-description").textContent = environmentLed
+    ? "自由切换环境，不预设解决路线"
+    : "自由切换，不预设玩家路线";
   renderRuntimeOverview();
   renderRuntimeReferenceCards();
   renderGlobalDisplayMaterials();
@@ -3439,8 +3844,8 @@ function renderRuntime() {
     const beatIndex = beat ? activePlan.beats.findIndex((item) => item.id === beat.id) + 1 : 0;
     planStatus.className = "runtime-plan-status active";
     planStatus.innerHTML = '<strong>运行中：</strong> ' + esc(activePlan.title) +
-      (activePlan.navigation_mode === 'location'
-        ? ' <span class="muted">· 地点自由切换</span>'
+      (anchorLed(activePlan)
+        ? ' <span class="muted">· ' + (environmentLed ? '局势' : '地点') + '自由切换</span>'
         : (beatIndex ? ' <span class="muted">· 当前节拍 ' + beatIndex + ' / ' + activePlan.beats.length + '</span>' : ''));
   } else {
     planStatus.className = "runtime-plan-status pending";
@@ -3483,13 +3888,27 @@ function renderRuntime() {
   const scene = currentRuntimeCard();
   $("runtime-exploration-list").innerHTML = sceneCards.length
     ? sceneCards.map((card) => '<button type="button" class="exploration-node ' + (card.id === scene?.id ? 'selected' : '') + '" data-runtime-scene="' + esc(card.id) + '"><strong>' + esc(card.title) + '</strong><span>' + esc(profileDefinition(card.profile_id, card.type).display_name) + '</span></button>').join("")
-    : '<div class="empty-state">当前计划还没有可探索地点。</div>';
+    : '<div class="empty-state">当前计划还没有可运行的' + (environmentLed ? '局势' : '地点') + '。</div>';
+  if (environmentLed && runtimeNarrative.beat !== "all") {
+    const buttons = (cards) => cards.map((card) => '<button type="button" class="exploration-node ' +
+      (card.id === scene?.id ? 'selected' : '') + '" data-runtime-scene="' + esc(card.id) + '"><strong>' +
+      esc(card.title) + '</strong><span>环境卡</span></button>').join('');
+    const linked = sceneCards.filter(runtimeBeatIncludes);
+    const others = sceneCards.filter((card) => !runtimeBeatIncludes(card));
+    $("runtime-exploration-list").innerHTML = buttons(linked) +
+      (!linked.length ? '<p class="muted">该拍暂无关联环境。</p>' : '') +
+      (others.length ? '<details><summary>本章其他环境 · ' + others.length + '</summary>' + buttons(others) + '</details>' : '');
+  }
   $("scene-holder").innerHTML = scene ?
-    '<article class="domain-card selected runtime-scene-card"><div class="card-title-row"><div><div class="card-title">' + esc(scene.title) + '</div><p class="card-subtitle">' + esc(scene.subtitle || '当前地点') + '</p></div>' + badge('当前地点', 'accent') + '</div>' +
-    runtimeCardFieldsHtml(scene) + locationTriggersHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues) + locationMaterialsHtml(activePlan, scene) + sourceHtml(scene.fact_ids) + '</article>' :
+    '<article class="domain-card selected runtime-scene-card"><div class="card-title-row"><div><div class="card-title">' + esc(scene.title) + '</div><p class="card-subtitle">' + esc(scene.subtitle || (environmentLed ? '当前局势' : '当前地点')) + '</p></div>' + badge(environmentLed ? '当前局势' : '当前地点', 'accent') + '</div>' +
+    runtimeCardFieldsHtml(scene) + (environmentLed ? runtimeGroupHtml(scene) : locationTriggersHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues)) + locationMaterialsHtml(activePlan, scene) + sourceHtml(scene.fact_ids) + '</article>' :
     '<div class="empty-state">当前板块暂无场景级卡。请先完成该板块的产物生成与复核。</div>';
 
-  const clocks = runtimeCards(["clock", "operation_clock", "encounter_clock"]);
+  const allClocks = runtimeCards(["clock", "operation_clock", "encounter_clock"]);
+  const currentGroups = new Set(scene?.runtime_group_ids || []);
+  const clocks = environmentLed
+    ? allClocks.filter((clock) => (clock.runtime_group_ids || []).some((groupId) => currentGroups.has(groupId)))
+    : allClocks;
   $("runtime-clocks").innerHTML = clocks.map((clock) => {
     const stages = Array.isArray(clock.fields.stages) ? clock.fields.stages : [];
     const stage = state.session.clock_stages[clock.id] ?? 0;
@@ -3514,11 +3933,11 @@ function renderRuntime() {
     return '<div class="session-log-entry">' +
       badge(eventLabel, accentEvents.includes(entry.kind) ? 'accent' : 'neutral') +
       '<span>' + esc(entry.text) + '</span><time>' +
-      esc(entry.created_at.replace('T', ' ').slice(0, 16)) + '</time></div>';
+      esc(localDateTime(entry.created_at)) + '</time></div>';
   }).join("") || '<div class="muted">还没有运行记录。</div>';
   $("session-notes").value = state.session.notes || '';
   $("session-status").textContent = state.sessionState === 'saved' && state.sessionUpdatedAt
-    ? (state.sessionDirty ? '运行状态待保存' : '运行状态已保存 ' + state.sessionUpdatedAt.replace('T', ' ').slice(0, 16))
+    ? (state.sessionDirty ? '运行状态待保存' : '运行状态已保存 ' + localDateTime(state.sessionUpdatedAt))
     : state.sessionState === 'invalid' ? '存档无效，使用新状态' : '未保存的本次运行';
 }
 
@@ -3538,16 +3957,89 @@ function runtimePlanCards() {
   const plan = currentPlan();
   if (!plan || !state.data?.bundle) return [];
   const ids = new Set(plan.card_ids || []);
-  return state.data.bundle.cards.filter((card) => ids.has(card.id));
+  return state.data.bundle.cards.filter((card) => ids.has(card.id) && runtimeChapterIncludes(card));
+}
+
+const runtimeNarrative = {workspace: null, chapter: "all", beat: "all"};
+
+function runtimeChapterIncludes(card) {
+  return currentPlan()?.navigation_mode !== "environment" || runtimeNarrative.chapter === "all" ||
+    (card.chapter_ids || []).includes(runtimeNarrative.chapter);
+}
+
+function runtimeBeatIncludes(card) {
+  if (currentPlan()?.navigation_mode !== "environment" || runtimeNarrative.beat === "all") return true;
+  const beat = (state.data.bundle.story_beats || []).find((item) => item.id === runtimeNarrative.beat);
+  if (!beat) return true;
+  if (!(card.chapter_ids || []).includes(beat.chapter_id)) return false;
+  return (card.story_beat_ids || []).includes(beat.id);
 }
 
 function renderRuntimeOverview() {
   const host = $("runtime-overview");
   if (!host) return;
-  const overview = runtimePlanCards().find((card) => card.type === "chapter_overview");
-  host.innerHTML = overview
-    ? '<article class="domain-card runtime-overview-card"><div class="card-title-row"><div class="card-title">' + esc(overview.title) + '</div>' + badge('章节总览', 'accent') + '</div>' + runtimeCardFieldsHtml(overview) + sourceHtml(overview.fact_ids) + '</article>'
-    : '<div class="empty-state">当前运行计划没有章节总览卡。</div>';
+  const bundle = state.data?.bundle;
+  const chapters = currentPlan()?.navigation_mode === "environment" ? bundle?.adventure_chapters || [] : [];
+  if (runtimeNarrative.workspace !== bundle?.id) {
+    Object.assign(runtimeNarrative, {workspace: bundle?.id, chapter: "all", beat: "all"});
+  }
+  $("runtime-narrative-controls").hidden = !chapters.length;
+  $("runtime-chapter-reference").innerHTML = "";
+  if (chapters.length) {
+    if (!chapters.some((chapter) => chapter.id === runtimeNarrative.chapter)) runtimeNarrative.chapter = "all";
+    $("runtime-chapter").innerHTML = '<option value="all">全部章节</option>' + chapters.map((chapter) =>
+      '<option value="' + esc(chapter.id) + '">' + esc(chapter.title) + '</option>').join('');
+    $("runtime-chapter").value = runtimeNarrative.chapter;
+    const beats = (bundle.story_beats || []).filter((beat) => runtimeNarrative.chapter === "all" || beat.chapter_id === runtimeNarrative.chapter);
+    if (!beats.some((beat) => beat.id === runtimeNarrative.beat)) runtimeNarrative.beat = "all";
+    $("runtime-story-beat").innerHTML = '<option value="all">全部环境</option>' + beats.map((beat) =>
+      '<option value="' + esc(beat.id) + '">' + esc(beat.title) + '</option>').join('');
+    $("runtime-story-beat").value = runtimeNarrative.beat;
+    $("runtime-chapter").onchange = (event) => {
+      runtimeNarrative.chapter = event.target.value;
+      runtimeNarrative.beat = "all";
+      renderRuntime();
+    };
+    $("runtime-story-beat").onchange = (event) => {
+      runtimeNarrative.beat = event.target.value;
+      renderRuntime();
+    };
+    const beat = beats.find((item) => item.id === runtimeNarrative.beat);
+    const chapter = chapters.find((item) => item.id ===
+      (runtimeNarrative.chapter === "all" ? beat?.chapter_id : runtimeNarrative.chapter));
+    host.innerHTML = chapter
+      ? '<h3>' + esc(chapter.title) + '</h3><p>' + esc(chapter.summary) + '</p>' +
+        (chapter.overview ? runtimeCardFieldsHtml({fields: chapter.overview}) + sourceHtml(chapter.overview.fact_ids) : '')
+      : chapters.map((item) => '<details><summary>' + esc(item.title) + '</summary><p>' + esc(item.summary) + '</p></details>').join('');
+    if (beat) {
+      const hasMatches = runtimeConfirmedSceneCards().some(runtimeBeatIncludes);
+      host.innerHTML += '<h3>' + esc(beat.title) + '</h3><p>' + esc(beat.summary) + '</p>' +
+        beatThreadDevelopmentHtml(beat, bundle.story_threads || []) +
+        (hasMatches ? '' : '<p class="muted">该拍暂无明确关联环境；可查阅本章其他环境。</p>') + sourceHtml(beat.fact_ids);
+    }
+    if (chapter) {
+      host.innerHTML += chapterThreadDistributionHtml(chapter, bundle.story_threads || [], bundle.story_beats || []);
+    }
+    const refs = chapter ? chapter.reference_fact_ids || [] : [];
+    const covered = new Set([...(chapter?.overview?.fact_ids || []),
+      ...runtimePlanCards().flatMap((card) => card.fact_ids || [])]);
+    const referenceOnly = refs.filter((id) => !covered.has(id));
+    const globals = (bundle.fact_dispositions || []).filter((item) => item.kind === 'global_reference').map((item) => item.fact_id);
+    $("runtime-chapter-reference").innerHTML =
+      (refs.length ? '<details><summary>章节参考资料 · ' + refs.length + ' · 仅参考 ' + referenceOnly.length + '</summary>' + sourceHtml(refs) + '</details>' : '') +
+      (globals.length ? '<details><summary>全局参考资料 · ' + globals.length + '</summary>' + sourceHtml(globals) + '</details>' : '');
+    return;
+  }
+  const brief = bundle?.runtime_brief;
+  if (currentPlan()?.navigation_mode === "location") {
+    host.innerHTML = runtimeCards(["chapter_overview"]).map((card) =>
+      '<h3>' + esc(card.title) + '</h3>' + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids)).join('') ||
+      '<div class="empty-state">当前计划暂无章节总览。</div>';
+    return;
+  }
+  host.innerHTML = brief
+    ? '<article class="domain-card runtime-overview-card"><div class="card-title-row"><div class="card-title">运行包摘要</div>' + badge('运行包元数据', 'accent') + '</div>' + runtimeCardFieldsHtml({fields: brief}) + sourceHtml(brief.fact_ids) + '</article>'
+    : '<div class="empty-state">当前运行计划没有运行包摘要。</div>';
 }
 
 function renderRuntimeReferenceCards() {
@@ -3808,6 +4300,10 @@ function bindEvents() {
     state.factVisibility = event.target.value;
     renderFacts();
   });
+  $("fact-structure").addEventListener("change", (event) => {
+    state.factStructure = event.target.value;
+    renderFacts();
+  });
   $("card-profile").addEventListener("change", (event) => {
     state.cardProfile = event.target.value;
     refreshCardTypes();
@@ -3817,10 +4313,15 @@ function bindEvents() {
     state.cardType = event.target.value;
     renderCards();
   });
+  $("card-chapter").addEventListener("change", (event) => {
+    state.cardChapter = event.target.value;
+    renderCards();
+  });
   $("card-select-all").addEventListener("change", (event) => {
     const visibleCards = state.data.bundle.cards.filter((card) =>
       (state.cardProfile === "all" || card.profile_id === state.cardProfile) &&
-      (state.cardType === "all" || card.type === state.cardType)
+      (state.cardType === "all" || card.type === state.cardType) &&
+      (state.cardChapter === "all" || (card.chapter_ids || []).includes(state.cardChapter))
     );
     if (event.target.checked) {
       visibleCards.forEach((card) => state.selectedCardIds.add(card.id));
@@ -3843,6 +4344,8 @@ function bindEvents() {
     reviewCards(selectedCardIdsForReview("reopen"), "reopen")
   );
   $("draft-artifacts").addEventListener("click", draftArtifacts);
+  $("draft-structure")?.addEventListener("click", draftAdventureStructure);
+  $("approve-structure")?.addEventListener("click", approveAdventureStructure);
   $("open-artifacts").addEventListener("click", () => showView("cards"));
   $("review-refresh").addEventListener("click", () => {
     state.review.notice = "";
@@ -3976,6 +4479,14 @@ function bindEvents() {
   $("card-editor").addEventListener("submit", submitCardEditor);
 
   document.addEventListener("click", (event) => {
+    const structureFacts = event.target.closest("[data-structure-facts]");
+    if (structureFacts) {
+      state.factStructure = structureFacts.dataset.structureFacts;
+      showView("facts");
+      renderFacts();
+      window.scrollTo({top: 0, behavior: "smooth"});
+      return;
+    }
     const viewTarget = event.target.closest("[data-view-target]");
     if (viewTarget) {
       showView(viewTarget.dataset.viewTarget);
@@ -4194,6 +4705,9 @@ async function init() {
       state.artifacts.job = null;
       state.artifacts.retryingJobId = null;
     }
+    state.structure.job = state.data.structure_job || null;
+    state.structure.generating = structureJobInFlight(state.structure.job);
+    scheduleStructurePoll();
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     scheduleArtifactPoll();
     await Promise.all([

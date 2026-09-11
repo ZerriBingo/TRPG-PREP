@@ -151,7 +151,12 @@ def validate_cards(
             raise DomainValidationError(
                 f"card {card.id} refers to missing profile {card.profile_id}"
             )
-        definition = profile.definition_for(card.type)
+        try:
+            definition = profile.definition_for(card.type)
+        except ValueError as error:
+            raise DomainValidationError(
+                f"card {card.id} uses undefined type {card.type!r} for profile {card.profile_id}"
+            ) from error
 
         missing = [key for key in definition.required_fields if not _nonempty(card.fields.get(key))]
         if missing:
@@ -189,6 +194,31 @@ def validate_cards(
                     f"approved card {card.id} refers to model candidate facts: {candidate_refs}"
                 )
 
+    for profile_id, profile in profiles.items():
+        if profile.runtime_navigation_mode != "environment":
+            continue
+        profile_cards = [card for card in cards if card.profile_id == profile_id]
+        environments = [
+            card for card in profile_cards if card.type == profile.runtime_anchor_type
+        ]
+        groups = {
+            group_id
+            for card in profile_cards
+            for group_id in card.runtime_group_ids
+        }
+        for group_id in groups:
+            anchors = [
+                card.id
+                for card in environments
+                if group_id in card.runtime_group_ids
+            ]
+            if not anchors:
+                raise DomainValidationError(
+                    f"runtime group {group_id} is missing environment anchor"
+                )
+            # One support card may be relevant to several possible environments.
+            # A group remains a retrieval hint and never fixes encounter order.
+
 
 def validate_bundle(
     bundle: ExampleBundle, profiles: Mapping[str, RuleProfile]
@@ -198,10 +228,157 @@ def validate_bundle(
         raise DomainValidationError(f"bundle refers to missing profiles: {missing_profiles}")
 
     fact_index = validate_fact_graph(bundle.facts)
+    prep_unit_ids = {unit.id for unit in bundle.prep_units}
+    if len(prep_unit_ids) != len(bundle.prep_units):
+        raise DomainValidationError("duplicate preparation unit id")
+    invalid_unit_profiles = [
+        unit.id for unit in bundle.prep_units if unit.profile_id not in bundle.profile_ids
+    ]
+    if invalid_unit_profiles:
+        raise DomainValidationError(
+            f"preparation units refer to profiles outside the bundle: {invalid_unit_profiles}"
+        )
     validate_cards(bundle.cards, profiles, bundle.facts)
+    invalid_card_units = [
+        card.id for card in bundle.cards
+        if card.prep_unit_id is not None and card.prep_unit_id not in prep_unit_ids
+    ]
+    if invalid_card_units:
+        raise DomainValidationError(
+            f"cards refer to missing preparation units: {invalid_card_units}"
+        )
     card_ids = {card.id for card in bundle.cards}
     cards_by_id = {card.id: card for card in bundle.cards}
     fact_ids = {fact.id for fact in bundle.facts}
+    for unit in bundle.prep_units:
+        missing_member_facts = [
+            fact_id for fact_id in unit.fact_ids if fact_id not in fact_ids
+        ]
+        if missing_member_facts:
+            raise DomainValidationError(
+                f"prep chapter {unit.id} refers to missing facts: {missing_member_facts}"
+            )
+    chapter_ids: set[str] = set()
+    for chapter in bundle.adventure_chapters:
+        if chapter.id in chapter_ids:
+            raise DomainValidationError(f"duplicate adventure chapter id: {chapter.id}")
+        chapter_ids.add(chapter.id)
+        if set(chapter.reference_fact_ids) - set(chapter.fact_ids):
+            raise DomainValidationError(f"chapter {chapter.id} reference facts must belong to that chapter")
+        missing_chapter_facts = [
+            fact_id for fact_id in chapter.fact_ids if fact_id not in fact_ids
+        ]
+        if missing_chapter_facts:
+            raise DomainValidationError(
+                f"adventure chapter {chapter.id} refers to missing facts: {missing_chapter_facts}"
+            )
+    invalid_card_chapters = [
+        card.id
+        for card in bundle.cards
+        if any(chapter_id not in chapter_ids for chapter_id in card.chapter_ids)
+    ]
+    if invalid_card_chapters:
+        raise DomainValidationError(
+            f"cards refer to missing adventure chapters: {invalid_card_chapters}"
+        )
+    thread_ids: set[str] = set()
+    for thread in bundle.story_threads:
+        if thread.id in thread_ids:
+            raise DomainValidationError(f"duplicate story thread id: {thread.id}")
+        thread_ids.add(thread.id)
+        missing_thread_chapters = [
+            chapter_id for chapter_id in thread.chapter_roles if chapter_id not in chapter_ids
+        ]
+        if missing_thread_chapters:
+            raise DomainValidationError(
+                f"story thread {thread.id} refers to missing adventure chapters: "
+                f"{missing_thread_chapters}"
+            )
+        missing_thread_facts = [
+            fact_id for fact_id in thread.fact_ids if fact_id not in fact_ids
+        ]
+        if missing_thread_facts:
+            raise DomainValidationError(
+                f"story thread {thread.id} refers to missing facts: {missing_thread_facts}"
+            )
+    beat_ids: set[str] = set()
+    for beat in bundle.story_beats:
+        if beat.id in beat_ids:
+            raise DomainValidationError(f"duplicate story beat id: {beat.id}")
+        beat_ids.add(beat.id)
+        if beat.chapter_id not in chapter_ids:
+            raise DomainValidationError(
+                f"story beat {beat.id} refers to missing adventure chapter: {beat.chapter_id}"
+            )
+        missing_beat_threads = [
+            thread_id for thread_id in beat.thread_ids if thread_id not in thread_ids
+        ]
+        if missing_beat_threads:
+            raise DomainValidationError(
+                f"story beat {beat.id} refers to missing story threads: {missing_beat_threads}"
+            )
+        inapplicable_threads = [
+            thread.id for thread in bundle.story_threads
+            if thread.id in beat.thread_ids and beat.chapter_id not in thread.chapter_roles
+        ]
+        if inapplicable_threads:
+            raise DomainValidationError(
+                f"story beat {beat.id} refers to inapplicable story threads: {inapplicable_threads}"
+            )
+        missing_beat_facts = [fact_id for fact_id in beat.fact_ids if fact_id not in fact_ids]
+        if missing_beat_facts:
+            raise DomainValidationError(
+                f"story beat {beat.id} refers to missing facts: {missing_beat_facts}"
+            )
+    disposition_ids: set[str] = set()
+    beats_by_id = {beat.id: beat for beat in bundle.story_beats}
+    for card in bundle.cards:
+        for beat_id in card.story_beat_ids:
+            beat = beats_by_id.get(beat_id)
+            if card.type != "environment" or beat is None or beat.chapter_id not in card.chapter_ids:
+                raise DomainValidationError(f"card {card.id} has invalid story beat link: {beat_id}")
+    for disposition in bundle.fact_dispositions:
+        if disposition.fact_id in disposition_ids:
+            raise DomainValidationError(
+                f"duplicate fact disposition: {disposition.fact_id}"
+            )
+        disposition_ids.add(disposition.fact_id)
+        if disposition.fact_id not in fact_ids:
+            raise DomainValidationError(
+                f"fact disposition refers to missing fact: {disposition.fact_id}"
+            )
+        missing_disposition_chapters = [
+            chapter_id
+            for chapter_id in disposition.chapter_ids
+            if chapter_id not in chapter_ids
+        ]
+        if missing_disposition_chapters:
+            raise DomainValidationError(
+                f"fact disposition refers to missing adventure chapters: "
+                f"{missing_disposition_chapters}"
+            )
+        missing_disposition_threads = [
+            thread_id
+            for thread_id in disposition.thread_ids
+            if thread_id not in thread_ids
+        ]
+        if missing_disposition_threads:
+            raise DomainValidationError(
+                f"fact disposition refers to missing story threads: "
+                f"{missing_disposition_threads}"
+            )
+    if chapter_ids and all(
+        chapter.review_state == "approved" for chapter in bundle.adventure_chapters
+    ):
+        promoted_fact_ids = {
+            fact.id for fact in bundle.facts if fact.evidence_status != "model_candidate"
+        }
+        missing_dispositions = sorted(promoted_fact_ids - disposition_ids)
+        if missing_dispositions:
+            raise DomainValidationError(
+                f"approved adventure structure leaves facts without disposition: "
+                f"{missing_dispositions[:20]}"
+            )
     material_ids: set[str] = set()
     materials_by_id: dict[str, DisplayMaterial] = {}
     for material in bundle.display_materials:
@@ -254,6 +431,15 @@ def validate_bundle(
             raise DomainValidationError(f"plan {plan.id} refers to a profile outside the bundle")
         if profiles[plan.profile_id].profile_kind != "runtime":
             raise DomainValidationError(f"plan {plan.id} refers to a preparation-only profile")
+        if plan.prep_unit_id is not None and plan.prep_unit_id not in prep_unit_ids:
+            raise DomainValidationError(
+                f"plan {plan.id} refers to a missing preparation unit"
+            )
+        plan_profile = profiles[plan.profile_id]
+        if plan.navigation_mode != plan_profile.runtime_navigation_mode:
+            raise DomainValidationError(
+                f"plan {plan.id} navigation does not match its runtime profile"
+            )
         if len(plan.card_ids) != len(set(plan.card_ids)):
             raise DomainValidationError(f"plan {plan.id} contains duplicate card ids")
         missing_cards = [card_id for card_id in plan.card_ids if card_id not in card_ids]
@@ -267,6 +453,15 @@ def validate_bundle(
             raise DomainValidationError(
                 f"plan {plan.id} refers to cards from another profile: {plan_profile_mismatches}"
             )
+        if plan.prep_unit_id is not None:
+            plan_unit_mismatches = [
+                card_id for card_id in plan.card_ids
+                if cards_by_id[card_id].prep_unit_id not in {None, plan.prep_unit_id}
+            ]
+            if plan_unit_mismatches:
+                raise DomainValidationError(
+                    f"plan {plan.id} refers to cards from another preparation unit: {plan_unit_mismatches}"
+                )
         unapproved_cards = [
             card_id for card_id in plan.card_ids
             if cards_by_id[card_id].edit_state != "approved"
@@ -275,18 +470,24 @@ def validate_bundle(
             raise DomainValidationError(
                 f"plan {plan.id} refers to unapproved cards: {unapproved_cards}"
             )
-        if not any(
-            cards_by_id[card_id].type in SCENE_PLAN_ANCHOR_TYPES
-            for card_id in plan.card_ids
-        ):
-            raise DomainValidationError(f"plan {plan.id} has no runtime location card")
+        anchor_type = plan_profile.runtime_anchor_type
+        if not any(cards_by_id[card_id].type == anchor_type for card_id in plan.card_ids):
+            raise DomainValidationError(f"plan {plan.id} has no runtime anchor card")
         expected_location_ids = [
             card_id for card_id in plan.card_ids
-            if cards_by_id[card_id].type in SCENE_PLAN_ANCHOR_TYPES
+            if cards_by_id[card_id].type == "location" and anchor_type == "location"
         ]
         if plan.location_card_ids != expected_location_ids:
             raise DomainValidationError(
                 f"plan {plan.id} location index does not match its runtime cards"
+            )
+        expected_environment_ids = [
+            card_id for card_id in plan.card_ids
+            if cards_by_id[card_id].type == "environment" and anchor_type == "environment"
+        ]
+        if plan.environment_card_ids != expected_environment_ids:
+            raise DomainValidationError(
+                f"plan {plan.id} environment index does not match its runtime cards"
             )
         plan_fact_ids = [
             fact_id
@@ -346,9 +547,12 @@ def validate_bundle(
                     f"display material {material.id} refers to missing plan {link.plan_id}"
                 )
             if link.card_id is not None:
-                if link.card_id not in plan.location_card_ids:
+                if link.card_id not in {
+                    *plan.location_card_ids,
+                    *plan.environment_card_ids,
+                }:
                     raise DomainValidationError(
-                        f"display material {material.id} refers to a location outside plan {plan.id}"
+                        f"display material {material.id} refers to an anchor outside plan {plan.id}"
                     )
                 continue
             if link.beat_id not in {beat.id for beat in plan.beats}:
@@ -379,8 +583,8 @@ def validate_session(session: SessionState, bundle: ExampleBundle) -> None:
             raise DomainValidationError("session points to a missing scene beat")
     if session.current_plan_id is not None:
         active_plan = plan_by_id[session.current_plan_id]
-        if active_plan.navigation_mode == "location" and session.current_beat_id is not None:
-            raise DomainValidationError("location-led runtime cannot point to a scene beat")
+        if active_plan.navigation_mode in {"location", "environment"} and session.current_beat_id is not None:
+            raise DomainValidationError("anchor-led runtime cannot point to a scene beat")
     if session.current_plan_id is not None and session.current_card_id is not None:
         if session.current_card_id not in plan_by_id[session.current_plan_id].card_ids:
             raise DomainValidationError("session current card is outside the current scene plan")
@@ -628,6 +832,7 @@ def draft_scene_plan(
     source_pages: list[int],
     premise: str,
     profile: RuleProfile | None = None,
+    prep_unit_id: str | None = None,
 ) -> ScenePlan:
     """Build a deterministic, editable scene skeleton from confirmed cards.
 
@@ -668,7 +873,8 @@ def draft_scene_plan(
     def rule_focus(mode: str) -> str | None:
         return profile.scene_guidance.get(mode) if profile is not None else None
 
-    scene_cards = [card for card in selected if card.type in SCENE_PLAN_ANCHOR_TYPES]
+    anchor_type = profile.runtime_anchor_type if profile is not None else None
+    scene_cards = [card for card in selected if card.type == anchor_type]
     npc_cards = [card for card in selected if card.type in {"npc", "character"}]
     clock_cards = [card for card in selected if card.type in {"clock", "operation_clock", "encounter_clock"}]
     threat_cards = [card for card in selected if card.type in {"threat", "enemy", "anomaly"}]
@@ -684,7 +890,7 @@ def draft_scene_plan(
     # Overview/support cards do not change the navigation model. A plan with
     # location anchors remains location-led even when it also includes the
     # chapter overview, NPCs, threats, clocks, or display references.
-    location_led = bool(scene_cards) and all(card.type == "location" for card in scene_cards)
+    location_led = profile is not None and profile.runtime_navigation_mode == "location"
     if location_led:
         slug = re.sub(r"[^a-z0-9_-]+", "_", title.lower()).strip("_") or "runtime"
         plan_id = "plan_" + bundle.id + "_" + slug
@@ -699,6 +905,7 @@ def draft_scene_plan(
         return ScenePlan(
             id=candidate_id,
             profile_id=profile_id,
+            prep_unit_id=prep_unit_id,
             title=title,
             source_file=source_file,
             source_pages=source_pages,
@@ -706,8 +913,35 @@ def draft_scene_plan(
             card_ids=[card.id for card in selected],
             navigation_mode="location",
             location_card_ids=[card.id for card in scene_cards],
+            environment_card_ids=[],
             beats=[],
             exit_states=endings if isinstance(endings, list) else [],
+        )
+
+    environment_led = profile is not None and profile.runtime_navigation_mode == "environment"
+    if environment_led:
+        slug = re.sub(r"[^a-z0-9_-]+", "_", title.lower()).strip("_") or "runtime"
+        plan_id = "plan_" + bundle.id + "_" + slug
+        existing_ids = {item.id for item in bundle.plans}
+        suffix = 2
+        candidate_id = plan_id
+        while candidate_id in existing_ids:
+            candidate_id = plan_id + "_" + str(suffix)
+            suffix += 1
+        return ScenePlan(
+            id=candidate_id,
+            profile_id=profile_id,
+            prep_unit_id=prep_unit_id,
+            title=title,
+            source_file=source_file,
+            source_pages=source_pages,
+            premise=premise,
+            card_ids=[card.id for card in selected],
+            navigation_mode="environment",
+            location_card_ids=[],
+            environment_card_ids=[card.id for card in scene_cards],
+            beats=[],
+            exit_states=[],
         )
 
     beats: list[SceneBeat] = []
@@ -838,6 +1072,7 @@ def draft_scene_plan(
         card_ids=[card.id for card in selected],
         navigation_mode="beat",
         location_card_ids=[card.id for card in scene_cards],
+        environment_card_ids=[],
         beats=beats,
         exit_states=["带着新线索离开", "压力升级后转场", "目标改变", "暂时失败但故事继续"],
     )
@@ -850,6 +1085,7 @@ def draft_scene_plan_from_workspace(
     profile_id: str | None = None,
     source_file: str | None = None,
     source_pages: list[int] | None = None,
+    prep_unit_id: str | None = None,
 ) -> ScenePlan:
     """Draft from persisted workspace context without accepting GM-authored inputs.
 
@@ -875,7 +1111,6 @@ def draft_scene_plan_from_workspace(
     # Standalone bundles without scope retain the historical all-approved-card
     # assembly path.
     fact_index = {fact.id: fact for fact in bundle.facts}
-
     def card_matches_scope(card: DerivedCard) -> bool:
         """Keep an assembled plan inside its task-owned source scope."""
         if not trusted_source or not trusted_pages:
@@ -938,7 +1173,9 @@ def draft_scene_plan_from_workspace(
 
     anchor = scene_cards[0]
     opening = anchor.fields.get("opening_image") or anchor.fields.get("situation")
-    if isinstance(opening, str) and opening.strip():
+    if bundle.runtime_brief is not None:
+        premise = bundle.runtime_brief.premise
+    elif isinstance(opening, str) and opening.strip():
         premise = f"{anchor.title}：{opening.strip()}"
     else:
         premise = f"以「{anchor.title}」为当前情境，具体走向由桌边行动决定。"
@@ -951,6 +1188,7 @@ def draft_scene_plan_from_workspace(
         trusted_pages,
         premise,
         profile=profiles[profile_id],
+        prep_unit_id=prep_unit_id,
     )
 
 

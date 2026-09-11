@@ -1,4 +1,5 @@
 """Generate source-bound preparation artifact drafts from promoted shelf facts."""
+
 from __future__ import annotations
 
 import hashlib
@@ -6,13 +7,14 @@ import json
 import re
 import threading
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from . import prep, storage
 from .llm import make_client
-from ..domain import load_profiles, validate_bundle
+from .planning_transport import PlanningTransport
+from ..domain import PrepUnit, RuntimeBrief, load_profiles, validate_bundle
 from ..domain.models import (
     ArtifactDraftJob,
     CardGeneration,
@@ -22,8 +24,8 @@ from ..domain.models import (
 )
 
 
-PROMPT_VERSION = "prep-artifact-draft-v2"
-GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v3"
+PROMPT_VERSION = "prep-artifact-draft-v7"
+GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v11"
 MAX_FACT_INPUT_CHARS = 120_000
 # Keep individual model requests comfortably below the hard input ceiling.  A
 # single artifact job may contain several of these batches; the final cards are
@@ -32,8 +34,10 @@ MAX_FACT_BATCH_CHARS = 80_000
 MAX_SINGLE_FACT_CHARS = MAX_FACT_BATCH_CHARS
 MAX_FACT_BATCH_TOKENS = 22_000
 MAX_SINGLE_FACT_TOKENS = MAX_FACT_BATCH_TOKENS
+MAX_FACTS_PER_BATCH = 200
 # This is a technical guard against an accidentally unbounded model response,
 # not a product rule that may force useful entities into one card.
+# Bound individual model responses, not the combined output of all chapters.
 MAX_DRAFT_CARDS = 120
 MAX_LOCAL_UNITS = 120
 MAX_LOCAL_OPEN_QUESTIONS = 120
@@ -41,9 +45,15 @@ MAX_JOB_OPEN_QUESTION_PREVIEW = 50
 MAX_CARD_FACT_INPUT_CHARS = 72_000
 MAX_CARD_FACT_INPUT_TOKENS = 22_000
 LOCAL_DIGEST_MAX_TOKENS = 7000
-GLOBAL_PLAN_MAX_TOKENS = 7000
+GLOBAL_PLAN_MAX_TOKENS = 12000
 ARTIFACT_REQUEST_TIMEOUT = 300
 ARTIFACT_MAX_TOKENS = 9000
+
+
+class ArtifactDraftRequest(BaseModel):
+    """The completed preparation task already owns the artifact source scope."""
+
+    model_config = ConfigDict(extra="forbid")
 LIST_FIELDS = {
     "immediate_actions",
     "direct_clues",
@@ -57,6 +67,7 @@ LIST_FIELDS = {
     "usable_features",
     "hazards",
     "positioning",
+    "sensory_details",
     "environment_changes",
     "signature_actions",
     "resolutions",
@@ -71,8 +82,24 @@ LIST_FIELDS = {
     "consequences",
     "display_materials",
     "return_changes",
+    "major_conflicts",
+    "opening_conditions",
+    "possible_endings",
+    "factions",
+    "cross_environment_consequences",
+    "impulses",
+    "gm_responses",
+    "phase_changes",
+    "exit_outcomes",
+    "triggers",
+    "potential_adversaries",
+    "motives",
+    "attitude_changes",
+    "choices",
+    "complications",
 }
 RUNTIME_ANCHOR_TYPES = {"location", "environment"}
+GM_AUTHORED_FIELDS = {"gm_moves", "gm_responses"}
 
 _active_jobs: set[str] = set()
 _active_jobs_lock = threading.Lock()
@@ -186,6 +213,14 @@ def _run_json_step(
         "created_at": timestamp,
     }
     attempts = list(step.get("attempts") or [])
+    resume_plan = None
+    if stage == "global_plan" and attempts and attempts[-1].get("response"):
+        try:
+            validator(attempts[-1]["response"])
+        except PlanCoverageError:
+            resume_plan = attempts[-1]["response"]
+        except Exception:
+            pass
     working_messages = [dict(message) for message in messages]
     step.update(status="running", updated_at=timestamp, error=None)
     storage.save_artifact_job_step(step)
@@ -196,13 +231,18 @@ def _run_json_step(
         attempt_number = len(attempts) + 1
         started_at = storage.now()
         try:
-            raw = client.chat_json(
+            raw = resume_plan if resume_plan is not None else client.chat_json(
                 working_messages,
                 temperature=0.15,
                 max_tokens=max_tokens,
                 request_timeout=ARTIFACT_REQUEST_TIMEOUT,
             )
-            output = validator(raw)
+            resume_plan = None
+            try:
+                output = validator(raw)
+            except PlanCoverageError as coverage:
+                raw = _complete_plan_coverage(job, stage, step_index, raw, coverage, client, validator)
+                output = validator(raw)
         except Exception as error:  # noqa: BLE001
             last_error = error
             attempts.append(
@@ -224,7 +264,7 @@ def _run_json_step(
                 updated_at=storage.now(),
             )
             storage.save_artifact_job_step(step)
-            if raw is None or correction_attempt == 1:
+            if raw is None or correction_attempt == 1 or isinstance(error, PlanCoverageError):
                 raise
             working_messages.extend(
                 [
@@ -384,6 +424,7 @@ def create_artifact_job(
     *,
     model_id: str,
     fake_model: bool,
+    prep_unit_id: str | None = None,
 ) -> tuple[ArtifactDraftJob, bool]:
     """Create one durable, full-scope artifact request."""
     with _active_jobs_lock:
@@ -407,19 +448,19 @@ def create_artifact_job(
         if active is not None:
             same_request = (
                 active.profile_id == profile_id
+                and active.prep_unit_id == prep_unit_id
                 and active.model_id == model_id
                 and active.fake_model == fake_model
             )
             if same_request:
                 return active, False
-            raise ArtifactJobConflictError(
-                "当前已有整板生成任务在运行，请等待该任务完成后再试"
-            )
+            raise ArtifactJobConflictError("当前已有整板生成任务在运行，请等待该任务完成后再试")
         timestamp = storage.now()
         job = ArtifactDraftJob(
             id=f"artifact_job_{uuid.uuid4().hex}",
             workspace_id=workspace_id,
             profile_id=profile_id,
+            prep_unit_id=prep_unit_id,
             model_id=model_id,
             fake_model=fake_model,
             status="queued",
@@ -471,9 +512,15 @@ def retry_artifact_job(
         ), True
 
 
-def has_profile_artifacts(bundle: ExampleBundle, profile_id: str) -> bool:
+def has_profile_artifacts(
+    bundle: ExampleBundle, profile_id: str, prep_unit_id: str | None = None
+) -> bool:
     """Return whether a bookshelf already contains cards for one profile."""
-    return any(card.profile_id == profile_id for card in bundle.cards)
+    return any(
+        card.profile_id == profile_id
+        and (prep_unit_id is None or card.prep_unit_id == prep_unit_id)
+        for card in bundle.cards
+    )
 
 
 def get_artifact_job(job_id: str) -> ArtifactDraftJob:
@@ -520,9 +567,18 @@ def execute_artifact_job(
             )
         client = make_client(model_id=job.model_id, force_fake=job.fake_model)
         scoped_facts = _facts_for_workspace(bundle, workspace_id)
+        if profile_id == "daggerheart" and bundle.fact_dispositions:
+            artifact_fact_ids = {
+                item.fact_id
+                for item in bundle.fact_dispositions
+                if item.kind == "chapter"
+            }
+            scoped_facts = [
+                fact for fact in scoped_facts if fact.id in artifact_fact_ids
+            ]
         if not scoped_facts:
             raise ArtifactGenerationError("书架没有可用于生成产物的已提升事实")
-        batches = _fact_batches(scoped_facts)
+        batches = _artifact_batches(bundle, scoped_facts)
         input_fingerprint = _stable_hash(
             {
                 "prompt_version": PROMPT_VERSION,
@@ -538,6 +594,8 @@ def execute_artifact_job(
             completed_batches=0,
             card_count=0,
             unit_count=0,
+            planning_scope_count=0,
+            completed_planning_scopes=0,
             planned_card_count=0,
             completed_cards=0,
             input_fingerprint=input_fingerprint,
@@ -547,6 +605,8 @@ def execute_artifact_job(
             open_question_overflow_count=0,
         )
 
+        runtime_brief: dict[str, Any] | None = None
+        chapter_briefs: list[dict[str, Any]] = []
         # Runtime boards always pass through the planner so location coverage
         # and chapter-overview requirements are checked before materializing
         # cards. The compact direct path is reserved for non-runtime boards.
@@ -558,6 +618,7 @@ def execute_artifact_job(
                 profile,
                 client,
                 scoped_facts,
+                prep_unit_id=None,
             )
             question_summary = _OpenQuestionSummary()
             question_summary.add(questions)
@@ -570,13 +631,20 @@ def execute_artifact_job(
                 **_question_summary_fields(question_summary),
             )
         else:
-            generated_cards, question_summary, job = _generate_hierarchical_artifacts(
+            (
+                generated_cards,
+                question_summary,
+                job,
+                runtime_brief,
+                chapter_briefs,
+            ) = _generate_hierarchical_artifacts(
                 job,
                 bundle,
                 profile,
                 client,
                 scoped_facts,
                 batches,
+                prep_unit_id=None,
             )
 
         if not generated_cards:
@@ -585,11 +653,6 @@ def execute_artifact_job(
             card.type in RUNTIME_ANCHOR_TYPES for card in generated_cards
         ):
             raise ArtifactGenerationError("运行板块的产物缺少场景或环境卡")
-        if len(generated_cards) > MAX_DRAFT_CARDS:
-            raise ArtifactGenerationError(
-                f"合并后的备团产物超过 {MAX_DRAFT_CARDS} 项，请缩小备团范围"
-            )
-
         job = _save_job(_job_from_store(job_id), phase="validating")
         # Reload after the model call so a concurrent manual edit cannot be overwritten.
         latest = storage.load_domain_bundle(workspace_id)
@@ -598,14 +661,27 @@ def execute_artifact_job(
         bundle = ExampleBundle.model_validate(latest[0])
         validate_bundle(bundle, profiles)
         if has_profile_artifacts(bundle, profile_id):
-            raise ArtifactGenerationError(
-                "生成期间已有同一板块的备团产物，请刷新书架后继续复核"
-            )
+            raise ArtifactGenerationError("生成期间已有同一板块的备团产物，请刷新书架后继续复核")
+        if runtime_brief is not None:
+            bundle.runtime_brief = RuntimeBrief.model_validate(runtime_brief)
+        if profile_id == "daggerheart" and chapter_briefs:
+            briefs_by_id = {
+                item["chapter_id"]: RuntimeBrief.model_validate(item["brief"])
+                for item in chapter_briefs
+            }
+            bundle.adventure_chapters = [
+                chapter.model_copy(update={
+                    "overview": briefs_by_id.get(chapter.id),
+                    "reference_fact_ids": next(
+                        item["reference_fact_ids"] for item in chapter_briefs if item["chapter_id"] == chapter.id
+                    ),
+                })
+                for chapter in bundle.adventure_chapters
+            ]
+            bundle.runtime_brief = None
         bundle.cards.extend(generated_cards)
         validate_bundle(bundle, profiles)
-        storage.save_domain_bundle(
-            workspace_id, bundle.model_dump(mode="json", by_alias=True)
-        )
+        storage.save_domain_bundle(workspace_id, bundle.model_dump(mode="json", by_alias=True))
         _save_job(
             job,
             status="completed",
@@ -640,6 +716,7 @@ class DraftCardPayload(BaseModel):
     fields: dict[str, Any]
     field_sources: dict[str, list[str]] = Field(default_factory=dict)
     open_questions: list[str] = Field(default_factory=list, max_length=30)
+    runtime_group_ids: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("title", "subtitle")
     @classmethod
@@ -670,6 +747,15 @@ class DraftCardPayload(BaseModel):
     def normalize_questions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
+    @field_validator("runtime_group_ids")
+    @classmethod
+    def normalize_runtime_group_ids(cls, value: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+        invalid = [item for item in cleaned if not re.fullmatch(r"encounter_[a-z0-9_-]+", item)]
+        if invalid:
+            raise ValueError(f"invalid runtime group ids: {invalid}")
+        return cleaned
+
 
 class DraftResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -688,12 +774,34 @@ LOCAL_UNIT_KINDS = {
     "scene",
     "location",
     "npc",
+    "faction",
     "clue_cluster",
     "threat",
     "timeline",
     "outcome",
     "resource",
 }
+
+
+def _local_runtime_guidance(profile: RuleProfile) -> str:
+    if profile.runtime_navigation_mode == "environment":
+        return (
+            "For environment-led fantasy material, organize around each playable situation, not "
+            "every named place. A situation may be exploration, social interaction, traversal, "
+            "combat, or an event. Preserve its narrative function, active motives, pressures, "
+            "phase changes, nonviolent outcomes, and meaningful travel choices. Ordinary transit "
+            "and background-only place names stay supporting context. Do not invent or convert "
+            "game statistics. "
+        )
+    if profile.runtime_navigation_mode == "location":
+        return (
+            "For location material, create one location unit per distinct place that players can "
+            "enter, search, revisit, seek help at, or trigger an event in. Put that place's "
+            "canonical name in entity_keys; do not combine a dock, house, generator shed, workshop, "
+            "searchable room, or other actionable sublocation merely because they share an island "
+            "or building. "
+        )
+    return ""
 
 
 class LocalUnitPayload(BaseModel):
@@ -732,9 +840,7 @@ class LocalDigestResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     units: list[LocalUnitPayload] = Field(min_length=1, max_length=MAX_LOCAL_UNITS)
-    open_questions: list[str] = Field(
-        default_factory=list, max_length=MAX_LOCAL_OPEN_QUESTIONS
-    )
+    open_questions: list[str] = Field(default_factory=list, max_length=MAX_LOCAL_OPEN_QUESTIONS)
 
     @field_validator("open_questions")
     @classmethod
@@ -751,15 +857,31 @@ class PlannedCardPayload(BaseModel):
     fact_ids: list[str] = Field(min_length=1, max_length=100)
     focus: list[str] = Field(default_factory=list, max_length=30)
     open_questions: list[str] = Field(default_factory=list, max_length=30)
+    runtime_groups: list[str] = Field(default_factory=list, max_length=20)
+    chapter_ids: list[str] = Field(default_factory=list, max_length=24)
+    story_beat_ids: list[str] = Field(default_factory=list, max_length=120)
 
     @field_validator("title", "purpose")
     @classmethod
     def strip_required_text(cls, value: str) -> str:
         return value.strip()
 
-    @field_validator("fact_ids", "focus", "open_questions")
+    @field_validator("fact_ids", "focus", "open_questions", "runtime_groups", "chapter_ids", "story_beat_ids")
     @classmethod
     def unique_text_items(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+class ChapterBriefPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str = Field(pattern=r"^chapter_[a-z0-9_-]+$")
+    brief: RuntimeBrief
+    reference_fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+
+    @field_validator("reference_fact_ids")
+    @classmethod
+    def unique_fact_ids(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
 
@@ -767,9 +889,12 @@ class GlobalPlanResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cards: list[PlannedCardPayload] = Field(min_length=1, max_length=MAX_DRAFT_CARDS)
+    brief: RuntimeBrief | None = None
+    chapter_briefs: list[ChapterBriefPayload] = Field(default_factory=list, max_length=24)
+    global_reference_fact_ids: list[str] = Field(default_factory=list, max_length=2000)
     open_questions: list[str] = Field(default_factory=list, max_length=50)
 
-    @field_validator("open_questions")
+    @field_validator("open_questions", "global_reference_fact_ids")
     @classmethod
     def normalize_questions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
@@ -795,6 +920,26 @@ def _flatten_one_level(value: Any) -> Any:
     return flattened
 
 
+def _normalize_field_source_refs(value: Any) -> Any:
+    """Collapse an item-to-sources map into the card's field-level provenance."""
+    if not isinstance(value, dict):
+        return _flatten_one_level(value)
+    flattened: list[str] = []
+    for refs in value.values():
+        if isinstance(refs, str):
+            flattened.append(refs)
+            continue
+        if not isinstance(refs, list):
+            return value
+        one_level = _flatten_one_level(refs)
+        if not isinstance(one_level, list) or any(
+            not isinstance(item, str) for item in one_level
+        ):
+            return value
+        flattened.extend(one_level)
+    return list(dict.fromkeys(flattened))
+
+
 def _normalize_nested_field_provenance(card: dict[str, Any]) -> dict[str, Any]:
     """Flatten one common gateway shape without accepting unknown structures."""
     fields = card.get("fields")
@@ -802,6 +947,8 @@ def _normalize_nested_field_provenance(card: dict[str, Any]) -> dict[str, Any]:
         return card
     normalized = dict(card)
     normalized_fields = dict(fields)
+    if not isinstance(card.get("field_sources", {}), dict):
+        return card
     normalized_sources = dict(card.get("field_sources") or {})
     changed = False
     for field_name, value in fields.items():
@@ -835,6 +982,8 @@ def _normalize_list_item_provenance(card: dict[str, Any]) -> dict[str, Any]:
         return card
     normalized = dict(card)
     normalized_fields = dict(fields)
+    if not isinstance(card.get("field_sources", {}), dict):
+        return card
     normalized_sources = dict(card.get("field_sources") or {})
     changed = False
     for field_name, value in fields.items():
@@ -844,13 +993,29 @@ def _normalize_list_item_provenance(card: dict[str, Any]) -> dict[str, Any]:
         item_sources: list[Any] = []
         field_changed = False
         for item in value:
-            if not isinstance(item, dict) or "text" not in item:
+            if not isinstance(item, dict):
                 unwrapped.append(item)
                 continue
-            if set(item) - {"text", "field_sources"}:
+            keys = set(item)
+            is_text_item = "text" in item and not keys - {"text", "field_sources"}
+            is_named_item = {"name", "description"} <= keys and not keys - {
+                "name",
+                "description",
+                "field_sources",
+            }
+            if not is_text_item and not is_named_item:
                 unwrapped.append(item)
                 continue
-            unwrapped.append(item["text"])
+            if is_named_item:
+                if not all(
+                    isinstance(item[key], str) and item[key].strip()
+                    for key in ("name", "description")
+                ):
+                    unwrapped.append(item)
+                    continue
+                unwrapped.append(f"{item['name'].strip()}：{item['description'].strip()}")
+            else:
+                unwrapped.append(item["text"])
             if "field_sources" in item:
                 item_sources.append(item["field_sources"])
             field_changed = True
@@ -888,6 +1053,9 @@ def _normalize_global_plan_shape(raw: Any) -> Any:
         focus = card.get("focus")
         if isinstance(focus, str):
             card["focus"] = [focus.strip()] if focus.strip() else []
+        chapter_ids = card.get("chapter_ids")
+        if isinstance(chapter_ids, str):
+            card["chapter_ids"] = [chapter_ids.strip()] if chapter_ids.strip() else []
         cards.append(card)
     normalized["cards"] = cards
     return normalized
@@ -914,7 +1082,9 @@ def _fact_payload_from_facts(facts: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _facts_for_workspace(bundle: ExampleBundle, workspace_id: str) -> list[Any]:
+def _facts_for_workspace(
+    bundle: ExampleBundle, workspace_id: str, unit: PrepUnit | None = None
+) -> list[Any]:
     """Limit task-owned shelves to the source file and selected page scope."""
     task = prep.find_prep_job_by_workspace(workspace_id)
     # Display materials are source assets, not GM-facing artifact input. They
@@ -926,18 +1096,16 @@ def _facts_for_workspace(bundle: ExampleBundle, workspace_id: str) -> list[Any]:
     ]
     if task is None:
         return sorted(usable, key=lambda fact: _fact_source_sort_key(fact, None))
-    allowed_pages = {
-        page for span in task.scope.page_spans for page in span.pages()
-    }
+    scope = unit or task.scope
+    allowed_pages = {page for span in scope.page_spans for page in span.pages()}
     selected: list[Any] = []
     for fact in usable:
         refs = list(fact.source_refs)
         if not refs or any(
-            ref.file == task.scope.source_file and ref.page in allowed_pages
-            for ref in refs
+            ref.file == scope.source_file and ref.page in allowed_pages for ref in refs
         ):
             selected.append(fact)
-    return sorted(selected, key=lambda fact: _fact_source_sort_key(fact, task.scope.source_file))
+    return sorted(selected, key=lambda fact: _fact_source_sort_key(fact, scope.source_file))
 
 
 def _fact_source_sort_key(fact: Any, preferred_file: str | None) -> tuple:
@@ -963,10 +1131,7 @@ def _fact_batches(facts: list[Any]) -> list[list[Any]]:
         single_serialized = json.dumps(single_payload, ensure_ascii=False)
         single_size = len(single_serialized)
         single_tokens = _estimate_tokens(single_serialized)
-        if (
-            single_size > MAX_SINGLE_FACT_CHARS
-            or single_tokens > MAX_SINGLE_FACT_TOKENS
-        ):
+        if single_size > MAX_SINGLE_FACT_CHARS or single_tokens > MAX_SINGLE_FACT_TOKENS:
             raise ArtifactGenerationError(
                 f"事实 {fact.id} 单条输入约 {single_size} 字符 / {single_tokens} 估算 token，"
                 "超过单批保护上限；请拆分或缩短该事实后重试。"
@@ -976,7 +1141,9 @@ def _fact_batches(facts: list[Any]) -> list[list[Any]]:
         size = len(serialized)
         tokens = _estimate_tokens(serialized)
         if current and (
-            size > MAX_FACT_BATCH_CHARS or tokens > MAX_FACT_BATCH_TOKENS
+            size > MAX_FACT_BATCH_CHARS
+            or tokens > MAX_FACT_BATCH_TOKENS
+            or len(candidate) > MAX_FACTS_PER_BATCH
         ):
             batches.append(current)
             current = [fact]
@@ -993,27 +1160,33 @@ def _local_digest_messages(
     *,
     batch_index: int,
     batch_count: int,
+    chapter: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
+    response_schema = LocalDigestResponsePayload.model_json_schema()
+    response_schema["$defs"]["LocalUnitPayload"]["properties"]["kind"]["enum"] = sorted(LOCAL_UNIT_KINDS)
     system = (
         "You build a compact planning index from reviewed TRPG source facts. Return only one "
         "JSON object with keys units and open_questions. Every unit must contain kind, title, "
         "summary, fact_ids, entity_keys, relationship_hints, and open_questions. Use only supplied "
         "facts. Cover every supplied fact_id in at least one unit. Group facts into useful local "
-        "material such as background, scenes, locations, NPCs, clue clusters, threats, timelines, "
-        "outcomes, or resources. Preserve actionable details and uncertainty, but do not write final "
-        "cards. For location material, create one location unit per distinct place that players can "
-        "enter, search, revisit, seek help at, or trigger an event in. Put that place's canonical name "
-        "in entity_keys; do not combine a dock, house, generator shed, workshop, searchable room, or "
-        "other actionable sublocation merely because they share an island or building. "
-        "cards and do not invent cross-batch relationships. All user-facing text must be Chinese."
+        "material such as background, scenes, locations, NPCs, factions, traversal situations, clue clusters, "
+        "threats, timelines, outcomes, or resources. Preserve actionable details and uncertainty, "
+        "but do not write final cards. "
+        + _local_runtime_guidance(profile)
+        + "Do not invent cross-batch relationships. kind must be one of ALLOWED_UNIT_KINDS_JSON, "
+        "not the source fact kind or a final card type. Event material belongs to scene, timeline, "
+        "or outcome according to its narrative function; event is not a local unit kind. "
+        "Follow RESPONSE_SCHEMA_JSON. All user-facing text must be Chinese."
     )
     user = (
         "[TASK:prep:artifact_local_digest]\n"
         f"PROMPT_VERSION_JSON={json.dumps(PROMPT_VERSION)}\n"
         f"BATCH_INDEX_JSON={batch_index}\n"
         f"BATCH_COUNT_JSON={batch_count}\n"
+        f"CHAPTER_CONTEXT_JSON={json.dumps(chapter, ensure_ascii=False)}\n"
         f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"ALLOWED_UNIT_KINDS_JSON={json.dumps(sorted(LOCAL_UNIT_KINDS), ensure_ascii=False)}\n"
+        f"RESPONSE_SCHEMA_JSON={json.dumps(response_schema)}\n"
         f"LOCAL_FACTS_JSON={json.dumps(facts, ensure_ascii=False)}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -1025,6 +1198,24 @@ def _validate_local_digest(
     *,
     batch_index: int,
 ) -> dict[str, Any]:
+    # A local digest only owns the facts in its transport batch. Some gateways
+    # still copy an id seen in nearby context; discard that reference while
+    # preserving the unit as an explicit unresolved question.
+    if isinstance(raw, dict) and isinstance(raw.get("units"), list):
+        normalized = dict(raw)
+        normalized_units: list[Any] = []
+        for item in raw["units"]:
+            if not isinstance(item, dict):
+                normalized_units.append(item)
+                continue
+            unit = dict(item)
+            for field_name in ("fact_ids", "entity_keys", "relationship_hints", "open_questions"):
+                value = unit.get(field_name)
+                if isinstance(value, str):
+                    unit[field_name] = [value] if value.strip() else []
+            normalized_units.append(unit)
+        normalized["units"] = normalized_units
+        raw = normalized
     try:
         payload = LocalDigestResponsePayload.model_validate(raw)
     except ValidationError as error:
@@ -1033,16 +1224,23 @@ def _validate_local_digest(
     facts_by_id = {fact.id: fact for fact in batch_facts}
     covered: set[str] = set()
     units: list[dict[str, Any]] = []
+    normalization_questions: list[str] = []
     for unit_index, unit in enumerate(payload.units, start=1):
         unknown = [fact_id for fact_id in unit.fact_ids if fact_id not in facts_by_id]
+        valid_fact_ids = [fact_id for fact_id in unit.fact_ids if fact_id in facts_by_id]
         if unknown:
-            raise ArtifactGenerationError(
-                f"局部整理单元 {unit.title} 引用了批次外事实: {unknown}"
+            normalization_questions.append(
+                f"局部整理单元“{unit.title}”引用了 {len(unknown)} 条当前批次外事实；已忽略越界引用。"
             )
-        covered.update(unit.fact_ids)
+        if not valid_fact_ids:
+            normalization_questions.append(
+                f"局部整理单元“{unit.title}”没有可用的当前批次事实；已跳过该单元。"
+            )
+            continue
+        covered.update(valid_fact_ids)
         source_refs: list[dict[str, Any]] = []
         seen_refs: set[tuple[str, int]] = set()
-        for fact_id in unit.fact_ids:
+        for fact_id in valid_fact_ids:
             for ref in facts_by_id[fact_id].source_refs:
                 key = (ref.file, ref.page)
                 if key in seen_refs:
@@ -1050,6 +1248,10 @@ def _validate_local_digest(
                 seen_refs.add(key)
                 source_refs.append({"file": ref.file, "page": ref.page})
         unit_data = unit.model_dump(mode="json")
+        unit_data["fact_ids"] = valid_fact_ids
+        unit_data["open_questions"] = _unique_questions(
+            [*unit_data.get("open_questions", []), *normalization_questions]
+        )
         digest = _stable_hash(
             {"batch": batch_index, "index": unit_index, "unit": unit_data}
         ).removeprefix("sha256:")[:16]
@@ -1087,12 +1289,16 @@ def _validate_local_digest(
                     "id": f"local_unit_{batch_index}_fallback_{digest}",
                     **fallback,
                     "source_refs": [
-                        {"file": ref.file, "page": ref.page}
-                        for ref in fact.source_refs
+                        {"file": ref.file, "page": ref.page} for ref in fact.source_refs
                     ],
                 }
             )
-    return {"units": units, "open_questions": payload.open_questions}
+    return {
+        "units": units,
+        "open_questions": _unique_questions(
+            [*payload.open_questions, *normalization_questions]
+        ),
+    }
 
 
 def _global_plan_messages(
@@ -1100,39 +1306,300 @@ def _global_plan_messages(
     units: list[dict[str, Any]],
     fact_sizes: dict[str, int],
     fact_tokens: dict[str, int],
+    structure_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     planning_units = _compact_global_units(units)
+    if profile.runtime_navigation_mode == "environment":
+        runtime_guidance = (
+            "For this environment-led profile, create one environment card per playable situation, "
+            "not every named place. A playable situation may be exploration, social, traversal, "
+            "combat, or event material and can span several nearby places when they share one active "
+            "conflict and phase structure. Do not duplicate one situation merely because its mode "
+            "changes. Preserve motives, meaningful choices, phase changes, nonviolent outcomes, and "
+            "cross-environment consequences. Represent meaningful travel as an environment plan "
+            "whose purpose and focus describe traversal; do not create a separate travel card. Do not generate or "
+            "convert game statistics. "
+        )
+    elif profile.runtime_navigation_mode == "location":
+        runtime_guidance = (
+            "Every named explorable, returnable, investigable, or help-providing place present in "
+            "the local units must receive its own location card; do not collapse places such as a "
+            "police station, funeral, publisher, residence, or office into one generic scene. If a "
+            "place is only a minor mention with no possible player action, leave it in open_questions "
+            "rather than inventing a card. When one source passage names several rooms or "
+            "sublocations, create separate cards for each room that can be entered, searched, "
+            "revisited, used for help, or contain a clue/event; never represent the whole building "
+            "as one card merely because the rooms share a parent location. "
+        )
+    else:
+        runtime_guidance = ""
     system = (
         "You are the global planning stage for a TRPG preparation workspace. Return only one JSON "
-        "object with keys cards and open_questions. Each planned card must contain type, title, "
-        "purpose, fact_ids, focus, and open_questions. Reconcile aliases and relationships across all "
+        "object with keys cards, brief, chapter_briefs, global_reference_fact_ids, and "
+        "open_questions. For an environment-led runtime profile, "
+        "brief is package metadata for an unstructured workspace; when reviewed chapters are supplied "
+        "set brief=null and place summaries in chapter_briefs only. A brief must contain premise, current_situation, "
+        "major_conflicts, opening_conditions, possible_endings, fact_ids, field_sources, and open_questions. "
+        "Each planned card must contain type, title, "
+        "purpose, fact_ids, focus, open_questions, runtime_groups, chapter_ids, and story_beat_ids. "
+        "For environment cards, story_beat_ids explicitly identifies supplied chapter-local beats "
+        "whose immediate situation this environment supports, and nothing else. NPC, enemy, and "
+        "clock/support cards MUST use story_beat_ids=[]; their relevance to a beat does not make "
+        "them environment navigation anchors. Shared storyline membership alone is "
+        "not sufficient. Do not attach every environment to every beat to satisfy coverage. "
+        "One environment can support several beats and one beat several environments. "
+        "First identify independently runnable situations from the local source indexes, then associate "
+        "them with beat thread_developments and interplay. Beats organize narrative changes across "
+        "a possible game; they are not a card inventory. Do not copy beat titles/summaries as "
+        "environment plans or merge distinct playable places merely because they serve the same beat. "
+        "A one-to-one link is allowed when the source supports it, but is not a target. "
+        "Narrative suggestions do not authorize invented facts. Use an empty "
+        "list for supporting cards or when no beat is supported by the source. Report unsupported "
+        "beats in open_questions instead of inventing environments. Reconcile aliases and relationships across all "
         "local units, then plan a coherent working set for the whole selected scope. The compact units "
         "are planning indexes only: do not write final card fields and do not treat their prose as a "
         "new source. Each card will later reread the original fact_ids you select. Use only listed "
         "fact_ids, avoid duplicate cards, preserve conflicts as open questions, and keep each card's "
-        "estimated original-fact input within the supplied character budget. For runtime profiles, "
-        "every named explorable, returnable, investigable, or help-providing place present in the local units must receive its own location "
-        "or environment card; do not collapse places such as a police station, "
-        "funeral, publisher, residence, or office into one generic scene. If a place is only a minor "
-        "mention with no possible player action, leave it in open_questions rather than inventing a card. "
-        "When one source passage names several rooms or sublocations, create separate cards for each room "
-        "that can be entered, searched, revisited, used for help, or contain a clue/event; never represent "
-        "the whole building as one card merely because the rooms share a parent location. Player-facing source assets "
+        "estimated original-fact input within the supplied character budget. "
+        + runtime_guidance
+        + "Player-facing source assets "
         "such as maps, letters, photos, newspapers, logs, and records are tracked separately and must "
-        "not become artifact cards. All user-facing text "
-        "must be Chinese."
+        "not become artifact cards. All user-facing text must be Chinese. For an environment-led "
+        "profile, runtime_groups are optional retrieval hints. Use a shared short semantic key only "
+        "when source-backed material makes an environment and support card clearly relevant together. "
+        "Do not invent an encounter, require an enemy or clock, or preselect what must appear in play. "
+        "Reusable support may list multiple keys. "
+        "Runtime brief metadata is not a card and does not need a runtime group. "
+        "Follow RESPONSE_SCHEMA_JSON exactly. Do not add environment_type or other final card fields "
+        "to a planned card; express operating modes in purpose/focus. opening_conditions is an array. "
+        "field_sources maps brief field names to arrays of supplied fact IDs, never book names, "
+        "rulebooks, URLs, or invented source labels. Each cited ID must also be in that brief's fact_ids. "
+        "chapter_briefs is an array of objects with chapter_id, brief (a nested RuntimeBrief), and "
+        "reference_fact_ids; it is not a chapter-keyed dictionary or a list of title/summary/cards. "
+        + (
+            " The complete job covers all approved chapters through separate planning requests. "
+            "THIS request generates ONLY REVIEWED_STRUCTURE_JSON.chapters. adventure_index and "
+            "cross-chapter thread roles are context for continuity, not additional generation targets. "
+            "Every card must list only applicable chapter IDs from chapters in THIS request. "
+            "Shared support will be reconciled across chapter plans by the application. Return one "
+            "chapter_briefs item for each chapter in THIS request, and none for adventure_index-only "
+            "chapters. Local unit prose may summarize wider context; only its listed fact_ids "
+            "authorize content for this request. For each chapter, account for every applicable fact in a card, that "
+            "chapter brief, or reference_fact_ids. Account for every global_reference fact in "
+            "global_reference_fact_ids or the package brief. Do not omit facts merely to shorten "
+            "the card set; reference facts remain directly retrievable without becoming cards."
+            " Actionable leads, evidence connecting locations, NPC motives, and changes to an environment "
+            "belong in relevant card fact_ids or the chapter brief; do not park them in reference_fact_ids "
+            "to reduce generation effort. Reference facts are supporting context. Avoid duplicating "
+            "facts already covered by cards/briefs in reference_fact_ids."
+            if structure_context
+            else ""
+        )
     )
+    allowed_ids = {fact_id for unit in units for fact_id in unit.get("fact_ids", [])}
+    fact_sizes = {key: value for key, value in fact_sizes.items() if key in allowed_ids}
+    fact_tokens = {key: value for key, value in fact_tokens.items() if key in allowed_ids}
+    schema = GlobalPlanResponsePayload.model_json_schema()
+    schema["$defs"]["PlannedCardPayload"]["allOf"] = [{
+        "if": {"properties": {"type": {"const": "environment"}}, "required": ["type"]},
+        "else": {"properties": {"story_beat_ids": {"maxItems": 0}}},
+    }]
+    schema["$defs"]["PlannedCardPayload"]["properties"]["type"]["enum"] = [
+        definition.type for definition in profile.card_definitions
+    ]
+    if structure_context:
+        chapter_ids = [item["id"] for item in structure_context["chapters"]]
+        schema["$defs"]["PlannedCardPayload"]["properties"]["chapter_ids"]["items"]["enum"] = chapter_ids
+        beat_ids = [item["id"] for item in structure_context.get("beats", [])]
+        beat_field = schema["$defs"]["PlannedCardPayload"]["properties"]["story_beat_ids"]
+        if beat_ids:
+            beat_field["items"]["enum"] = beat_ids
+        else:
+            beat_field["maxItems"] = 0
+        schema["$defs"]["ChapterBriefPayload"]["properties"]["chapter_id"]["enum"] = chapter_ids
+    example_fact = next(iter(sorted(allowed_ids)), "fact_example")
+    brief_example = {
+        "premise": "来源支持的背景。",
+        "current_situation": "当前章节的局势。",
+        "opening_conditions": ["来源支持的开局条件。"],
+        "fact_ids": [example_fact],
+        "field_sources": {"premise": [example_fact], "current_situation": [example_fact]},
+    }
+    chapter_example = ([{
+        "chapter_id": structure_context["chapters"][0]["id"],
+        "brief": brief_example,
+        "reference_fact_ids": [],
+    }] if structure_context else [])
+    # The planner needs card categories, not the final card field contract.
+    planning_profile = profile.model_dump(mode="json")
+    planning_profile["card_definitions"] = [
+        {key: value for key, value in definition.items() if key in {"type", "label", "description"}}
+        for definition in planning_profile["card_definitions"]
+    ]
     user = (
         "[TASK:prep:artifact_global_plan]\n"
         f"PROMPT_VERSION_JSON={json.dumps(GLOBAL_PLAN_PROMPT_VERSION)}\n"
-        f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
+        f"TARGET_PROFILE_JSON={json.dumps(planning_profile, ensure_ascii=False)}\n"
+        f"RESPONSE_SCHEMA_JSON={json.dumps(schema, ensure_ascii=False)}\n"
+        "EXAMPLE_IS_SHAPE_ONLY_JSON=true\n"
+        f"CHAPTER_BRIEFS_EXAMPLE_JSON={json.dumps(chapter_example, ensure_ascii=False)}\n"
         f"MAX_CARD_FACT_INPUT_CHARS_JSON={MAX_CARD_FACT_INPUT_CHARS}\n"
         f"MAX_CARD_FACT_INPUT_TOKENS_JSON={MAX_CARD_FACT_INPUT_TOKENS}\n"
         f"FACT_INPUT_CHARS_JSON={json.dumps(fact_sizes, ensure_ascii=False)}\n"
         f"FACT_INPUT_TOKENS_JSON={json.dumps(fact_tokens, ensure_ascii=False)}\n"
+        f"REVIEWED_STRUCTURE_JSON={json.dumps(structure_context, ensure_ascii=False)}\n"
         f"GLOBAL_UNITS_JSON={json.dumps(planning_units, ensure_ascii=False)}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _normalize_runtime_group_anchors(
+    plan: dict[str, Any], profile: RuleProfile
+) -> dict[str, Any]:
+    """Drop support-only group ids without inventing an environment relation."""
+    if profile.runtime_navigation_mode != "environment":
+        return plan
+    cards = list(plan.get("cards") or [])
+    anchor_ids = {
+        group_id
+        for card in cards
+        if card.get("type") == profile.runtime_anchor_type
+        for group_id in card.get("runtime_group_ids") or []
+    }
+    normalized_cards: list[Any] = []
+    questions = list(plan.get("open_questions") or [])
+    changed = False
+    for card in cards:
+        if not isinstance(card, dict) or card.get("type") == profile.runtime_anchor_type:
+            normalized_cards.append(card)
+            continue
+        groups = list(card.get("runtime_group_ids") or [])
+        orphaned = [group_id for group_id in groups if group_id not in anchor_ids]
+        if not orphaned:
+            normalized_cards.append(card)
+            continue
+        normalized = dict(card)
+        normalized["runtime_group_ids"] = [
+            group_id for group_id in groups if group_id in anchor_ids
+        ]
+        normalized_cards.append(normalized)
+        questions.append(
+            f"全局计划“{card.get('title') or '未命名支持卡'}”的 {len(orphaned)} 个运行组"
+            "缺少环境锚点；已保留卡片并移除孤立关联。"
+        )
+        changed = True
+    if not changed:
+        return plan
+    normalized_plan = dict(plan)
+    normalized_plan["cards"] = normalized_cards
+    normalized_plan["open_questions"] = _unique_questions(questions)
+    return normalized_plan
+
+
+class PlanCoverageError(ArtifactGenerationError):
+    def __init__(self, chapters, global_ids, facts):
+        self.chapters = chapters
+        self.global_ids = global_ids
+        missing = set(global_ids).union(*(set(ids) for ids in chapters.values()))
+        self.facts = _fact_payload_from_facts([fact for fact in facts if fact.id in missing])
+        super().__init__(f"全局计划没有闭合全部事实去向: chapters={chapters}, global={global_ids}")
+
+
+class CoverageDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fact_id: str
+    chapter_id: str | None
+    destination: Literal["card", "chapter_reference", "global_reference"]
+    card_index: int | None = Field(default=None, ge=0)
+    reason: str = Field(min_length=1, max_length=800)
+
+
+class CoverageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decisions: list[CoverageDecision]
+
+
+def _validate_coverage_decisions(response, expected):
+    # Recover only ownership already determined by the request, never model intent.
+    if isinstance(response, dict) and isinstance(response.get("decisions"), list):
+        decisions = []
+        for item in response["decisions"]:
+            if isinstance(item, dict):
+                item = dict(item)
+                owners = {chapter for fact_id, chapter in expected if fact_id == item.get("fact_id")}
+                if not owners:
+                    raise ArtifactGenerationError("事实去向修正引用未知事实")
+                if item.get("chapter_id") is None:
+                    if len(owners) != 1:
+                        raise ArtifactGenerationError("事实去向修正缺少章节，归属存在歧义")
+                    item["chapter_id"] = next(iter(owners))
+                elif item["chapter_id"] not in owners:
+                    raise ArtifactGenerationError("事实去向修正的章节归属错误")
+            decisions.append(item)
+        response = {**response, "decisions": decisions}
+    payload = CoverageResponse.model_validate(response)
+    pairs = [(item.fact_id, item.chapter_id) for item in payload.decisions]
+    if len(pairs) != len(set(pairs)):
+        raise ArtifactGenerationError("事实去向修正包含重复事实与章节组合")
+    missing = expected - set(pairs)
+    if missing:
+        raise ArtifactGenerationError(f"事实去向修正遗漏 {len(missing)} 个事实与章节组合")
+    return payload
+
+
+def _complete_plan_coverage(job, stage, index, raw, error, client, validator):
+    expected = {(fid, chapter) for chapter, ids in error.chapters.items() for fid in ids}
+    expected.update((fid, None) for fid in error.global_ids)
+
+    def merge(response):
+        payload = _validate_coverage_decisions(response, expected)
+        merged = GlobalPlanResponsePayload.model_validate(_normalize_global_plan_shape(raw)).model_dump(mode="json")
+        for item in payload.decisions:
+            if item.chapter_id is None:
+                if item.destination != "global_reference" or item.card_index is not None:
+                    raise ArtifactGenerationError("全局参考事实必须保留为全局参考")
+                merged["global_reference_fact_ids"].append(item.fact_id)
+            elif item.destination == "card":
+                if item.card_index is None or item.card_index >= len(merged["cards"]):
+                    raise ArtifactGenerationError("事实去向修正引用未知卡片")
+                card = merged["cards"][item.card_index]
+                if card["chapter_ids"] and item.chapter_id not in card["chapter_ids"]:
+                    raise ArtifactGenerationError("事实去向修正引用其他章节的卡片")
+                card["fact_ids"] = list(dict.fromkeys([*card["fact_ids"], item.fact_id]))
+            elif item.destination == "chapter_reference" and item.card_index is None:
+                brief = next(b for b in merged["chapter_briefs"] if b["chapter_id"] == item.chapter_id)
+                brief["reference_fact_ids"].append(item.fact_id)
+            else:
+                raise ArtifactGenerationError("事实去向修正的目标不符合约定")
+        validator(merged)
+        return merged
+
+    messages = [{"role": "system", "content": (
+        "Complete only the missing fact destinations in this TRPG card plan. Never rewrite the plan. "
+        "Return decisions following the schema. For chapter facts choose an existing card when its "
+        "purpose fits; otherwise retain the fact as chapter_reference with a reason. Do not dump "
+        "actionable facts into reference merely to pass validation. Global facts remain global_reference. "
+        "Every decision must include chapter_id: copy the exact chapter key from missing_chapters; "
+        "use null only for missing_global facts. Return each requested fact/chapter pair exactly once. "
+        "Use zero-based card_index only for card destinations; otherwise null. Descriptions in Chinese."
+    )}, {"role": "user", "content": json.dumps({
+        "schema": CoverageResponse.model_json_schema(), "missing_chapters": error.chapters,
+        "missing_global": error.global_ids, "facts": error.facts,
+        "cards": [{"index": i, **{k: c.get(k) for k in ("type", "title", "purpose", "focus", "chapter_ids")}}
+                  for i, c in enumerate(raw["cards"])],
+    }, ensure_ascii=False)}]
+    try:
+        return _run_json_step(
+            job, stage=stage + "_coverage", step_index=index,
+            input_payload={"version": "coverage-v2", "plan": raw, "facts": error.facts,
+                           "chapters": error.chapters, "global": error.global_ids},
+            input_refs={"fact_ids": [fact["id"] for fact in error.facts]},
+            messages=messages, client=client, max_tokens=4000, validator=merge,
+        )
+    except Exception as failure:
+        # Keep the original plan intact instead of triggering a whole-plan rewrite.
+        error.args = (f"{error}；事实去向修正失败：{failure}",)
+        raise error from failure
 
 
 def _validate_global_plan(
@@ -1140,22 +1607,34 @@ def _validate_global_plan(
     units: list[dict[str, Any]],
     facts: list[Any],
     profile: RuleProfile,
+    bundle: ExampleBundle | None = None,
+    chapter_scope_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     try:
-        payload = GlobalPlanResponsePayload.model_validate(
-            _normalize_global_plan_shape(raw)
-        )
+        payload = GlobalPlanResponsePayload.model_validate(_normalize_global_plan_shape(raw))
     except ValidationError as error:
         raise ArtifactGenerationError(f"全局卡片计划 JSON 不符合约定: {error}") from error
 
-    allowed_fact_ids = {
-        fact_id for unit in units for fact_id in unit.get("fact_ids", [])
-    }
+    allowed_fact_ids = {fact_id for unit in units for fact_id in unit.get("fact_ids", [])}
     facts_by_id = {fact.id: fact for fact in facts}
     definitions = {definition.type: definition for definition in profile.card_definitions}
     seen: set[tuple[str, str]] = set()
     planned: list[dict[str, Any]] = []
     used_fact_ids: set[str] = set()
+    runtime_group_ids: dict[str, str] = {}
+    all_chapter_ids = {
+        chapter.id for chapter in (bundle.adventure_chapters if bundle is not None else [])
+    }
+    known_chapter_ids = chapter_scope_ids or all_chapter_ids
+
+    def group_id(group: str) -> str:
+        key = " ".join(group.split()).casefold()
+        if key not in runtime_group_ids:
+            slug = re.sub(r"[^a-z0-9]+", "_", key).strip("_")[:40] or "situation"
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+            runtime_group_ids[key] = f"encounter_{slug}_{digest}"
+        return runtime_group_ids[key]
+
     for index, card in enumerate(payload.cards, start=1):
         if card.type not in definitions:
             raise ArtifactGenerationError(f"全局计划包含未定义卡型: {card.type}")
@@ -1165,25 +1644,42 @@ def _validate_global_plan(
         seen.add(key)
         unknown = [fact_id for fact_id in card.fact_ids if fact_id not in allowed_fact_ids]
         if unknown:
+            raise ArtifactGenerationError(f"全局计划 {card.title} 引用了局部索引外事实: {unknown}")
+        unknown_chapters = sorted(set(card.chapter_ids) - known_chapter_ids)
+        if unknown_chapters:
             raise ArtifactGenerationError(
-                f"全局计划 {card.title} 引用了局部索引外事实: {unknown}"
+                f"全局计划 {card.title} 引用了未知章节: {unknown_chapters}"
             )
+        if known_chapter_ids and not card.chapter_ids:
+            if chapter_scope_ids and len(chapter_scope_ids) == 1:
+                card.chapter_ids = sorted(chapter_scope_ids)
+            else:
+                raise ArtifactGenerationError(f"全局计划 {card.title} 缺少适用章节")
         selected_facts = [facts_by_id[fact_id] for fact_id in card.fact_ids]
-        input_chars = len(
-            json.dumps(_fact_payload_from_facts(selected_facts), ensure_ascii=False)
-        )
+        beats_by_id = {beat.id: beat for beat in (bundle.story_beats if bundle else [])}
+        for beat_id in card.story_beat_ids:
+            beat = beats_by_id.get(beat_id)
+            if beat is None:
+                raise ArtifactGenerationError(f"全局计划 {card.title} 引用了未知拍: {beat_id}")
+            if beat.chapter_id not in card.chapter_ids:
+                raise ArtifactGenerationError(f"全局计划 {card.title} 的拍关联跨章节: {beat_id}")
+        if card.type != "environment" and card.story_beat_ids:
+            payload.open_questions.append(
+                f"支持卡“{card.title}”的拍筛选关联已移除；卡片内容与事实保留。"
+            )
+            card.story_beat_ids = []
+        input_chars = len(json.dumps(_fact_payload_from_facts(selected_facts), ensure_ascii=False))
         input_tokens = _estimate_tokens(
             json.dumps(_fact_payload_from_facts(selected_facts), ensure_ascii=False)
         )
-        if (
-            input_chars > MAX_CARD_FACT_INPUT_CHARS
-            or input_tokens > MAX_CARD_FACT_INPUT_TOKENS
-        ):
+        if input_chars > MAX_CARD_FACT_INPUT_CHARS or input_tokens > MAX_CARD_FACT_INPUT_TOKENS:
             raise ArtifactGenerationError(
                 f"全局计划 {card.title} 的原始事实输入约 {input_chars} 字符 / "
                 f"{input_tokens} 估算 token，超过单卡保护上限；请拆成多张用途明确的卡。"
             )
         data = card.model_dump(mode="json")
+        groups = data.pop("runtime_groups", [])
+        data["runtime_group_ids"] = [group_id(group) for group in groups]
         digest = _stable_hash({"index": index, "card": data}).removeprefix("sha256:")[:16]
         planned.append(
             {
@@ -1195,21 +1691,112 @@ def _validate_global_plan(
         )
         used_fact_ids.update(card.fact_ids)
 
+    if bundle:
+        linked_beats = {beat_id for card in planned for beat_id in card.get("story_beat_ids", [])}
+        for beat in bundle.story_beats:
+            if beat.chapter_id in known_chapter_ids and beat.id not in linked_beats:
+                payload.open_questions.append(f"拍“{beat.title}”暂无明确关联环境，需要复核其可运行情境。")
+    overview_types = {"chapter_overview"}
     requires_overview = any(
-        definition.type == "chapter_overview" for definition in profile.card_definitions
+        definition.type in overview_types for definition in profile.card_definitions
     )
-    if requires_overview and not any(card["type"] == "chapter_overview" for card in planned):
-        raise ArtifactGenerationError("全局计划缺少章节总览卡")
+    if requires_overview and not any(card["type"] in overview_types for card in planned):
+        raise ArtifactGenerationError("全局计划缺少总览卡")
     if profile.profile_kind == "runtime" and not any(
         card["type"] in RUNTIME_ANCHOR_TYPES for card in planned
     ):
         raise ArtifactGenerationError("全局计划缺少场景或环境类运行锚点")
+    brief = payload.brief
+    if profile.runtime_navigation_mode == "environment" and brief is None and not known_chapter_ids:
+        raise ArtifactGenerationError("环境运行板块缺少运行包摘要")
+    if brief is not None:
+        unknown_brief_facts = [fact_id for fact_id in brief.fact_ids if fact_id not in facts_by_id]
+        if unknown_brief_facts:
+            raise ArtifactGenerationError(
+                f"运行包摘要引用了不存在的事实: {unknown_brief_facts}"
+            )
+    chapter_briefs = [item.model_dump(mode="json") for item in payload.chapter_briefs]
+    global_reference_fact_ids = list(payload.global_reference_fact_ids)
+    for item in chapter_briefs:
+        chapter = next((chapter for chapter in (bundle.adventure_chapters if bundle else [])
+                        if chapter.id == item["chapter_id"]), None)
+        if chapter and set(item["reference_fact_ids"]) - set(chapter.fact_ids):
+            raise ArtifactGenerationError(f"章节摘要 {chapter.id} 的参考事实不属于该章节")
+        unknown = [
+            fact_id
+            for fact_id in [*item["brief"]["fact_ids"], *item["reference_fact_ids"]]
+            if fact_id not in allowed_fact_ids
+        ]
+        if unknown:
+            raise ArtifactGenerationError(
+                f"章节摘要 {item['chapter_id']} 引用了局部索引外事实: {unknown}"
+            )
+    if known_chapter_ids:
+        brief_ids = [item["chapter_id"] for item in chapter_briefs]
+        if len(brief_ids) != len(set(brief_ids)) or set(brief_ids) != known_chapter_ids:
+            raise ArtifactGenerationError(
+                "章节摘要必须完整覆盖全部已确认章节"
+            )
+        dispositions = {
+            disposition.fact_id: disposition
+            for disposition in bundle.fact_dispositions
+            if disposition.fact_id in allowed_fact_ids
+        }
+        cards_by_chapter = {
+            chapter_id: {
+                fact_id
+                for card in planned
+                if chapter_id in card["chapter_ids"]
+                for fact_id in card["fact_ids"]
+            }
+            for chapter_id in known_chapter_ids
+        }
+        briefs_by_chapter = {
+            item["chapter_id"]: set(
+                [*item["brief"]["fact_ids"], *item["reference_fact_ids"]]
+            )
+            for item in chapter_briefs
+        }
+        missing_by_chapter: dict[str, list[str]] = {}
+        for chapter_id in known_chapter_ids:
+            expected = {
+                fact_id
+                for fact_id, disposition in dispositions.items()
+                if chapter_id in disposition.chapter_ids
+            }
+            missing = sorted(
+                expected - cards_by_chapter[chapter_id] - briefs_by_chapter[chapter_id]
+            )
+            if missing:
+                missing_by_chapter[chapter_id] = missing
+        expected_global = {
+            fact_id
+            for fact_id, disposition in dispositions.items()
+            if disposition.kind == "global_reference"
+        }
+        package_facts = set(brief.fact_ids) if brief is not None else set()
+        missing_global = sorted(
+            expected_global - set(global_reference_fact_ids) - package_facts
+        )
+        if missing_by_chapter or missing_global:
+            raise PlanCoverageError(missing_by_chapter, missing_global, facts)
+    # Runtime groups are optional retrieval hints. An environment remains
+    # usable without a preselected enemy or clock.
+    used_fact_ids.update(global_reference_fact_ids)
+    if brief is not None:
+        used_fact_ids.update(brief.fact_ids)
+    for item in chapter_briefs:
+        used_fact_ids.update(item["brief"]["fact_ids"])
+        used_fact_ids.update(item["reference_fact_ids"])
     uncovered = sorted(allowed_fact_ids - used_fact_ids)
-    return {
+    return _normalize_runtime_group_anchors({
         "cards": planned,
+        "brief": brief.model_dump(mode="json") if brief is not None else None,
+        "chapter_briefs": chapter_briefs,
+        "global_reference_fact_ids": global_reference_fact_ids,
         "uncovered_fact_ids": uncovered,
         "open_questions": payload.open_questions,
-    }
+    }, profile)
 
 
 def _compact_global_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1232,9 +1819,7 @@ def _materialization_messages(
     plan: dict[str, Any],
     facts: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
-    definition = next(
-        item for item in profile.card_definitions if item.type == plan["type"]
-    )
+    definition = next(item for item in profile.card_definitions if item.type == plan["type"])
     list_fields = sorted(
         LIST_FIELDS & set([*definition.required_fields, *definition.optional_fields])
     )
@@ -1242,22 +1827,32 @@ def _materialization_messages(
         field: ("array of concise strings" if field in LIST_FIELDS else "concise string")
         for field in definition.required_fields
     }
+    gm_authored_fields = sorted(
+        GM_AUTHORED_FIELDS & set([*definition.required_fields, *definition.optional_fields])
+    )
     system = (
         "You materialize exactly one planned TRPG preparation card by rereading its original reviewed "
         "facts. Return only one JSON object with keys cards and open_questions; cards must contain "
         "exactly one card. Use the planned type and title exactly. The card must contain type, title, "
-        "subtitle, fact_ids, fields, field_sources, and open_questions. Use only supplied original "
+        "subtitle, fact_ids, fields, field_sources, and open_questions. Runtime grouping is owned by "
+        "the supplied plan and must not be returned or changed. Use only supplied original "
         "facts. Every factual field must cite one or more fact_ids from that card, and every populated "
         "field must have field_sources. Do not fill gaps from the planning summary; record an open "
         "question instead. Every required field listed below MUST be present and non-empty. "
         "Before returning, check the fields object key by key against REQUIRED_FIELD_SHAPES_JSON; "
         "array-shaped fields must be JSON arrays, never scalar strings. "
+        "source_statistics, when supported, is a concise string quoting only supplied source information, "
+        "never a stat-block object or generated rules. current_stage must be a string if included; "
+        "omit unsupported optional fields instead of null. field_sources must be an object mapping "
+        "field names to arrays of fact IDs, never a flat array. "
         "For every optional field, actively inspect the supplied facts and include it whenever the "
         "facts support useful table-side content; omit it only when no useful content exists. In "
         "particular, check relevant_characters, hidden_clues, and return_changes separately. "
-        "gm_moves may be concise GM-authored pressure or opportunity prompts grounded in the "
-        "location's fiction; mark them with no field_sources unless the source explicitly supports one. "
+        "Fields listed in GM_AUTHORED_FIELDS_JSON may be concise GM-authored operating prompts "
+        "grounded in the card's source-backed fiction; mark those prompts with no field_sources unless "
+        "the source explicitly supports them. Never use that exception for factual claims. "
         f"REQUIRED_FIELD_SHAPES_JSON={json.dumps(required_shapes, ensure_ascii=False)} "
+        f"GM_AUTHORED_FIELDS_JSON={json.dumps(gm_authored_fields, ensure_ascii=False)} "
         "All user-facing text must be Chinese."
     )
     user = (
@@ -1279,6 +1874,7 @@ def _validate_materialized_card(
     plan: dict[str, Any],
     *,
     model_id: str,
+    prep_unit_id: str | None = None,
 ) -> dict[str, Any]:
     if isinstance(raw, dict) and isinstance(raw.get("cards"), list):
         # The global plan owns the card's fact closure. Models may omit a
@@ -1293,9 +1889,7 @@ def _validate_materialized_card(
             card = dict(item)
             declared_ids = card.get("fact_ids")
             if isinstance(declared_ids, list):
-                card["fact_ids"] = list(
-                    dict.fromkeys([*declared_ids, *plan["fact_ids"]])
-                )
+                card["fact_ids"] = list(dict.fromkeys([*declared_ids, *plan["fact_ids"]]))
             elif declared_ids is None:
                 card["fact_ids"] = list(plan["fact_ids"])
             normalized_cards.append(card)
@@ -1307,6 +1901,7 @@ def _validate_materialized_card(
         profile,
         model_id=model_id,
         require_runtime_anchor=False,
+        prep_unit_id=prep_unit_id,
     )
     if len(cards) != 1:
         raise ArtifactGenerationError("单卡落地阶段必须且只能返回一张卡")
@@ -1315,6 +1910,13 @@ def _validate_materialized_card(
         raise ArtifactGenerationError(
             f"单卡落地必须沿用计划类型与标题: {plan['type']} / {plan['title']}"
         )
+    card = card.model_copy(
+        update={
+            "runtime_group_ids": list(plan.get("runtime_group_ids") or []),
+            "chapter_ids": list(plan.get("chapter_ids") or []),
+            "story_beat_ids": list(plan.get("story_beat_ids") or []),
+        }
+    )
     return {
         "cards": [card.model_dump(mode="json")],
         "open_questions": questions,
@@ -1328,6 +1930,7 @@ def _validated_card_output(
     *,
     model_id: str,
     require_runtime_anchor: bool = True,
+    prep_unit_id: str | None = None,
 ) -> dict[str, Any]:
     cards, questions = _validate_and_build(
         raw,
@@ -1335,6 +1938,7 @@ def _validated_card_output(
         profile,
         model_id=model_id,
         require_runtime_anchor=require_runtime_anchor,
+        prep_unit_id=prep_unit_id,
     )
     return {
         "cards": [card.model_dump(mode="json") for card in cards],
@@ -1348,6 +1952,8 @@ def _generate_direct_step(
     profile: RuleProfile,
     client: Any,
     facts: list[Any],
+    *,
+    prep_unit_id: str | None = None,
 ) -> tuple[list[DerivedCard], list[str]]:
     fact_payload = _fact_payload_from_facts(facts)
     direct_bundle = bundle.model_copy(update={"facts": facts, "cards": [], "plans": []})
@@ -1376,12 +1982,117 @@ def _generate_direct_step(
             profile,
             model_id=getattr(client, "model", "configured-model"),
             require_runtime_anchor=True,
+            prep_unit_id=prep_unit_id,
         ),
     )
     return (
         [DerivedCard.model_validate(card) for card in output["cards"]],
         list(output.get("open_questions") or []),
     )
+
+
+def _merge_chapter_plans(
+    existing_plans: list[dict[str, Any]], incoming_plans: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge a repeated cross-chapter card only while it remains materializable."""
+    merged = [dict(item) for item in existing_plans]
+    for incoming in incoming_plans:
+        match = next(
+            (
+                item
+                for item in merged
+                if item["type"] == incoming["type"]
+                and item["title"].casefold() == incoming["title"].casefold()
+            ),
+            None,
+        )
+        combined_fact_ids = list(
+            dict.fromkeys(
+                [*(match or {}).get("fact_ids", []), *incoming.get("fact_ids", [])]
+            )
+        )
+        if match is None or len(combined_fact_ids) > 100:
+            merged.append(dict(incoming))
+            continue
+        match["fact_ids"] = combined_fact_ids
+        for field_name in (
+            "focus",
+            "open_questions",
+            "runtime_group_ids",
+            "chapter_ids",
+            "story_beat_ids",
+        ):
+            match[field_name] = list(
+                dict.fromkeys(
+                    [*match.get(field_name, []), *incoming.get(field_name, [])]
+                )
+            )
+    return merged
+
+
+def _artifact_batches(bundle: ExampleBundle, facts: list[Any]) -> list[list[Any]]:
+    if not bundle.adventure_chapters:
+        return _fact_batches(facts)
+    return [batch for chapter in bundle.adventure_chapters
+            for batch in _fact_batches([fact for fact in facts if fact.id in set(chapter.fact_ids)])]
+
+
+class PlanningIndexSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=160)
+    summary: str = Field(min_length=1, max_length=1200)
+
+
+def _bounded_plan_input(job, plan_index, profile, units, sizes, tokens, context, client):
+    """Condense indexes while keeping every source fact available for card planning."""
+    transport = PlanningTransport(client, list(sizes))
+    current = _compact_global_units(units)
+    round_index = 0
+    while True:
+        messages = _global_plan_messages(profile, current, sizes, tokens, context)
+        request_chars = len(json.dumps(transport.messages(messages), ensure_ascii=False))
+        if request_chars <= MAX_FACT_INPUT_CHARS:
+            return current, messages, transport
+        # No source IDs, chapter identity, or provenance may be truncated to fit.
+        if len(current) <= 1:
+            raise ArtifactGenerationError(
+                f"规划请求过大：索引已汇总，但必要章节上下文与事实编号仍占 {request_chars:,} 字符，"
+                f"超过 {MAX_FACT_INPUT_CHARS:,} 字符预算。保留全部事实，未发送超预算请求。"
+            )
+        condensed = []
+        for group_index, offset in enumerate(range(0, len(current), 8), start=1):
+            group = current[offset:offset + 8]
+            prompt = [{"role": "system", "content": (
+                "Summarize this same-chapter TRPG planning index, not the original source. "
+                'Return exactly one JSON object: {"title":"...","summary":"..."}. '
+                "Keep the English field names title and summary; write their string values in Chinese. "
+                "Do not return headings, Markdown, Chinese field names, or text outside the JSON object. "
+                "Preserve named playable situations, "
+                "NPC motives, actionable leads, conflicts, and alternatives. Do not invent connections or "
+                "merge distinct places into one scene. This is a retrieval index, not a final card or "
+                "a required route. All original fact IDs are preserved separately by the application. "
+                "Keep title within 160 characters and summary within 1200 characters."
+            )}, {"role": "user", "content": json.dumps({
+                "schema": PlanningIndexSummary.model_json_schema(),
+                "units": [{k: v for k, v in unit.items() if k not in {"fact_ids", "id"}} for unit in group],
+            }, ensure_ascii=False)}]
+            if len(json.dumps(prompt, ensure_ascii=False)) > MAX_FACT_INPUT_CHARS:
+                raise ArtifactGenerationError("规划索引汇总请求超过预算；未截断事实或发送请求")
+            output = _run_json_step(
+                job, stage=f"planning_index_{plan_index}_{round_index}", step_index=group_index,
+                input_payload={"version": "planning-index-v1", "units": group},
+                input_refs={"fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"]))},
+                messages=prompt, client=client, max_tokens=2500,
+                validator=lambda raw: PlanningIndexSummary.model_validate(raw).model_dump(mode="json"),
+            )
+            condensed.append({
+                "id": f"planning_index_{plan_index}_{round_index}_{group_index}",
+                "kind": "background", **output,
+                "fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"])),
+                "entity_keys": [], "relationship_hints": [], "open_questions": [],
+            })
+        current = condensed
+        round_index += 1
 
 
 def _generate_hierarchical_artifacts(
@@ -1391,14 +2102,24 @@ def _generate_hierarchical_artifacts(
     client: Any,
     scoped_facts: list[Any],
     batches: list[list[Any]],
-) -> tuple[list[DerivedCard], _OpenQuestionSummary, ArtifactDraftJob]:
+    *,
+    prep_unit_id: str | None = None,
+) -> tuple[
+    list[DerivedCard],
+    _OpenQuestionSummary,
+    ArtifactDraftJob,
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+]:
     job = _save_job(job, phase="local_digest")
     local_units: list[dict[str, Any]] = []
+    batch_chapters = [chapter.id for chapter in bundle.adventure_chapters
+                      for _ in _fact_batches([fact for fact in scoped_facts if fact.id in set(chapter.fact_ids)])]
     question_summary = _OpenQuestionSummary()
     for batch_index, batch_facts in enumerate(batches, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
-            return [], question_summary, current
+            return [], question_summary, current, None, []
         fact_payload = _fact_payload_from_facts(batch_facts)
         try:
             output = _run_json_step(
@@ -1411,6 +2132,7 @@ def _generate_hierarchical_artifacts(
                     "batch_index": batch_index,
                     "batch_count": len(batches),
                     "facts": fact_payload,
+                    "chapter_id": batch_chapters[batch_index - 1] if batch_chapters else None,
                 },
                 input_refs={"fact_ids": [fact.id for fact in batch_facts]},
                 messages=_local_digest_messages(
@@ -1418,6 +2140,10 @@ def _generate_hierarchical_artifacts(
                     fact_payload,
                     batch_index=batch_index,
                     batch_count=len(batches),
+                    chapter=next(({
+                        "id": chapter.id, "title": chapter.title, "summary": chapter.summary,
+                    } for chapter in bundle.adventure_chapters
+                        if batch_chapters and chapter.id == batch_chapters[batch_index - 1]), None),
                 ),
                 client=client,
                 max_tokens=LOCAL_DIGEST_MAX_TOKENS,
@@ -1429,7 +2155,8 @@ def _generate_hierarchical_artifacts(
             raise ArtifactGenerationError(
                 f"第 {batch_index}/{len(batches)} 批局部整理失败：{error}"
             ) from error
-        local_units.extend(output["units"])
+        local_units.extend({**unit, "chapter_id": batch_chapters[batch_index - 1] if batch_chapters else None}
+                           for unit in output["units"])
         question_summary.add(list(output.get("open_questions") or []))
         job = _save_job(
             _job_from_store(job.id),
@@ -1438,51 +2165,161 @@ def _generate_hierarchical_artifacts(
             **_question_summary_fields(question_summary),
         )
 
-    serialized_units = json.dumps(local_units, ensure_ascii=False)
-    if len(serialized_units) > MAX_FACT_INPUT_CHARS:
-        raise ArtifactGenerationError(
-            "局部整理索引仍然过大，暂不能可靠进入全局规划；需要增加递归区域汇总。"
-        )
     facts_by_id = {fact.id: fact for fact in scoped_facts}
     fact_sizes = {
         fact.id: len(json.dumps(_fact_payload_from_facts([fact]), ensure_ascii=False))
         for fact in scoped_facts
     }
     fact_tokens = {
-        fact.id: _estimate_tokens(
-            json.dumps(_fact_payload_from_facts([fact]), ensure_ascii=False)
-        )
+        fact.id: _estimate_tokens(json.dumps(_fact_payload_from_facts([fact]), ensure_ascii=False))
         for fact in scoped_facts
     }
     job = _save_job(_job_from_store(job.id), phase="global_plan")
+    structure_context = None
+    if bundle.adventure_chapters:
+        structure_context = {
+            "chapters": [
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "summary": item.summary,
+                }
+                for item in bundle.adventure_chapters
+            ],
+            "threads": [
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "kind": item.kind,
+                    "summary": item.summary,
+                    "chapter_roles": item.chapter_roles,
+                }
+                for item in bundle.story_threads
+            ],
+            "beats": [
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "summary": item.summary,
+                    "chapter_id": item.chapter_id,
+                    "thread_ids": item.thread_ids,
+                    "thread_developments": {key: value.model_dump(mode="json") for key, value in item.thread_developments.items()},
+                    "interplay": item.interplay,
+                    "fact_ids": item.fact_ids,
+                }
+                for item in bundle.story_beats
+            ],
+            "fact_dispositions": [
+                {
+                    "fact_id": item.fact_id,
+                    "kind": item.kind,
+                    "chapter_ids": item.chapter_ids,
+                    "thread_ids": item.thread_ids,
+                }
+                for item in bundle.fact_dispositions
+                if item.fact_id in facts_by_id
+            ],
+        }
     try:
-        plan_output = _run_json_step(
-            job,
-            stage="global_plan",
-            step_index=1,
-            input_payload={
-                "prompt_version": GLOBAL_PLAN_PROMPT_VERSION,
-                "profile": profile.model_dump(mode="json"),
-                "units": _compact_global_units(local_units),
-                "fact_sizes": fact_sizes,
-                "fact_tokens": fact_tokens,
-            },
-            input_refs={
-                "unit_ids": [unit["id"] for unit in local_units],
-                "fact_ids": list(facts_by_id),
-            },
-            messages=_global_plan_messages(
-                profile,
-                local_units,
-                fact_sizes,
-                fact_tokens,
-            ),
-            client=client,
-            max_tokens=GLOBAL_PLAN_MAX_TOKENS,
-            validator=lambda raw: _validate_global_plan(
-                raw, local_units, scoped_facts, profile
-            ),
+        planning_scopes: list[
+            tuple[list[dict[str, Any]], list[Any], dict[str, Any] | None, set[str] | None]
+        ] = [(local_units, scoped_facts, structure_context, None)]
+        if structure_context:
+            planning_scopes = []
+            for chapter in bundle.adventure_chapters:
+                scope_fact_ids = set(chapter.fact_ids)
+                chapter_facts = [
+                    fact for fact in scoped_facts if fact.id in scope_fact_ids
+                ]
+                chapter_units = []
+                for unit in local_units:
+                    if unit.get("chapter_id") != chapter.id:
+                        continue
+                    member_ids = [
+                        fact_id
+                        for fact_id in unit.get("fact_ids", [])
+                        if fact_id in scope_fact_ids
+                    ]
+                    if member_ids:
+                        chapter_units.append({**unit, "fact_ids": member_ids})
+                chapter_context = {
+                    "chapters": [
+                        item
+                        for item in structure_context["chapters"]
+                        if item["id"] == chapter.id
+                    ],
+                    "adventure_index": structure_context["chapters"],
+                    "threads": [
+                        item
+                        for item in structure_context["threads"]
+                        if chapter.id in item["chapter_roles"]
+                    ],
+                    "beats": [
+                        item
+                        for item in structure_context["beats"]
+                        if item["chapter_id"] == chapter.id
+                    ],
+                    "fact_dispositions": [
+                        item
+                        for item in structure_context["fact_dispositions"]
+                        if item["fact_id"] in scope_fact_ids
+                    ],
+                }
+                planning_scopes.append(
+                    (chapter_units, chapter_facts, chapter_context, {chapter.id})
+                )
+
+        job = _save_job(
+            _job_from_store(job.id),
+            planning_scope_count=len(planning_scopes),
+            completed_planning_scopes=0,
         )
+        plan_outputs: list[dict[str, Any]] = []
+        for plan_index, (
+            plan_units,
+            plan_facts,
+            plan_context,
+            chapter_scope,
+        ) in enumerate(planning_scopes, start=1):
+            owned_ids = {fact.id for fact in plan_facts}
+            plan_fact_sizes = {key: value for key, value in fact_sizes.items() if key in owned_ids}
+            plan_fact_tokens = {key: value for key, value in fact_tokens.items() if key in owned_ids}
+            plan_units, plan_messages, plan_client = _bounded_plan_input(
+                job, plan_index, profile, plan_units, plan_fact_sizes, plan_fact_tokens,
+                plan_context, client,
+            )
+            output = _run_json_step(
+                job,
+                stage="global_plan",
+                step_index=plan_index,
+                input_payload={
+                    "prompt_version": GLOBAL_PLAN_PROMPT_VERSION,
+                    "profile": profile.model_dump(mode="json"),
+                    "units": _compact_global_units(plan_units),
+                    "fact_sizes": plan_fact_sizes,
+                    "fact_tokens": plan_fact_tokens,
+                    "structure": plan_context,
+                },
+                input_refs={
+                    "unit_ids": [unit["id"] for unit in plan_units],
+                    "fact_ids": [fact.id for fact in plan_facts],
+                },
+                messages=plan_messages,
+                client=plan_client,
+                max_tokens=GLOBAL_PLAN_MAX_TOKENS,
+                validator=lambda raw, owned_units=plan_units, owned_facts=plan_facts, owned_scope=chapter_scope: _validate_global_plan(
+                    raw,
+                    owned_units,
+                    owned_facts,
+                    profile,
+                    bundle,
+                    owned_scope,
+                ),
+            )
+            plan_outputs.append(output)
+            job = _save_job(
+                _job_from_store(job.id), completed_planning_scopes=plan_index
+            )
     except Exception as error:  # noqa: BLE001
         if "API 请求超时" in str(error):
             raise ArtifactGenerationError(
@@ -1490,9 +2327,17 @@ def _generate_hierarchical_artifacts(
                 "已完成的局部整理会复用。\n" + str(error)
             ) from error
         raise ArtifactGenerationError(f"全局规划失败：{error}") from error
-    plans = plan_output["cards"]
-    question_summary.add(list(plan_output.get("open_questions") or []))
-    uncovered = list(plan_output.get("uncovered_fact_ids") or [])
+    plans: list[dict[str, Any]] = []
+    runtime_brief = None
+    chapter_briefs = []
+    uncovered = []
+    for output in plan_outputs:
+        output = _normalize_runtime_group_anchors(output, profile)
+        runtime_brief = runtime_brief or output.get("brief")
+        chapter_briefs.extend(output.get("chapter_briefs") or [])
+        question_summary.add(list(output.get("open_questions") or []))
+        uncovered.extend(output.get("uncovered_fact_ids") or [])
+        plans = _merge_chapter_plans(plans, output["cards"])
     if uncovered:
         question_summary.add(
             [f"全局计划未使用 {len(uncovered)} 条已提升事实；请在产物复核时检查覆盖范围。"]
@@ -1510,7 +2355,7 @@ def _generate_hierarchical_artifacts(
     for card_index, plan in enumerate(plans, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
-            return generated_cards, question_summary, current
+            return generated_cards, question_summary, current, runtime_brief, chapter_briefs
         selected_facts = [facts_by_id[fact_id] for fact_id in plan["fact_ids"]]
         fact_payload = _fact_payload_from_facts(selected_facts)
         subset_bundle = bundle.model_copy(
@@ -1531,17 +2376,18 @@ def _generate_hierarchical_artifacts(
                     "planned_card_id": plan["id"],
                     "fact_ids": plan["fact_ids"],
                 },
-                messages=_materialization_messages(
-                    profile, plan, fact_payload
-                ),
+                messages=_materialization_messages(profile, plan, fact_payload),
                 client=client,
                 max_tokens=ARTIFACT_MAX_TOKENS,
-                validator=lambda raw, selected_bundle=subset_bundle, card_plan=plan: _validate_materialized_card(
-                    raw,
-                    selected_bundle,
-                    profile,
-                    card_plan,
-                    model_id=getattr(client, "model", "configured-model"),
+                validator=lambda raw, selected_bundle=subset_bundle, card_plan=plan: (
+                    _validate_materialized_card(
+                        raw,
+                        selected_bundle,
+                        profile,
+                        card_plan,
+                        model_id=getattr(client, "model", "configured-model"),
+                        prep_unit_id=prep_unit_id,
+                    )
                 ),
             )
         except Exception as error:  # noqa: BLE001
@@ -1555,9 +2401,7 @@ def _generate_hierarchical_artifacts(
                 **_question_summary_fields(question_summary),
             )
             continue
-        generated_cards.extend(
-            DerivedCard.model_validate(card) for card in output["cards"]
-        )
+        generated_cards.extend(DerivedCard.model_validate(card) for card in output["cards"])
         question_summary.add(list(output.get("open_questions") or []))
         job = _save_job(
             _job_from_store(job.id),
@@ -1573,7 +2417,7 @@ def _generate_hierarchical_artifacts(
             f"本轮 {len(plans)} 张计划卡已全部尝试，其中 {len(failed_cards)} 项失败。"
             f"请使用‘重试失败项’；已成功步骤会复用。{preview}"
         )
-    return generated_cards, question_summary, job
+    return generated_cards, question_summary, job, runtime_brief, chapter_briefs
 
 
 def _prompt_messages(
@@ -1645,9 +2489,13 @@ def _prompt_messages(
     ]
 
 
-def _stable_card_id(bundle_id: str, draft: DraftCardPayload) -> str:
+def _stable_card_id(
+    bundle_id: str, draft: DraftCardPayload, prep_unit_id: str | None = None
+) -> str:
     content = json.dumps(draft.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
-    digest = hashlib.sha256(f"{bundle_id}:{content}".encode("utf-8")).hexdigest()[:14]
+    digest = hashlib.sha256(
+        f"{bundle_id}:{prep_unit_id or 'unscoped'}:{content}".encode("utf-8")
+    ).hexdigest()[:14]
     type_slug = re.sub(r"[^a-z0-9_]+", "_", draft.type.lower()).strip("_") or "artifact"
     return f"card_generated_{type_slug}_{digest}"
 
@@ -1659,6 +2507,7 @@ def _validate_and_build(
     *,
     model_id: str,
     require_runtime_anchor: bool = True,
+    prep_unit_id: str | None = None,
 ) -> tuple[list[DerivedCard], list[str]]:
     if isinstance(raw, list):
         raw = {"cards": raw, "open_questions": []}
@@ -1673,6 +2522,11 @@ def _validate_and_build(
                 card = _normalize_nested_field_provenance(dict(card))
                 card = _normalize_list_item_provenance(card)
                 fields = dict(card["fields"])
+                statistics = fields.get("source_statistics")
+                if isinstance(statistics, list) and all(isinstance(item, str) for item in statistics):
+                    fields["source_statistics"] = "\n".join(statistics)
+                if fields.get("current_stage", "") is None:
+                    fields["current_stage"] = ""
                 for field_name in LIST_FIELDS:
                     value = fields.get(field_name)
                     if isinstance(value, str) and value.strip():
@@ -1687,7 +2541,7 @@ def _validate_and_build(
                 field_sources = card.get("field_sources")
                 if isinstance(field_sources, dict):
                     card["field_sources"] = {
-                        field_name: _flatten_one_level(refs)
+                        field_name: _normalize_field_source_refs(refs)
                         for field_name, refs in field_sources.items()
                     }
             normalized_cards.append(card)
@@ -1699,8 +2553,7 @@ def _validate_and_build(
         raise ArtifactGenerationError(f"备团产物 JSON 不符合约定: {error}") from error
 
     allowed_facts = {
-        fact.id: fact for fact in bundle.facts
-        if fact.evidence_status != "model_candidate"
+        fact.id: fact for fact in bundle.facts if fact.evidence_status != "model_candidate"
     }
     definitions = {item.type: item for item in profile.card_definitions}
     seen_keys: set[tuple[str, str]] = set()
@@ -1724,21 +2577,15 @@ def _validate_and_build(
         allowed_fields = set(definition.required_fields) | set(definition.optional_fields)
         unknown_fields = sorted(set(draft.fields) - allowed_fields)
         if unknown_fields:
-            raise ArtifactGenerationError(
-                f"产物 {draft.title} 包含未定义字段: {unknown_fields}"
-            )
+            raise ArtifactGenerationError(f"产物 {draft.title} 包含未定义字段: {unknown_fields}")
         missing_fields = [
             key for key in definition.required_fields if not _nonempty(draft.fields.get(key))
         ]
         if missing_fields:
-            raise ArtifactGenerationError(
-                f"产物 {draft.title} 缺少必填字段: {missing_fields}"
-            )
+            raise ArtifactGenerationError(f"产物 {draft.title} 缺少必填字段: {missing_fields}")
         for field_name in LIST_FIELDS & set(draft.fields):
             if not isinstance(draft.fields[field_name], list):
-                raise ArtifactGenerationError(
-                    f"产物 {draft.title} 的 {field_name} 必须是数组"
-                )
+                raise ArtifactGenerationError(f"产物 {draft.title} 的 {field_name} 必须是数组")
         scalar_fields = set(draft.fields) - LIST_FIELDS
         invalid_scalar_fields = sorted(
             field_name
@@ -1757,16 +2604,12 @@ def _validate_and_build(
         field_sources: dict[str, list[str]] = {}
         closure = list(draft.fact_ids)
         for field_name in draft.fields:
-            if field_name == "gm_moves" and not draft.field_sources.get(field_name):
-                # GM moves are explicitly allowed to be authored operating prompts.
+            if field_name in GM_AUTHORED_FIELDS and not draft.field_sources.get(field_name):
+                # Explicit GM operating prompts may be authored without claiming provenance.
                 # They must never silently claim source provenance.
                 field_sources[field_name] = []
                 continue
-            refs = list(
-                dict.fromkeys(
-                    draft.field_sources.get(field_name) or list(draft.fact_ids)
-                )
-            )
+            refs = list(dict.fromkeys(draft.field_sources.get(field_name) or list(draft.fact_ids)))
             unknown_refs = [item for item in refs if item not in allowed_facts]
             if unknown_refs:
                 raise ArtifactGenerationError(
@@ -1777,14 +2620,13 @@ def _validate_and_build(
                     closure.append(fact_id)
             field_sources[field_name] = refs
         if len(closure) > 100:
-            raise ArtifactGenerationError(
-                f"产物 {draft.title} 的事实闭包超过允许上限"
-            )
+            raise ArtifactGenerationError(f"产物 {draft.title} 的事实闭包超过允许上限")
 
         cards.append(
             DerivedCard(
-                id=_stable_card_id(bundle.id, draft),
+                id=_stable_card_id(bundle.id, draft, prep_unit_id),
                 profile_id=profile.id,
+                prep_unit_id=prep_unit_id,
                 type=draft.type,
                 title=draft.title,
                 subtitle=draft.subtitle,
@@ -1792,6 +2634,7 @@ def _validate_and_build(
                 fields=draft.fields,
                 field_sources=field_sources,
                 open_questions=draft.open_questions,
+                runtime_group_ids=draft.runtime_group_ids,
                 generation=CardGeneration(
                     model_id=model_id,
                     prompt_version=PROMPT_VERSION,
@@ -1801,8 +2644,10 @@ def _validate_and_build(
             )
         )
 
-    if require_runtime_anchor and profile.profile_kind == "runtime" and not any(
-        card.type in RUNTIME_ANCHOR_TYPES for card in cards
+    if (
+        require_runtime_anchor
+        and profile.profile_kind == "runtime"
+        and not any(card.type in RUNTIME_ANCHOR_TYPES for card in cards)
     ):
         raise ArtifactGenerationError("运行板块的产物缺少场景或环境卡")
     response_questions = _unique_questions(

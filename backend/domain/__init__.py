@@ -1,8 +1,9 @@
 """Rule-agnostic domain models and validation for the rebuilt prep tool."""
 
-from .models import ArtifactDraftJob, CardGeneration, DisplayMaterial, DisplayMaterialLink, EvidenceStatus, DerivedCard, FactProvenance, RuleProfile, SceneBeat, ScenePlan, SessionLogEntry, SessionState, SourceFact, SourceRef
-from .prep import CoreTextSlice, ExtractionWindow, PageSpan, PrepJob, PrepJobCreate, PrepScope, parse_page_spans
+from .models import ArtifactDraftJob, CardGeneration, DisplayMaterial, DisplayMaterialLink, EvidenceStatus, DerivedCard, FactProvenance, RuleProfile, SceneBeat, ScenePlan, SessionLogEntry, SessionState, SourceFact, SourceRef, StructureDraftJob
+from .prep import AdventureChapter, CoreTextSlice, ExtractionWindow, FactDisposition, PageSpan, PrepJob, PrepJobCreate, PrepScope, PrepUnit, RuntimeBrief, StoryBeat, StoryThread, parse_page_spans
 from .shadow import (
+    MAX_SHADOW_RESPONSE_CANDIDATES,
     ShadowCandidate,
     ShadowCandidateDraft,
     ShadowCandidateEdit,
@@ -34,6 +35,9 @@ __all__ = [
     "DisplayMaterial",
     "DisplayMaterialLink",
     "ArtifactDraftJob",
+    "StructureDraftJob",
+    "AdventureChapter",
+    "FactDisposition",
     "CardGeneration",
     "EvidenceStatus",
     "FactProvenance",
@@ -45,11 +49,16 @@ __all__ = [
     "PrepJob",
     "PrepJobCreate",
     "PrepScope",
+    "PrepUnit",
+    "RuntimeBrief",
+    "StoryThread",
+    "StoryBeat",
     "RuleProfile",
     "SceneBeat",
     "ScenePlan",
     "SessionLogEntry",
     "SessionState",
+    "MAX_SHADOW_RESPONSE_CANDIDATES",
     "ShadowCandidate",
     "ShadowCandidateDraft",
     "ShadowCandidateEdit",

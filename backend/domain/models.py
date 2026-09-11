@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .prep import AdventureChapter, FactDisposition, PrepUnit, RuntimeBrief, StoryBeat, StoryThread
 
 
 FactKind = Literal[
@@ -31,8 +34,17 @@ ArtifactJobPhase = Literal[
     "validating",
     "completed",
 ]
+StructureJobStatus = Literal["queued", "running", "completed", "failed"]
+StructureJobPhase = Literal[
+    "queued",
+    "local_observations",
+    "consolidating",
+    "assigning_facts",
+    "validating",
+    "completed",
+]
 BeatMode = Literal["arrival", "investigation", "pressure", "revelation", "confrontation", "aftermath", "transition"]
-RuntimeNavigationMode = Literal["location", "beat"]
+RuntimeNavigationMode = Literal["location", "environment", "beat"]
 TriggerState = Literal["unhandled", "active", "resolved"]
 SessionLogKind = Literal[
     # Legacy values remain readable so existing saved sessions do not break.
@@ -212,6 +224,8 @@ class RuleProfile(BaseModel):
     version: str = Field(min_length=1)
     profile_kind: ProfileKind = "runtime"
     summary: str = ""
+    runtime_anchor_type: str | None = None
+    runtime_navigation_mode: RuntimeNavigationMode | None = None
     card_definitions: list[CardDefinition]
     risk_axes: list[str] = Field(default_factory=list)
     failure_moves: list[str] = Field(default_factory=list)
@@ -225,6 +239,21 @@ class RuleProfile(BaseModel):
         duplicates = sorted({item for item in types if types.count(item) > 1})
         if duplicates:
             raise ValueError(f"duplicate card types: {duplicates}")
+        if self.profile_kind == "runtime":
+            if self.runtime_anchor_type is None:
+                if "location" in types:
+                    self.runtime_anchor_type = "location"
+                elif "environment" in types:
+                    self.runtime_anchor_type = "environment"
+            if self.runtime_navigation_mode is None:
+                if self.runtime_anchor_type in {"location", "environment"}:
+                    self.runtime_navigation_mode = self.runtime_anchor_type
+            if not self.runtime_anchor_type or not self.runtime_navigation_mode:
+                raise ValueError("runtime profiles must declare their anchor type and navigation mode")
+            if self.runtime_anchor_type not in types:
+                raise ValueError("runtime anchor type must be defined by the profile")
+        elif self.runtime_anchor_type is not None or self.runtime_navigation_mode is not None:
+            raise ValueError("preparation-only profiles cannot declare runtime navigation")
         return self
 
     def definition_for(self, card_type: str) -> CardDefinition:
@@ -248,6 +277,9 @@ class DerivedCard(BaseModel):
     id: str = Field(pattern=r"^card_[a-z][a-z0-9_]*$")
     campaign_id: int | None = None
     profile_id: str = Field(min_length=1)
+    prep_unit_id: str | None = Field(default=None, pattern=r"^prep_unit_[a-z0-9_-]+$")
+    chapter_ids: list[str] = Field(default_factory=list, max_length=24)
+    story_beat_ids: list[str] = Field(default_factory=list, max_length=120)
     type: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_-]*$")
     title: str = Field(min_length=1)
     subtitle: str | None = None
@@ -255,6 +287,7 @@ class DerivedCard(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
     field_sources: dict[str, list[str]] = Field(default_factory=dict)
     open_questions: list[str] = Field(default_factory=list)
+    runtime_group_ids: list[str] = Field(default_factory=list, max_length=20)
     generation: CardGeneration | None = None
     edit_state: CardEditState = "generated"
 
@@ -266,6 +299,20 @@ class DerivedCard(BaseModel):
     @field_validator("open_questions")
     @classmethod
     def normalize_open_questions(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @field_validator("runtime_group_ids")
+    @classmethod
+    def normalize_runtime_group_ids(cls, value: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+        invalid = [item for item in cleaned if not re.fullmatch(r"encounter_[a-z0-9_-]+", item)]
+        if invalid:
+            raise ValueError(f"invalid runtime group ids: {invalid}")
+        return cleaned
+
+    @field_validator("chapter_ids")
+    @classmethod
+    def normalize_chapter_ids(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
 
@@ -326,6 +373,7 @@ class ArtifactDraftJob(BaseModel):
     id: str = Field(pattern=r"^artifact_job_[a-z0-9_-]+$")
     workspace_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    prep_unit_id: str | None = Field(default=None, pattern=r"^prep_unit_[a-z0-9_-]+$")
     model_id: str = Field(min_length=1, max_length=160)
     fake_model: bool = False
     status: ArtifactJobStatus = "queued"
@@ -335,6 +383,8 @@ class ArtifactDraftJob(BaseModel):
     batch_count: int = Field(default=0, ge=0)
     completed_batches: int = Field(default=0, ge=0)
     unit_count: int = Field(default=0, ge=0)
+    planning_scope_count: int = Field(default=0, ge=0)
+    completed_planning_scopes: int = Field(default=0, ge=0)
     planned_card_count: int = Field(default=0, ge=0)
     completed_cards: int = Field(default=0, ge=0)
     input_fingerprint: str | None = Field(default=None, max_length=160)
@@ -379,12 +429,48 @@ class ArtifactDraftJob(BaseModel):
             raise ValueError("completed_batches cannot exceed batch_count")
         if self.completed_cards > self.planned_card_count:
             raise ValueError("completed_cards cannot exceed planned_card_count")
+        if self.completed_planning_scopes > self.planning_scope_count:
+            raise ValueError("completed planning scopes cannot exceed planning scope count")
         if self.open_question_count < len(self.open_questions):
             raise ValueError("open_question_count cannot be below the displayed preview")
         if self.open_question_overflow_count != (
             self.open_question_count - len(self.open_questions)
         ):
             raise ValueError("open question overflow count must match the displayed preview")
+        return self
+
+
+class StructureDraftJob(BaseModel):
+    """Durable generation state for one reviewed long-form adventure structure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^structure_job_[a-z0-9_-]+$")
+    workspace_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    model_id: str = Field(min_length=1, max_length=160)
+    fake_model: bool = False
+    status: StructureJobStatus = "queued"
+    phase: StructureJobPhase = "queued"
+    fact_count: int = Field(default=0, ge=0)
+    batch_count: int = Field(default=0, ge=0)
+    completed_batches: int = Field(default=0, ge=0)
+    chapter_count: int = Field(default=0, ge=0)
+    thread_count: int = Field(default=0, ge=0)
+    beat_count: int = Field(default=0, ge=0)
+    error: str | None = Field(default=None, max_length=2000)
+    created_at: str = Field(min_length=1)
+    updated_at: str = Field(min_length=1)
+
+    @field_validator("model_id", "error")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def progress_is_consistent(self) -> "StructureDraftJob":
+        if self.completed_batches > self.batch_count:
+            raise ValueError("completed_batches cannot exceed batch_count")
         return self
 
 
@@ -420,6 +506,7 @@ class ScenePlan(BaseModel):
 
     id: str = Field(pattern=r"^plan_[a-z][a-z0-9_-]*$")
     profile_id: str = Field(min_length=1)
+    prep_unit_id: str | None = Field(default=None, pattern=r"^prep_unit_[a-z0-9_-]+$")
     title: str = Field(min_length=1)
     subtitle: str | None = None
     source_file: str = Field(min_length=1)
@@ -428,6 +515,7 @@ class ScenePlan(BaseModel):
     card_ids: list[str] = Field(default_factory=list)
     navigation_mode: RuntimeNavigationMode = "beat"
     location_card_ids: list[str] = Field(default_factory=list)
+    environment_card_ids: list[str] = Field(default_factory=list)
     beats: list[SceneBeat] = Field(default_factory=list)
     exit_states: list[str] = Field(default_factory=list)
     notes: str | None = None
@@ -444,10 +532,18 @@ class ScenePlan(BaseModel):
             raise ValueError(f"duplicate scene beat id in plan {self.id}")
         if len(self.location_card_ids) != len(set(self.location_card_ids)):
             raise ValueError(f"duplicate location card id in plan {self.id}")
+        if len(self.environment_card_ids) != len(set(self.environment_card_ids)):
+            raise ValueError(f"duplicate environment card id in plan {self.id}")
         if any(card_id not in self.card_ids for card_id in self.location_card_ids):
             raise ValueError(f"location cards must belong to plan {self.id}")
-        if self.navigation_mode == "location" and self.beats:
-            raise ValueError(f"location-led plan {self.id} cannot contain linear beats")
+        if any(card_id not in self.card_ids for card_id in self.environment_card_ids):
+            raise ValueError(f"environment cards must belong to plan {self.id}")
+        if self.navigation_mode in {"location", "environment"} and self.beats:
+            raise ValueError(f"anchor-led plan {self.id} cannot contain linear beats")
+        if self.navigation_mode == "location" and not self.location_card_ids:
+            raise ValueError(f"location-led plan {self.id} needs a location card")
+        if self.navigation_mode == "environment" and not self.environment_card_ids:
+            raise ValueError(f"environment-led plan {self.id} needs an environment card")
         if self.navigation_mode == "beat" and not self.beats:
             raise ValueError(f"beat-led plan {self.id} needs at least one beat")
         return self
@@ -515,5 +611,11 @@ class ExampleBundle(BaseModel):
     profile_ids: list[str] = Field(min_length=1)
     facts: list[SourceFact]
     cards: list[DerivedCard]
+    runtime_brief: RuntimeBrief | None = None
+    adventure_chapters: list[AdventureChapter] = Field(default_factory=list)
+    story_beats: list[StoryBeat] = Field(default_factory=list)
+    prep_units: list[PrepUnit] = Field(default_factory=list)
+    story_threads: list[StoryThread] = Field(default_factory=list)
+    fact_dispositions: list[FactDisposition] = Field(default_factory=list)
     display_materials: list[DisplayMaterial] = Field(default_factory=list)
     plans: list[ScenePlan] = Field(default_factory=list)

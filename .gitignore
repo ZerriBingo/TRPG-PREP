@@ -10,6 +10,7 @@ __pycache__/
 output/
 _tmp*.py
 _tmp*.patch
+tmp/
 
 # Local/reference material may be copyrighted or too large for the public source repo.
 Resource/

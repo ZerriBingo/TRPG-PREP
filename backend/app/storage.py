@@ -136,6 +136,14 @@ CREATE TABLE IF NOT EXISTS artifact_job_steps (
     updated_at TEXT NOT NULL,
     UNIQUE(job_id, stage, step_index, input_hash)
 );
+CREATE TABLE IF NOT EXISTS structure_jobs (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    data         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_shadow_runs_task_id ON shadow_runs(task_id, attempt);
 CREATE INDEX IF NOT EXISTS idx_shadow_candidates_review ON shadow_candidates(review_state, created_at);
 CREATE INDEX IF NOT EXISTS idx_shadow_candidates_task_id ON shadow_candidates(task_id, created_at);
@@ -143,6 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_prep_jobs_status ON prep_jobs(status, updated_at)
 CREATE INDEX IF NOT EXISTS idx_candidate_promotions_workspace ON candidate_promotions(workspace_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifact_jobs_workspace ON artifact_jobs(workspace_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_artifact_job_steps_job ON artifact_job_steps(job_id, stage, step_index);
+CREATE INDEX IF NOT EXISTS idx_structure_jobs_workspace ON structure_jobs(workspace_id, updated_at);
 """
 
 
@@ -337,6 +346,7 @@ def delete_domain_workspace(bundle_id: str) -> bool:
                 "SELECT 1 FROM domain_bundles WHERE id = ?",
                 "SELECT 1 FROM candidate_promotions WHERE workspace_id = ? LIMIT 1",
                 "SELECT 1 FROM artifact_jobs WHERE workspace_id = ? LIMIT 1",
+                "SELECT 1 FROM structure_jobs WHERE workspace_id = ? LIMIT 1",
                 "SELECT 1 FROM session_states WHERE id = ?",
                 "SELECT 1 FROM prep_jobs WHERE id = ?",
             )
@@ -349,6 +359,12 @@ def delete_domain_workspace(bundle_id: str) -> bool:
             (bundle_id,),
         )
         conn.execute("DELETE FROM artifact_jobs WHERE workspace_id = ?", (bundle_id,))
+        conn.execute(
+            "DELETE FROM artifact_job_steps WHERE job_id IN "
+            "(SELECT id FROM structure_jobs WHERE workspace_id = ?)",
+            (bundle_id,),
+        )
+        conn.execute("DELETE FROM structure_jobs WHERE workspace_id = ?", (bundle_id,))
         conn.execute("DELETE FROM session_states WHERE id = ?", (bundle_id,))
         conn.execute("DELETE FROM domain_bundles WHERE id = ?", (bundle_id,))
         conn.commit()
@@ -405,6 +421,7 @@ def delete_workspace_instances(workspace_ids: list[str]) -> int:
                 ("SELECT 1 FROM artifact_jobs WHERE workspace_id = ? LIMIT 1", (target,)),
                 ("SELECT 1 FROM session_states WHERE id = ?", (target,)),
                 ("SELECT 1 FROM prep_jobs WHERE id = ?", (target,)),
+                ("SELECT 1 FROM structure_jobs WHERE workspace_id = ? LIMIT 1", (target,)),
             )
             if any(conn.execute(query, params).fetchone() is not None for query, params in checks):
                 matched_targets.add(target)
@@ -426,6 +443,15 @@ def delete_workspace_instances(workspace_ids: list[str]) -> int:
         )
         conn.execute(
             f"DELETE FROM artifact_jobs WHERE workspace_id IN ({placeholders})",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM artifact_job_steps WHERE job_id IN "
+            f"(SELECT id FROM structure_jobs WHERE workspace_id IN ({placeholders}))",
+            targets,
+        )
+        conn.execute(
+            f"DELETE FROM structure_jobs WHERE workspace_id IN ({placeholders})",
             targets,
         )
         conn.execute(
@@ -1073,6 +1099,68 @@ def list_artifact_job_steps(job_id: str) -> list[dict]:
         "ORDER BY stage ASC, step_index ASC, created_at ASC",
         (job_id,),
     ).fetchall()
+    conn.close()
+    return [json.loads(row["data"]) for row in rows]
+
+
+# ---------- 冒险结构任务 ----------
+
+def create_structure_job(data: dict) -> None:
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO structure_jobs (id, workspace_id, status, data, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            data["id"],
+            data["workspace_id"],
+            data["status"],
+            json.dumps(data, ensure_ascii=False),
+            data["created_at"],
+            data["updated_at"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_structure_job(data: dict) -> None:
+    conn = _conn()
+    cursor = conn.execute(
+        "UPDATE structure_jobs SET status = ?, data = ?, updated_at = ? WHERE id = ?",
+        (
+            data["status"],
+            json.dumps(data, ensure_ascii=False),
+            data["updated_at"],
+            data["id"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+    if cursor.rowcount != 1:
+        raise ValueError(f"unknown structure job: {data['id']}")
+
+
+def load_structure_job(job_id: str) -> dict | None:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT data FROM structure_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    conn.close()
+    return json.loads(row["data"]) if row else None
+
+
+def list_structure_jobs(workspace_id: str | None = None) -> list[dict]:
+    conn = _conn()
+    if workspace_id is None:
+        rows = conn.execute(
+            "SELECT data FROM structure_jobs ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT data FROM structure_jobs WHERE workspace_id = ? "
+            "ORDER BY updated_at DESC, id DESC",
+            (workspace_id,),
+        ).fetchall()
     conn.close()
     return [json.loads(row["data"]) for row in rows]
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import httpx
@@ -170,7 +171,27 @@ async def main() -> None:
                 assert blocked_plan.status_code == 422, blocked_plan.text
                 assert "已批准" in blocked_plan.json()["detail"]
 
+                # Reviewing the whole generated result must work beyond 100 cards.
+                saved = storage.load_domain_bundle(bundle.id)[0]
+                while len(saved["cards"]) < 160:
+                    card = deepcopy(cards[0])
+                    card["id"] = f"card_bulk_review_{len(saved['cards'])}"
+                    saved["cards"].append(card)
+                storage.save_domain_bundle(bundle.id, saved)
+                cards = saved["cards"]
                 card_ids = [card["id"] for card in cards]
+                for invalid_ids, expected_status in (
+                    ([], 422),
+                    ([card_ids[0], card_ids[0]], 422),
+                    ([*card_ids, "card_unknown"], 404),
+                ):
+                    invalid = await client.post(
+                        f"/api/domain/examples/{bundle.id}/cards/review",
+                        json={"card_ids": invalid_ids, "action": "approve"},
+                    )
+                    assert invalid.status_code == expected_status, invalid.text
+                    assert all(card["edit_state"] == "generated"
+                               for card in storage.load_domain_bundle(bundle.id)[0]["cards"])
                 approved = await client.post(
                     f"/api/domain/examples/{bundle.id}/cards/review",
                     json={"card_ids": card_ids, "action": "approve"},
@@ -180,6 +201,19 @@ async def main() -> None:
                     card["edit_state"] == "approved"
                     for card in approved.json()["cards"]
                 )
+                assert len(approved.json()["cards"]) == 160
+                returned = await client.post(
+                    f"/api/domain/examples/{bundle.id}/cards/review",
+                    json={"card_ids": card_ids, "action": "reopen"},
+                )
+                assert returned.status_code == 200, returned.text
+                assert len(returned.json()["cards"]) == 160
+                assert all(card["edit_state"] == "edited" for card in returned.json()["cards"])
+                approved = await client.post(
+                    f"/api/domain/examples/{bundle.id}/cards/review",
+                    json={"card_ids": card_ids, "action": "approve"},
+                )
+                assert approved.status_code == 200, approved.text
 
                 plan_response = await client.post(
                     f"/api/domain/examples/{bundle.id}/plans/draft"
@@ -210,7 +244,7 @@ async def main() -> None:
                 )
                 assert reloaded.status_code == 200, reloaded.text
                 saved_bundle = reloaded.json()["bundle"]
-                assert len(saved_bundle["cards"]) == 5
+                assert len(saved_bundle["cards"]) == 160
                 assert len(saved_bundle["plans"]) == 1
 
                 task_ids = []

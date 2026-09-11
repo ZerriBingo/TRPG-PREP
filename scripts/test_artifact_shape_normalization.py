@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from copy import deepcopy
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.artifacts import (  # noqa: E402
     ArtifactGenerationError,
+    _fact_batches,
+    _merge_chapter_plans,
     _materialization_messages,
     _validate_global_plan,
     _validate_local_digest,
@@ -50,6 +53,24 @@ bundle = ExampleBundle(
     cards=[],
     plans=[],
 )
+
+digest = _validate_local_digest(
+    {
+        "units": [{
+            "kind": "scene",
+            "title": "跨批次引用",
+            "summary": "保留本批次事实。",
+            "fact_ids": ["fact_shape", "fact_from_other_batch"],
+            "relationship_hints": "待与下一批核对",
+        }],
+        "open_questions": [],
+    },
+    [bundle.facts[0]],
+    batch_index=1,
+)
+assert digest["units"][0]["fact_ids"] == ["fact_shape"]
+assert any("当前批次外" in item for item in digest["open_questions"])
+
 profile = load_profiles(ROOT / "backend" / "domain" / "profiles")["cthulhu-dark-2e"]
 raw = {
     "cards": [{
@@ -74,6 +95,15 @@ raw = {
     "open_questions": ["响应级问题"],
 }
 cards, questions = _validate_and_build(raw, bundle, profile, model_id="shape-test")
+malformed_provenance = deepcopy(raw)
+malformed_provenance["cards"][0]["field_sources"] = ["fact_shape"]
+try:
+    _validate_and_build(malformed_provenance, bundle, profile, model_id="shape-test")
+except ArtifactGenerationError as error:
+    assert "field_sources" in str(error)
+    assert "dictionary update sequence" not in str(error)
+else:
+    raise AssertionError("flat provenance lists must fail with a field validation error")
 assert cards[0].fields["relevant_characters"] == ["暂无在场人物"]
 assert "fact_shape_supporting" in cards[0].fact_ids
 assert set(cards[0].field_sources["relevant_characters"]).issubset(cards[0].fact_ids)
@@ -126,6 +156,29 @@ list_item_cards, _ = _validate_and_build(
 assert list_item_cards[0].fields["relevant_characters"] == ["门的看守者"]
 assert list_item_cards[0].field_sources["relevant_characters"] == ["fact_shape_supporting"]
 assert "fact_shape_supporting" in list_item_cards[0].fact_ids
+
+named_list_item = {
+    "cards": [{
+        "type": "location",
+        "title": "名称描述列表项测试",
+        "fact_ids": ["fact_shape"],
+        "fields": {
+            "normal_state": "门开着",
+            "arrival_description": "可以检查门锁",
+            "relevant_characters": [{
+                "name": "约拿·肯辛顿",
+                "description": "埃利亚斯的朋友和出版商，愿意与调查者谈话",
+            }],
+        },
+        "field_sources": {},
+    }],
+}
+named_cards, _ = _validate_and_build(
+    named_list_item, bundle, profile, model_id="shape-test"
+)
+assert named_cards[0].fields["relevant_characters"] == [
+    "约拿·肯辛顿：埃利亚斯的朋友和出版商，愿意与调查者谈话"
+]
 
 unknown_list_item_key = {
     "cards": [{
@@ -286,6 +339,91 @@ validated_plan = _validate_global_plan(
 )
 assert validated_plan["cards"][0]["focus"] == ["调查入口"]
 
+fantasy_profile = load_profiles(
+    ROOT / "backend" / "domain" / "profiles"
+)["daggerheart"]
+fantasy_plan = _validate_global_plan(
+    {
+        "cards": [
+            {
+                "type": "environment",
+                "title": "庄园局势",
+                "purpose": "提供可运行环境",
+                "fact_ids": ["fact_shape"],
+                "runtime_groups": ["庄园"],
+            },
+            {
+                "type": "npc",
+                "title": "庄园管家",
+                "purpose": "提供环境内人物支持",
+                "fact_ids": ["fact_shape_supporting"],
+                "runtime_groups": ["庄园"],
+            },
+            {
+                "type": "npc",
+                "title": "远方联系人",
+                "purpose": "提供可复用人物支持",
+                "fact_ids": ["fact_shape_supporting"],
+                "runtime_groups": ["不存在的塔楼"],
+            },
+        ],
+        "brief": {
+            "premise": "调查一座庄园。",
+            "current_situation": "庄园中的局势正在变化。",
+            "fact_ids": ["fact_shape"],
+        },
+    },
+    [{"fact_ids": ["fact_shape", "fact_shape_supporting"]}],
+    bundle.facts,
+    fantasy_profile,
+)
+environment_group = fantasy_plan["cards"][0]["runtime_group_ids"]
+assert len(environment_group) == 1
+assert fantasy_plan["cards"][1]["runtime_group_ids"] == environment_group
+assert fantasy_plan["cards"][2]["runtime_group_ids"] == []
+assert any("缺少环境锚点" in item for item in fantasy_plan["open_questions"])
+
+fantasy_environment, _ = _validate_and_build(
+    {
+        "cards": [{
+            "type": "environment",
+            "title": "感官与逐项来源",
+            "fact_ids": ["fact_shape"],
+            "fields": {
+                "environment_type": "探索",
+                "opening_image": "门在风中开启。",
+                "narrative_function": "提供进入庄园的局势。",
+                "impulses": ["风声催促来访者进入。"],
+                "usable_features": ["可以检查的门锁"],
+                "sensory_details": ["潮湿木头的气味", "门轴摩擦声"],
+            },
+            "field_sources": {
+                "environment_type": ["fact_shape"],
+                "opening_image": ["fact_shape"],
+                "narrative_function": ["fact_shape"],
+                "impulses": {"风声催促来访者进入。": ["fact_shape"]},
+                "usable_features": {"可以检查的门锁": ["fact_shape_supporting"]},
+                "sensory_details": {
+                    "潮湿木头的气味": ["fact_shape"],
+                    "门轴摩擦声": ["fact_shape_supporting"],
+                },
+            },
+        }],
+    },
+    bundle,
+    fantasy_profile,
+    model_id="shape-test",
+    require_runtime_anchor=False,
+)
+assert fantasy_environment[0].fields["sensory_details"] == [
+    "潮湿木头的气味",
+    "门轴摩擦声",
+]
+assert fantasy_environment[0].field_sources["sensory_details"] == [
+    "fact_shape",
+    "fact_shape_supporting",
+]
+
 many_cards = {
     "cards": [
         {
@@ -307,6 +445,33 @@ validated_many = _validate_global_plan(
     plan_profile,
 )
 assert len(validated_many["cards"]) == 53
+
+plan_a = {
+    "type": "npc", "title": "跨章人物", "fact_ids": [f"fact_{index}" for index in range(60)],
+    "focus": [], "open_questions": [], "runtime_group_ids": [], "chapter_ids": ["chapter_a"],
+}
+plan_b = {
+    "type": "npc", "title": "跨章人物", "fact_ids": [f"fact_{index}" for index in range(60, 120)],
+    "focus": [], "open_questions": [], "runtime_group_ids": [], "chapter_ids": ["chapter_b"],
+}
+assert len(_merge_chapter_plans([plan_a], [plan_b])) == 2
+mergeable_b = {**plan_b, "fact_ids": ["fact_60"]}
+merged_cross_chapter = _merge_chapter_plans([plan_a], [mergeable_b])
+assert len(merged_cross_chapter) == 1
+assert merged_cross_chapter[0]["chapter_ids"] == ["chapter_a", "chapter_b"]
+
+tiny_facts = [
+    SourceFact(
+        id=f"fact_tiny_{index}",
+        text="短事实",
+        kind="event",
+        visibility="explicit",
+        source_refs=[SourceRef(file="fixture://tiny", page=1)],
+    )
+    for index in range(201)
+]
+tiny_batches = _fact_batches(tiny_facts)
+assert [len(item) for item in tiny_batches] == [200, 1]
 
 local_units = _validate_local_digest(
     {

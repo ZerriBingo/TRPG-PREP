@@ -133,6 +133,212 @@ class PrepScope(BaseModel):
         return spans
 
 
+class RuntimeBrief(BaseModel):
+    """Package-level situation summary; intentionally not a bookshelf card."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    premise: str = Field(min_length=1, max_length=2000)
+    current_situation: str = Field(min_length=1, max_length=2000)
+    major_conflicts: list[str] = Field(default_factory=list, max_length=30)
+    opening_conditions: list[str] = Field(default_factory=list, max_length=30)
+    possible_endings: list[str] = Field(default_factory=list, max_length=30)
+    key_people: list[str] = Field(default_factory=list, max_length=30)
+    factions: list[str] = Field(default_factory=list, max_length=30)
+    cross_environment_consequences: list[str] = Field(default_factory=list, max_length=30)
+    fact_ids: list[str] = Field(default_factory=list, max_length=100)
+    field_sources: dict[str, list[str]] = Field(default_factory=dict)
+    open_questions: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator(
+        "premise", "current_situation", "major_conflicts", "opening_conditions",
+        "possible_endings", "key_people", "factions", "cross_environment_consequences",
+        "fact_ids", "open_questions"
+    )
+    @classmethod
+    def normalize_text(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return list(dict.fromkeys(item.strip() for item in value if isinstance(item, str) and item.strip()))
+
+
+class PrepUnit(BaseModel):
+    """A deliberate preparation slice within a source and profile.
+
+    Membership is the reviewed set of fact ids; page spans remain provenance
+    anchors so a unit can still be traced back to its source range.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^prep_unit_[a-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=160)
+    source_file: str = Field(min_length=1, max_length=500)
+    source_version: str = Field(min_length=1, max_length=160)
+    page_spans: list[PageSpan] = Field(min_length=1, max_length=24)
+    profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    kind: Literal["one_shot", "chapter", "arc", "reference"] = "chapter"
+    objective: str = Field(min_length=1, max_length=2000)
+    description: str = Field(default="", max_length=2000)
+    fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+    runtime_brief: "RuntimeBrief | None" = None
+
+    @field_validator("title", "source_file", "source_version", "profile_id", "objective", "description")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("fact_ids")
+    @classmethod
+    def unique_fact_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @field_validator("page_spans")
+    @classmethod
+    def normalize_spans(cls, value: list[PageSpan]) -> list[PageSpan]:
+        spans = normalize_page_spans(value)
+        if sum(span.page_count for span in spans) > 240:
+            raise ValueError("one prep unit cannot exceed 240 selected pages")
+        return spans
+
+
+ChapterReviewState = Literal["generated", "edited", "approved"]
+ThreadKind = Literal["faction", "truth_chain", "location", "character", "event", "free"]
+ThreadChapterRole = Literal["introduce", "develop", "resolve", "background"]
+FactDispositionKind = Literal["chapter", "global_reference", "display_material", "deferred"]
+
+
+class AdventureChapter(BaseModel):
+    """A reviewable narrative preparation scope, independent of source pagination."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^chapter_[a-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=160)
+    summary: str = Field(min_length=1, max_length=2000)
+    fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+    overview: RuntimeBrief | None = None
+    reference_fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+    review_state: ChapterReviewState = "generated"
+
+    @field_validator("title", "summary")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("fact_ids")
+    @classmethod
+    def unique_fact_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+class ThreadDevelopment(BaseModel):
+    """A proposed thread change and what remains open after a chapter-local beat."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    development: str = Field(min_length=1, max_length=600)
+    carry_forward: str = Field(min_length=1, max_length=600)
+
+
+class StoryBeat(BaseModel):
+    """A possible narrative development, not a mandatory runtime step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^story_beat_[a-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=160)
+    summary: str = Field(min_length=1, max_length=2000)
+    chapter_id: str = Field(pattern=r"^chapter_[a-z0-9_-]+$")
+    thread_ids: list[str] = Field(default_factory=list, max_length=24)
+    thread_developments: dict[str, ThreadDevelopment] = Field(default_factory=dict, max_length=24)
+    interplay: str = Field(default="", max_length=1200)
+    fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+    review_state: ChapterReviewState = "generated"
+
+    @model_validator(mode="after")
+    def development_membership(self) -> "StoryBeat":
+        if self.thread_developments:
+            if set(self.thread_developments) != set(self.thread_ids):
+                raise ValueError("beat developments must cover exactly its selected threads")
+            if not self.interplay.strip():
+                raise ValueError("beat developments need an interplay explanation")
+        return self
+
+    @field_validator("title", "summary")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("thread_ids", "fact_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+class StoryThread(BaseModel):
+    """A reviewable storyline that may support several adventure chapters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^thread_[a-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=160)
+    kind: ThreadKind = "free"
+    summary: str = Field(default="", max_length=2000)
+    chapter_roles: dict[str, ThreadChapterRole] = Field(default_factory=dict, max_length=24)
+    fact_ids: list[str] = Field(default_factory=list, max_length=2000)
+    review_state: ChapterReviewState = "generated"
+
+    @field_validator("title", "summary")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("fact_ids")
+    @classmethod
+    def unique_fact_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @field_validator("chapter_roles")
+    @classmethod
+    def normalize_chapter_ids(
+        cls, value: dict[str, ThreadChapterRole]
+    ) -> dict[str, ThreadChapterRole]:
+        return {key.strip(): role for key, role in value.items() if key.strip()}
+
+
+class FactDisposition(BaseModel):
+    """The reviewed preparation use of one promoted fact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str = Field(min_length=1)
+    kind: FactDispositionKind
+    chapter_ids: list[str] = Field(default_factory=list, max_length=24)
+    thread_ids: list[str] = Field(default_factory=list, max_length=24)
+    reason: str = Field(default="", max_length=500)
+
+    @field_validator("fact_id", "reason")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("chapter_ids", "thread_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @model_validator(mode="after")
+    def chapter_membership_matches_kind(self) -> "FactDisposition":
+        if self.kind == "chapter" and not self.chapter_ids:
+            raise ValueError("chapter fact disposition needs at least one chapter")
+        if self.kind != "chapter" and self.chapter_ids:
+            raise ValueError("only chapter fact dispositions may list chapters")
+        if self.kind == "deferred" and not self.reason:
+            raise ValueError("deferred fact disposition needs a reason")
+        return self
+
+
 class PrepJobCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

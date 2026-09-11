@@ -56,17 +56,18 @@
   "cards": [
     {
       "id": "card_red_signal_scene",
-      "profile_id": "cthulhu-dark-2e", "type": "scene",
+      "profile_id": "cthulhu-dark-2e", "type": "location",
       "title": "红信号旅馆", "subtitle": "停电后的前台与酒窖",
       "fact_ids": ["fact_red_signal_location", "fact_front_desk_clerk", "fact_storm_cutoff"],
       "edit_state": "approved",
       "fields": {
-        "opening_image": "雨水漫过大堂地毯，蜡烛把职员的脸照得忽明忽暗。",
-        "immediate_actions": ["询问停电时的住客", "检查账簿与前台抽屉", "观察酒窖门和地面痕迹"],
+        "normal_state": "暴雨夜停电的红信号旅馆：职员守在前台，酒窖门从内侧锁住。",
+        "arrival_description": "雨水漫过大堂地毯，蜡烛把职员的脸照得忽明忽暗。",
+        "first_triggers": ["询问停电时的住客", "检查账簿与前台抽屉", "观察酒窖门和地面痕迹"],
         "direct_clues": ["后路已断", "职员反复擦拭台面", "酒窖门从内侧锁住"],
         "hidden_clues": ["账簿缺页", "单向湿痕", "锁孔里的湿棉絮"],
         "gm_moves": ["让蜡烛熄灭一瞬", "让职员重复一句矛盾的话", "让地下传来一次水声"],
-        "risk_if_pressed": "职员会呼救或销毁账簿；酒窖里的东西也会注意到光源。",
+        "consequences": "职员会呼救或销毁账簿；酒窖里的东西也会注意到光源。",
         "exit_conditions": ["拿到账簿缺页", "说服职员合作", "确认酒窖来源后撤到公共房间"]
       }
     },
@@ -75,13 +76,18 @@
       "profile_id": "daggerheart", "type": "environment",
       "title": "被淹的大堂", "subtitle": "狭窄、湿滑、光线不稳",
       "fact_ids": ["fact_red_signal_location", "fact_storm_cutoff", "fact_locked_cellar"],
+      "runtime_group_ids": ["encounter_flooded_lobby"],
       "fields": {
+        "environment_type": "traversal",
         "opening_image": "积水、倒塌的行李架和摇晃烛台把大堂切成三条窄路。",
+        "narrative_function": "迫使众人分组行动、争夺高地，并在水位上涨前决定去留。",
+        "impulses": ["积水上涨", "吞没声响与光源"],
         "usable_features": ["柜台可作掩体", "行李架可搭路", "绳索可横跨积水"],
         "hazards": ["湿滑石板", "裸露电线", "酒窖门后的未知空间"],
         "positioning": "前台居高，楼梯狭窄，酒窖入口是唯一低位通道。",
-        "environment_changes": "水位每上升一档，移动和听觉都更困难。",
-        "noncombat_exits": ["从厨房侧门撤离", "把战斗引向高台", "用沙袋改道水流"]
+        "gm_responses": ["水位再涨一档，切断一条窄路", "熄灭最近的光源并让水下传来拖拽声"],
+        "phase_changes": "水位每上升一档，移动和听觉都更困难。",
+        "exit_outcomes": ["从厨房侧门撤离", "把战斗引向高台", "用沙袋改道水流"]
       }
     },
     {
@@ -89,8 +95,10 @@
       "profile_id": "daggerheart", "type": "enemy",
       "title": "湿痕行者", "subtitle": "只留下单向痕迹",
       "fact_ids": ["fact_wet_footprints"],
+      "runtime_group_ids": ["encounter_flooded_lobby"],
       "fields": {
-        "intention": "观察能打开酒窖的人，并在黑暗中拖走落单者。",
+        "motives": ["把落单者拖进水下"],
+        "current_objective": "观察能打开酒窖的人，并在黑暗中拖走落单者。",
         "signature_actions": ["熄灭最近的光源", "贴墙绕后", "把目标拖向低处"],
         "danger_signs": "烛焰变蓝，水声停了，湿气贴上后颈。",
         "damaged_behavior": "受伤后退入积水，用蒸汽和黑暗遮蔽行踪。",

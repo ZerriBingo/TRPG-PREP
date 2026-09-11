@@ -293,9 +293,10 @@ class LLMClient:
 
     def chat_json(self, messages: list[dict], **kw) -> dict:
         """调用模型（流式）并解析 JSON；空响应/解析失败各重发一次。"""
+        working_messages = list(messages)
         for _ in range(2):
             # 非流式：curl_cffi 流式在 uvicorn 线程里会卡，非流式稳定
-            text = self.chat(messages, **kw)
+            text = self.chat(working_messages, **kw)
             if not text.strip():
                 if _ == 0:
                     continue
@@ -307,8 +308,18 @@ class LLMClient:
             except (json.JSONDecodeError, ValueError) as e:
                 last = "JSONDecodeError" if isinstance(e, json.JSONDecodeError) else "ValueError"
                 tail = text[-300:] if text else "(empty)"
-                msg = f"JSON 解析失败（{last}: {e}）。可能输出被截断。\n末尾 {len(tail)} 字符: ...{tail!r}"
+                reason = "模型未返回 JSON 对象" if "{" not in text else "JSON 语法无效或内容不完整"
+                msg = f"{reason}（{last}: {e}）。\n末尾 {len(tail)} 字符: ...{tail!r}"
                 if _ == 0:
+                    working_messages = [*messages, {
+                        "role": "user",
+                        "content": (
+                            "Your previous response contained no JSON object. "
+                            if "{" not in text else
+                            "Your previous response contained invalid or incomplete JSON. "
+                        ) + "Return the complete JSON object following the original schema, "
+                        "with exact field names. No headings, Markdown, or explanatory prose.",
+                    }]
                     msg += "\n将重发一次请求。"
                     print(msg, flush=True)
                     continue
@@ -442,7 +453,7 @@ def _fake_consolidation_output(messages: list[dict]) -> dict:
             )
             if field == "source_refs":
                 existing[field] = [json.loads(item) for item in existing[field]]
-    return {"candidates": merged[:50]}
+    return {"candidates": merged}
 
 
 def _fake_artifact_output(messages: list[dict]) -> dict:
@@ -459,6 +470,11 @@ def _fake_artifact_output(messages: list[dict]) -> dict:
         "stages", "usable_features", "hazards", "positioning",
         "environment_changes", "signature_actions", "resolutions",
         "entry_points", "discoveries", "relevant_characters",
+        "major_conflicts", "opening_conditions", "possible_endings",
+        "key_people", "factions", "cross_environment_consequences",
+        "impulses", "gm_responses", "phase_changes", "exit_outcomes",
+        "triggers", "potential_adversaries", "motives", "attitude_changes",
+        "choices", "complications",
     }
     fact_ids = [item["id"] for item in facts[:3]]
     source_text = " / ".join(item["text"] for item in facts[:3])[:600]
@@ -544,12 +560,16 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
     tokens_match = re.search(r"^FACT_INPUT_TOKENS_JSON=(.+)$", content, re.MULTILINE)
     budget_match = re.search(r"^MAX_CARD_FACT_INPUT_CHARS_JSON=(\d+)$", content, re.MULTILINE)
     token_budget_match = re.search(r"^MAX_CARD_FACT_INPUT_TOKENS_JSON=(\d+)$", content, re.MULTILINE)
+    structure_match = re.search(r"^REVIEWED_STRUCTURE_JSON=(.+)$", content, re.MULTILINE)
     profile = json.loads(profile_match.group(1)) if profile_match else {}
     units = json.loads(units_match.group(1)) if units_match else []
     sizes = json.loads(sizes_match.group(1)) if sizes_match else {}
     tokens = json.loads(tokens_match.group(1)) if tokens_match else {}
     budget = int(budget_match.group(1)) if budget_match else 72_000
     token_budget = int(token_budget_match.group(1)) if token_budget_match else 22_000
+    structure = json.loads(structure_match.group(1)) if structure_match else None
+    chapters = structure.get("chapters", []) if isinstance(structure, dict) else []
+    chapter_ids = [item["id"] for item in chapters]
     fact_ids = list(
         dict.fromkeys(
             fact_id for unit in units for fact_id in unit.get("fact_ids", [])
@@ -579,6 +599,49 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
 
     definitions = profile.get("card_definitions", [])
     cards = []
+    dispositions = structure.get("fact_dispositions", []) if isinstance(structure, dict) else []
+    chapter_briefs = []
+    for chapter in chapters:
+        applicable = [
+            item["fact_id"]
+            for item in dispositions
+            if chapter["id"] in item.get("chapter_ids", [])
+        ]
+        chapter_briefs.append(
+            {
+                "chapter_id": chapter["id"],
+                "brief": {
+                    "premise": chapter["summary"],
+                    "current_situation": "该叙事阶段包含可回应的局势。",
+                    "major_conflicts": ["推进当前阶段的主要目标。"],
+                    "opening_conditions": ["从已确认事实进入该阶段。"],
+                    "possible_endings": ["局势转入后续阶段。"],
+                    "fact_ids": applicable[: min(20, len(applicable))],
+                    "field_sources": {},
+                    "open_questions": [],
+                },
+                "reference_fact_ids": applicable,
+            }
+        )
+    global_references = [
+        item["fact_id"]
+        for item in dispositions
+        if item.get("kind") == "global_reference"
+    ]
+    runtime_brief = (
+        {
+            "premise": "离线测试用运行包，围绕所选事实组织可运行局势。",
+            "current_situation": "局势已进入可回应的开场状态。",
+            "major_conflicts": ["在有限信息与不断推进的压力下作出选择。"],
+            "opening_conditions": ["冒险者已抵达第一个可回应的环境。"],
+            "possible_endings": ["局势被扭转", "压力继续向下一环境推进"],
+            "fact_ids": fact_ids[: min(len(fact_ids), 20)],
+            "field_sources": {},
+            "open_questions": [],
+        }
+        if profile.get("profile_kind") == "runtime"
+        else None
+    )
     if profile.get("profile_kind") == "runtime" and len(fact_ids) <= 90:
         unit_facts: dict[str, list[str]] = {}
         for unit in units:
@@ -611,6 +674,11 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
             ))
             if not relevant:
                 relevant = fact_ids[:1]
+            runtime_groups = []
+            if profile.get("runtime_navigation_mode") == "environment" and definition["type"] in {
+                "environment", "npc", "enemy", "encounter_clock"
+            }:
+                runtime_groups = ["主要局势"]
             cards.append({
                 "type": definition["type"],
                 "title": f"FakeLLM {definition.get('display_name') or definition['type']} {index}",
@@ -618,8 +686,16 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
                 "fact_ids": relevant,
                 "focus": ["来源覆盖", "运行资料"],
                 "open_questions": [],
+                "runtime_groups": runtime_groups,
+                "chapter_ids": chapter_ids,
             })
-        return {"cards": cards, "open_questions": []}
+        return {
+            "cards": cards,
+            "brief": runtime_brief,
+            "chapter_briefs": chapter_briefs,
+            "global_reference_fact_ids": global_references,
+            "open_questions": [],
+        }
     for index, chunk in enumerate(chunks, start=1):
         definition = definitions[(index - 1) % len(definitions)]
         display_name = definition.get("display_name") or definition["type"]
@@ -631,9 +707,16 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
                 "fact_ids": chunk,
                 "focus": ["来源覆盖", "跨批次规划"],
                 "open_questions": [],
+                "chapter_ids": chapter_ids,
             }
         )
-    return {"cards": cards, "open_questions": []}
+    return {
+        "cards": cards,
+        "brief": runtime_brief,
+        "chapter_briefs": chapter_briefs,
+        "global_reference_fact_ids": global_references,
+        "open_questions": [],
+    }
 
 
 def _fake_materialize_output(messages: list[dict]) -> dict:
@@ -653,6 +736,11 @@ def _fake_materialize_output(messages: list[dict]) -> dict:
         "stages", "usable_features", "hazards", "positioning",
         "environment_changes", "signature_actions", "resolutions",
         "entry_points", "discoveries", "relevant_characters",
+        "major_conflicts", "opening_conditions", "possible_endings",
+        "key_people", "factions", "cross_environment_consequences",
+        "impulses", "gm_responses", "phase_changes", "exit_outcomes",
+        "triggers", "potential_adversaries", "motives", "attitude_changes",
+        "choices", "complications",
     }
     fields = {}
     field_sources = {}
@@ -669,6 +757,101 @@ def _fake_materialize_output(messages: list[dict]) -> dict:
         "open_questions": [],
     }
     return {"cards": [card], "open_questions": []}
+
+
+def _fake_structure_local_output(messages: list[dict]) -> dict:
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    match = re.search(r"^STRUCTURE_FACTS_JSON=(.+)$", content, re.MULTILINE)
+    facts = json.loads(match.group(1)) if match else []
+    return {
+        "observations": [
+            {
+                "title": "离线叙事结构观察",
+                "summary": " / ".join(str(item.get("text", "")) for item in facts[:3])[:900]
+                or "离线结构验证",
+                "fact_ids": [item["id"] for item in facts],
+                "chapter_hints": ["开端", "发展"] if len(facts) > 6 else ["完整冒险"],
+                "thread_hints": ["主要目标"],
+                "beat_hints": ["局势出现变化"],
+            }
+        ]
+    }
+
+
+def _fake_structure_consolidate_output(messages: list[dict]) -> dict:
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    match = re.search(r"^STRUCTURE_OBSERVATIONS_JSON=(.+)$", content, re.MULTILINE)
+    observations = json.loads(match.group(1)) if match else []
+    fact_ids = list(
+        dict.fromkeys(
+            fact_id
+            for observation in observations
+            for fact_id in observation.get("fact_ids", [])
+        )
+    )
+    chapter_count = 2 if len(fact_ids) > 6 else 1
+    chapters = [
+        {
+            "key": f"phase_{index}",
+            "title": "开端" if index == 1 else "发展与收束",
+            "summary": "按叙事功能组织的离线冒险阶段。",
+        }
+        for index in range(1, chapter_count + 1)
+    ]
+    roles = {"phase_1": "introduce"}
+    if chapter_count == 2:
+        roles["phase_2"] = "resolve"
+    return {
+        "chapters": chapters,
+        "threads": [
+            {
+                "key": "objective",
+                "title": "目标争夺",
+                "kind": "truth_chain",
+                "summary": "贯穿冒险的离线验证剧情线。",
+                "chapter_roles": roles,
+            }
+        ],
+        "beats": [
+            {
+                "key": "situation_changes",
+                "title": "局势发生变化",
+                "summary": "这是可能发生的发展，不规定运行顺序。",
+                "chapter_key": chapters[0]["key"],
+                "thread_keys": ["objective"],
+                "thread_developments": {"objective": {
+                    "development": "调查可能揭示各方对目标的不同诉求。",
+                    "carry_forward": "保留尚未回应的诉求，供后续游戏继续处理。",
+                }},
+                "interplay": "队伍选择回应哪一方，会影响后续获得的信息；不预设解决路线。",
+                "fact_ids": fact_ids[: min(3, len(fact_ids))],
+            }
+        ],
+    }
+
+
+def _fake_structure_assign_output(messages: list[dict]) -> dict:
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    facts_match = re.search(r"^STRUCTURE_FACTS_JSON=(.+)$", content, re.MULTILINE)
+    skeleton_match = re.search(r"^STRUCTURE_SKELETON_JSON=(.+)$", content, re.MULTILINE)
+    facts = json.loads(facts_match.group(1)) if facts_match else []
+    skeleton = json.loads(skeleton_match.group(1)) if skeleton_match else {}
+    chapter_keys = [item["key"] for item in skeleton.get("chapters", [])]
+    thread_keys = [item["key"] for item in skeleton.get("threads", [])]
+    assignments = []
+    for index, fact in enumerate(facts):
+        kind = "display_material" if fact.get("kind") == "handout" else "chapter"
+        chapters = [] if kind == "display_material" else [chapter_keys[index % len(chapter_keys)]]
+        assignments.append(
+            {
+                "fact_id": fact["id"],
+                "kind": kind,
+                "chapter_keys": chapters,
+                "thread_keys": thread_keys[:1] if kind == "chapter" else [],
+                "reason": "",
+            }
+        )
+    return {"assignments": assignments}
 
 
 class FakeLLM:
@@ -695,6 +878,14 @@ class FakeLLM:
             return json.dumps(_fake_global_plan_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_materialize":
             return json.dumps(_fake_materialize_output(messages), ensure_ascii=False, indent=2)
+        if task == "prep:structure_local":
+            return json.dumps(_fake_structure_local_output(messages), ensure_ascii=False, indent=2)
+        if task == "prep:structure_consolidate":
+            return json.dumps(
+                _fake_structure_consolidate_output(messages), ensure_ascii=False, indent=2
+            )
+        if task == "prep:structure_assign":
+            return json.dumps(_fake_structure_assign_output(messages), ensure_ascii=False, indent=2)
         data = FAKE_OUTPUTS.get(task)
         if data is None:
             data = {"note": f"假客户端未实现任务: {task!r}", "task": task}

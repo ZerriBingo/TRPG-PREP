@@ -18,6 +18,7 @@ from ..domain import (
     DisplayMaterial,
     ExtractionWindow,
     FactProvenance,
+    MAX_SHADOW_RESPONSE_CANDIDATES,
     PageSpan,
     PrepJob,
     PrepJobCreate,
@@ -48,7 +49,7 @@ SCHEMA_VERSION = "shadow-candidate-v1"
 CONSOLIDATION_PROMPT_VERSION = "prep-fact-consolidate-v4"
 DETERMINISTIC_CONSOLIDATION_VERSION = "prep-fact-consolidate-deterministic-v1"
 MAX_CONSOLIDATION_INPUT_CHARS = 15000
-MAX_CONSOLIDATION_CANDIDATES = 50
+MAX_CONSOLIDATION_BATCH_CANDIDATES = 50
 MAX_CONSOLIDATION_ROUNDS = 8
 MAX_CONSOLIDATION_TIMEOUT_SPLIT_DEPTH = 2
 INTERRUPTED_CONSOLIDATION_ERROR = "segment consolidation was interrupted before completion"
@@ -2043,7 +2044,7 @@ def _consolidation_candidate_batches(
             proposed_parent_ids,
         )
         over_budget = len(proposed_input) > MAX_CONSOLIDATION_INPUT_CHARS
-        over_count = len(proposed) > MAX_CONSOLIDATION_CANDIDATES
+        over_count = len(proposed) > MAX_CONSOLIDATION_BATCH_CANDIDATES
         if current and (over_budget or over_count):
             batch_parent_ids = _consolidation_parent_task_ids(
                 current, parent_task_ids
@@ -2152,9 +2153,9 @@ def _fallback_segment_candidates(candidates: list[dict]) -> dict:
                 existing[field] = [json.loads(value) for value in dict.fromkeys(keys)]
             else:
                 existing[field] = list(dict.fromkeys(values))
-    if len(merged) > MAX_CONSOLIDATION_CANDIDATES:
+    if len(merged) > MAX_SHADOW_RESPONSE_CANDIDATES:
         raise PrepSourceError(
-            "deterministic consolidation would exceed the candidate limit"
+            "deterministic consolidation would exceed the semantic segment capacity"
         )
     return {"candidates": merged}
 
