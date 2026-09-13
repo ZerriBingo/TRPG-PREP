@@ -4,10 +4,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from copy import deepcopy
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from backend.app import artifacts as artifacts_module  # noqa: E402
 from backend.app.artifacts import (  # noqa: E402
     ArtifactGenerationError,
     _fact_batches,
@@ -446,17 +448,35 @@ validated_many = _validate_global_plan(
 )
 assert len(validated_many["cards"]) == 53
 
+# The merge guard measures a card's fact closure against the materialize budget
+# rather than a fact count, so the same cross-chapter pair merges or stays apart
+# depending on how large that closure actually is.
+merge_facts = [
+    SourceFact(
+        id=f"fact_merge_{index:03d}",
+        text="跨章人物资料" * 2,
+        kind="event",
+        visibility="explicit",
+        source_refs=[SourceRef(file="fixture://merge-budget", page=1)],
+    )
+    for index in range(120)
+]
+merge_facts_by_id = {fact.id: fact for fact in merge_facts}
 plan_a = {
-    "type": "npc", "title": "跨章人物", "fact_ids": [f"fact_{index}" for index in range(60)],
+    "type": "npc", "title": "跨章人物",
+    "fact_ids": [f"fact_merge_{index:03d}" for index in range(60)],
     "focus": [], "open_questions": [], "runtime_group_ids": [], "chapter_ids": ["chapter_a"],
 }
 plan_b = {
-    "type": "npc", "title": "跨章人物", "fact_ids": [f"fact_{index}" for index in range(60, 120)],
+    "type": "npc", "title": "跨章人物",
+    "fact_ids": [f"fact_merge_{index:03d}" for index in range(60, 120)],
     "focus": [], "open_questions": [], "runtime_group_ids": [], "chapter_ids": ["chapter_b"],
 }
-assert len(_merge_chapter_plans([plan_a], [plan_b])) == 2
-mergeable_b = {**plan_b, "fact_ids": ["fact_60"]}
-merged_cross_chapter = _merge_chapter_plans([plan_a], [mergeable_b])
+assert len(_merge_chapter_plans([plan_a], [plan_b], merge_facts_by_id)) == 1
+with patch.object(artifacts_module, "MAX_CARD_FACT_INPUT_CHARS", 5_000):
+    assert len(_merge_chapter_plans([plan_a], [plan_b], merge_facts_by_id)) == 2
+mergeable_b = {**plan_b, "fact_ids": ["fact_merge_060"]}
+merged_cross_chapter = _merge_chapter_plans([plan_a], [mergeable_b], merge_facts_by_id)
 assert len(merged_cross_chapter) == 1
 assert merged_cross_chapter[0]["chapter_ids"] == ["chapter_a", "chapter_b"]
 

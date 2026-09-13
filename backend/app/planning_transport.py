@@ -6,9 +6,17 @@ from typing import Any
 
 
 class PlanningTransport:
-    def __init__(self, client: Any, fact_ids: list[str]):
+    def __init__(self, client: Any, fact_ids: list[str], context: dict | None = None):
         self.client = client
         self.encode_ids = {fact_id: f"f{index}" for index, fact_id in enumerate(sorted(set(fact_ids)))}
+        context = context or {}
+        for prefix, items in (
+            ("chapter_", [*context.get("chapters", []), *context.get("adventure_index", [])]),
+            ("thread_", context.get("threads", [])),
+            ("story_beat_", context.get("beats", [])),
+        ):
+            for index, identifier in enumerate(sorted({item["id"] for item in items})):
+                self.encode_ids[identifier] = f"{prefix}{index}"
         self.decode_ids = {value: key for key, value in self.encode_ids.items()}
 
     def _translate(self, value: Any, mapping: dict[str, str], identifiers: bool = False) -> Any:
@@ -17,6 +25,8 @@ class PlanningTransport:
                 mapping.get(key, key): self._translate(item, mapping, identifiers or key in {
                     "id", "fact_id", "fact_ids", "reference_fact_ids", "global_reference_fact_ids",
                     "field_sources", "missing_chapters", "missing_global", "enum",
+                    "chapter_id", "chapter_ids", "chapter_fact_ids",
+                    "thread_id", "thread_ids", "story_beat_ids",
                 }) for key, item in value.items()
             }
             if len(translated) != len(value):

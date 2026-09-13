@@ -18,7 +18,6 @@ from ..domain import (
     StoryBeat,
     StoryThread,
     StructureDraftJob,
-    is_handout_fact,
     load_profiles,
     validate_bundle,
 )
@@ -26,7 +25,7 @@ from ..domain.models import ExampleBundle
 from ..domain.prep import ThreadDevelopment
 
 
-STRUCTURE_PROMPT_VERSION = "adventure-structure-v5"
+STRUCTURE_PROMPT_VERSION = "adventure-structure-v6"
 STRUCTURE_MAX_TOKENS = 8000
 MAX_CHAPTERS = 24
 MAX_THREADS = 60
@@ -217,6 +216,9 @@ def _local_messages(facts: list[dict[str, Any]], batch_index: int, batch_count: 
                 "not a list of locations or encounters. Preserve "
                 "factions, truth chains, objectives, character fates, and off-screen developments "
                 "as thread hints. Do not design maps, encounters, or final cards. "
+                "Retain whether source content is an actual-play example, optional variant, "
+                "past event, or current situation. Never strip those qualifiers when summarizing "
+                "a reported PC action, victory, capture, or reward. "
                 "Follow RESPONSE_SCHEMA_JSON; do not add undeclared fields. "
                 "Write descriptive text in Chinese, preserving JSON field names and fact IDs exactly."
             ),
@@ -300,6 +302,12 @@ def _skeleton_messages(observations: list[dict[str, Any]]):
                 "a fixed number of games, or guaranteed future outcomes. Keep each development and "
                 "carry_forward to one concise sentence. These are source-grounded preparation "
                 "suggestions, never new historical facts or a scripted player route. "
+                "Every introduce/develop/resolve chapter role must have at least one beat in that "
+                "chapter developing that thread; background roles need no beat. Do not add token "
+                "thread mentions just to satisfy coverage: revise the chapter role if no supported "
+                "development belongs there. Source play reports describe another group's choices, "
+                "not this group's current state or guaranteed outcomes. Preserve example status "
+                "and turn usable situations into conditional opportunities, not predetermined victories. "
                 "Do not label threads as main or sub. Prefer a small useful skeleton over page-shaped "
                 "fragmentation. Use only supplied fact_ids. Follow RESPONSE_SCHEMA_JSON exactly. "
                 "chapters, threads, and beats are arrays. Chapter objects contain only key, title, "
@@ -359,6 +367,17 @@ def _validate_skeleton(raw: Any, allowed_fact_ids: set[str]) -> dict[str, Any]:
             raise StructureGenerationError(
                 f"拍引用了不适用于其章节的剧情线: chapter={beat.chapter_key}, threads={inapplicable}"
             )
+    covered_roles = {(beat.chapter_key, key) for beat in payload.beats for key in beat.thread_keys}
+    missing_roles = [
+        f"{thread.key}@{chapter}"
+        for thread in payload.threads
+        for chapter, role in thread.chapter_roles.items()
+        if role != "background" and (chapter, thread.key) not in covered_roles
+    ]
+    if missing_roles:
+        raise StructureGenerationError(
+            "剧情线的章节进展缺少对应拍，请调整章节角色或补充有依据的拍: " + ", ".join(missing_roles)
+        )
     return payload.model_dump(mode="json")
 
 
@@ -393,11 +412,20 @@ def _assignment_messages(
                 "Chapter facts may name one or several chapter_keys. Global reference is for "
                 "setting, rules, or reusable context that should remain reachable but need not "
                 "become a card. Display material is only for an actual showable source asset. "
+                "A handout containing actionable addresses, instructions, evidence, or motives is "
+                "a chapter fact even if it can also be shown to players; handout is a source format, "
+                "not a reason to exclude its information from preparation. Use display_material "
+                "only for asset-only references without narrative operating information. "
                 "Do not use global_reference merely because a fact spans chapters or to reduce "
                 "chapter size. Actionable leads, NPC motives, investigable locations, threats, and "
                 "situation changes must belong to all applicable chapters. Pure setting background, "
                 "general rules commentary, and non-actionable context may remain global_reference. "
                 "A reusable actionable fact can belong to multiple chapters. "
+                "Item capabilities that unlock clues, change investigative choices, or erase "
+                "knowledge are actionable, not merely general rules. Preserve actual-play examples "
+                "as examples; do not assign their particular PC choices or victories as default "
+                "chapter events. They may remain reference material while reusable conditional "
+                "situations belong to chapters. "
                 "Deferred requires a concise reason. thread_keys may cross chapters. Return each "
                 "fact_id exactly once and use only supplied keys. Follow RESPONSE_SCHEMA_JSON. "
                 "assignments MUST be an array of objects, each with an explicit fact_id; never "
@@ -446,7 +474,6 @@ def _validate_assignments(
         )
     chapter_keys = {item["key"] for item in skeleton["chapters"]}
     thread_keys = {item["key"] for item in skeleton["threads"]}
-    facts_by_id = {fact.id: fact for fact in batch_facts}
     assignments: list[dict[str, Any]] = []
     for item in payload.assignments:
         item.chapter_keys = list(dict.fromkeys(
@@ -460,8 +487,6 @@ def _validate_assignments(
                 f"allowed_chapter_keys={sorted(chapter_keys)}, allowed_thread_keys={sorted(thread_keys)}"
             )
         data = item.model_dump(mode="json")
-        if is_handout_fact(facts_by_id[item.fact_id]):
-            data.update(kind="display_material", chapter_keys=[], reason="")
         if data["kind"] == "chapter" and not data["chapter_keys"]:
             raise StructureGenerationError(f"章节事实缺少章节归属: {item.fact_id}")
         if data["kind"] != "chapter":

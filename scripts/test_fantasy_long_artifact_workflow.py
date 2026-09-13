@@ -56,6 +56,9 @@ def main() -> None:
             structure.execute_structure_job(structure_job.id)
             assert structure.get_structure_job(structure_job.id).status == "completed"
             structured = structure.approve_structure(bundle.id)
+            # Source form must not remove an explicitly approved chapter lead.
+            structured.facts[0].kind = "handout"
+            handout_id = structured.facts[0].id
             structured.facts.append(SourceFact(
                 id="fact_global_reference", text="General setting reference", kind="resource",
                 visibility="explicit", source_refs=[SourceRef(file="fixture://fantasy-long", page=1)],
@@ -99,9 +102,13 @@ def main() -> None:
                         for beat_context in context["beats"]:
                             assert set(beat_context["thread_developments"]) == set(beat_context["thread_ids"])
                             assert beat_context["interplay"]
-                        owned = {item["fact_id"] for item in context["fact_dispositions"]}
-                        assert set(values["FACT_INPUT_CHARS_JSON"]) == owned
-                        assert set(values["FACT_INPUT_TOKENS_JSON"]) == owned
+                        owned = set(context["chapter_fact_ids"])
+                        budgeted = set(values["FACT_INPUT_CHARS_JSON"])
+                        tokenised = set(values["FACT_INPUT_TOKENS_JSON"])
+                        assert budgeted == owned == tokenised, (
+                            f"char={len(budgeted)} token={len(tokenised)} owned={len(owned)} "
+                            f"missing={sorted(owned - budgeted)[:6]} extra={sorted(budgeted - owned)[:6]}"
+                        )
                         schema = values["RESPONSE_SCHEMA_JSON"]
                         assert schema["$defs"]["PlannedCardPayload"]["additionalProperties"] is False
                         assert schema["$defs"]["ChapterBriefPayload"]["required"] == ["chapter_id", "brief"]
@@ -110,7 +117,7 @@ def main() -> None:
                         assert len(context["chapters"]) == 1
                         planning_requests.append(context["chapters"][0]["id"])
                         output = original_client.chat_json(messages, **kwargs)
-                        chapter_fact = next(item["fact_id"] for item in context["fact_dispositions"] if item["kind"] == "chapter")
+                        chapter_fact = context["chapter_fact_ids"][0]
                         output["chapter_briefs"][0]["reference_fact_ids"] = [chapter_fact]
                         output["brief"] = None
                         # Each chapter response fits its budget; their combined result exceeds 120.
@@ -146,7 +153,9 @@ def main() -> None:
                     )
                 oversized = artifacts.get_artifact_job(artifact_job.id)
                 assert oversized.status == "failed"
-                assert "规划请求过大" in oversized.error
+                assert any(message in oversized.error for message in (
+                    "规划请求过大", "规划索引汇总请求超过预算",
+                )), oversized.error
                 assert not planning_requests, "over-budget requests must not reach the model"
                 artifacts.retry_artifact_job(
                     artifact_job.id, model_id="fake-long", fake_model=True
@@ -175,6 +184,8 @@ def main() -> None:
             assert all(chapter.reference_fact_ids for chapter in generated.adventure_chapters)
             assert generated.cards
             assert len(generated.cards) > 120, "chapter totals must not inherit a single-response cap"
+            assert any(handout_id in card.fact_ids for card in generated.cards)
+            assert next(fact for fact in generated.facts if fact.id == handout_id).kind == "handout"
             assert all(card.chapter_ids for card in generated.cards)
             assert set().union(*(set(card.chapter_ids) for card in generated.cards)) == chapter_ids
         finally:

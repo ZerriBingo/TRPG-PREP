@@ -4,6 +4,10 @@ from pathlib import Path
 
 import httpx
 
+
+from _live_guard import require_live_tests
+
+require_live_tests("test_staged")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 from app import generate  # noqa: E402

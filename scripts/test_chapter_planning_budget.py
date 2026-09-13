@@ -51,6 +51,8 @@ def main():
             self.requests.append(messages)
             assert 'Return exactly one JSON object' in messages[0]["content"]
             assert 'English field names title and summary' in messages[0]["content"]
+            assert "Preserve whether" in messages[0]["content"]
+            assert "single evolving pressure" in messages[0]["content"]
             assert len(json.dumps(messages, ensure_ascii=False)) <= 24_000
             return {"title": "Situations", "summary": "Keep the separate situations and their leads accessible."}
 
@@ -62,6 +64,10 @@ def main():
         with patch.object(a, "MAX_FACT_INPUT_CHARS", 24_000):
             compact, messages, transport = a._bounded_plan_input(job, 1, profile, units, sizes, sizes, context, client)
             assert len(compact) < len(units)
+            # A fixed 8:1 collapse folded these 32 units into 4 entries and then
+            # kept folding, which is exactly the large-chapter over-compression
+            # this budget-derived grouping replaced.  Measured value is 8.
+            assert len(compact) >= 5, len(compact)
             assert {fid for unit in compact for fid in unit["fact_ids"]} == set(ids)
             assert len(json.dumps(transport.messages(messages), ensure_ascii=False)) <= 24_000
             assert client.calls > 0
@@ -69,6 +75,14 @@ def main():
             repeated, _, _ = a._bounded_plan_input(job, 1, profile, units, sizes, sizes, context, client)
             assert repeated == compact and client.calls == count
         assert json.dumps(units) == original
+        with patch.object(a, "MAX_FACT_INPUT_CHARS", 100):
+            try:
+                a._bounded_plan_input(job, 1, profile, units, sizes, sizes, context, client)
+            except a.ArtifactGenerationError as error:
+                assert "固定章节上下文" in str(error)
+            else:
+                raise AssertionError("fixed context must fail before summarization")
+            assert client.calls == count
 
     class Echo:
         def chat_json(self, messages, **kwargs):
@@ -79,6 +93,19 @@ def main():
     transport = PlanningTransport(Echo(), ids)
     payload = {"fact_ids": ids, "field_sources": {"summary": ids[:2]},
                "budgets": {ids[0]: 200}, "title": "f0", "summary": ids[0]}
+    assert transport.chat_json([{"role": "user", "content": "TEST_JSON=" + json.dumps(payload)}]) == payload
+    structure = {"chapters": [{"id": "chapter_one"}],
+                 "adventure_index": [{"id": "chapter_two"}],
+                 "threads": [{"id": "thread_one"}], "beats": [{"id": "beat_one"}]}
+    transport = PlanningTransport(Echo(), ids, structure)
+    payload.update(chapter_ids=["chapter_one", "chapter_two"], story_beat_ids=["beat_one"],
+                   thread_ids=["thread_one"], chapter_roles={"chapter_one": "develop"},
+                   thread_developments={"thread_one": {"development": "t0", "carry_forward": "chapter_one"}})
+    encoded = transport.messages([{"role": "user", "content": "TEST_JSON=" + json.dumps(payload)}])
+    body = json.loads(encoded[0]["content"].split("=", 1)[1])
+    assert body["chapter_ids"] == ["chapter_0", "chapter_1"]
+    assert body["story_beat_ids"] == ["story_beat_0"]
+    assert body["thread_developments"]["thread_0"]["development"] == "t0"
     assert transport.chat_json([{"role": "user", "content": "TEST_JSON=" + json.dumps(payload)}]) == payload
     print("PASS: chapter ownership, reversible IDs, budgeted index reduction, and cached retry")
 

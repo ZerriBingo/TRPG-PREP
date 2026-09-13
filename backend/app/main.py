@@ -52,8 +52,10 @@ from ..domain import (
 )
 from .llm import make_client
 
-storage.init_db()
-
+# Persistence is initialised by the lifespan hook below, never at import time.
+# Initialising here meant that merely importing this module — which every test
+# that builds the ASGI app does — created tables in whatever database
+# storage.DB_PATH pointed at, including the real one.
 PROJECT_ROOT = storage.PROJECT_ROOT
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 DOMAIN_DIR = PROJECT_ROOT / "backend" / "domain"
@@ -149,6 +151,7 @@ def remove_seed_workspace_instances() -> int:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Run persistence maintenance only when the service actually starts."""
+    storage.init_db()
     remove_seed_workspace_instances()
     artifacts.recover_interrupted_artifact_jobs()
     structure.recover_interrupted_structure_jobs()

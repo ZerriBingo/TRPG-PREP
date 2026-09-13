@@ -24,8 +24,39 @@ from ..domain.models import (
 )
 
 
-PROMPT_VERSION = "prep-artifact-draft-v7"
-GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v11"
+PROMPT_VERSION = "prep-artifact-draft-v8"
+GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v14"
+# Both versions participate in durable step hashes, so retries regenerate steps
+# produced under older semantics instead of reusing their successful outputs.
+SOURCE_SEMANTIC_GUIDANCE = (
+    "Distinguish source play reports and examples from default current state. Preserve whether "
+    "a passage describes established setup, historical background, one group's past play, or a "
+    "conditional example. Do not promote reported player choices, discoveries, victories, deaths, "
+    "or other outcomes into opening conditions, current situation, or inevitable future events. "
+    "Keep example outcomes conditional and background historical; when the source does not "
+    "establish a starting state, record the uncertainty in open_questions. "
+    "Preserve reusable actionable capabilities from included facts, including what an NPC, "
+    "creature, object, or environment can do, its triggers, limits, costs, and counterplay when "
+    "supplied. An illustrative use may support a reusable capability only when the source "
+    "establishes that capability; it does not establish that the example happened in this game. "
+    "A fact ID alone is not coverage of an actionable capability: carry it into the local summary, "
+    "select it for the relevant card and its purpose/focus, and reflect it in appropriate declared "
+    "card fields during materialization. Do not bury it solely in reference facts or background. "
+    "Preserve original source statistics and their fact citations where supported and allowed by "
+    "the card definition; do not invent or convert statistics to the target rules. "
+)
+CLOCK_SEMANTIC_GUIDANCE = (
+    "Each clock must track a single evolving pressure with a coherent starting state, "
+    "advancement triggers, observable escalation stages, and an endpoint consequence. Stages "
+    "must be changes in that same pressure, not a room itinerary, clue sequence, historical "
+    "chronology, fixed player route, attack counts, or numbered actions. Keep rooms in location "
+    "or environment material, clues in discoveries, and history in background. Do not create "
+    "a clock merely to package a sequence; without a supported evolving pressure, use the "
+    "appropriate non-clock material or record an open question. Clock structure may be a "
+    "GM-facing transformation, but factual triggers and consequences require supplied fact "
+    "citations. Do not set current_stage from a play report's completed outcome or assume "
+    "players will advance the clock along a predetermined route. "
+)
 MAX_FACT_INPUT_CHARS = 120_000
 # Keep individual model requests comfortably below the hard input ceiling.  A
 # single artifact job may contain several of these batches; the final cards are
@@ -44,10 +75,37 @@ MAX_LOCAL_OPEN_QUESTIONS = 120
 MAX_JOB_OPEN_QUESTION_PREVIEW = 50
 MAX_CARD_FACT_INPUT_CHARS = 72_000
 MAX_CARD_FACT_INPUT_TOKENS = 22_000
+# An upstream outage used to be retried once per planned card; stop the job
+# instead of issuing hundreds of doomed requests, and let the user retry.
+MAX_CONSECUTIVE_MATERIALIZE_FAILURES = 5
 LOCAL_DIGEST_MAX_TOKENS = 7000
 GLOBAL_PLAN_MAX_TOKENS = 12000
 ARTIFACT_REQUEST_TIMEOUT = 300
 ARTIFACT_MAX_TOKENS = 9000
+# Cross-chapter identity reconciliation runs once, after every chapter plan has
+# been collected.  A single request sees all candidates, so it cannot disagree
+# with itself the way per-chapter planning requests inevitably would.
+IDENTITY_RECONCILE_PROMPT_VERSION = "prep-artifact-identity-reconcile-v1"
+IDENTITY_RECONCILE_MAX_TOKENS = 3000
+IDENTITY_GROUP_CHAR_BUDGET = 40_000
+# Keep a chunk's plan count well below IdentityReconciliationPayload.clusters
+# max_length, because validation requires every candidate to be covered once.
+IDENTITY_MAX_PLANS_PER_CHUNK = 120
+# A component bigger than one chunk cannot be judged as a whole, so it is
+# reported instead of split.  Real components on the 8-chapter material are 16,
+# 27, 59 and 64 plans: the earlier cap of 40 silently dropped the two largest,
+# including the environment group that carries the mixed-location problem.
+MAX_IDENTITY_CANDIDATE_PLANS = IDENTITY_MAX_PLANS_PER_CHUNK
+# A merged card must stay materializable, and the binding constraint is the
+# character/token budget on its fact closure, not a fact count: short facts
+# legitimately allow many more citations than long ones.  The merge guard now
+# measures the closure against MAX_CARD_FACT_INPUT_CHARS and
+# MAX_CARD_FACT_INPUT_TOKENS directly, so this value is only a structural ceiling
+# on the card contracts: the guard prefers the budget and falls back to this count
+# only when it is given no fact table.  Measured, the leanest serialized fact
+# payload is about 300 characters and 80 tokens, so the character budget binds at
+# roughly 240 facts; 600 sits well above that.
+MAX_MERGED_FACT_IDS = 600
 
 
 class ArtifactDraftRequest(BaseModel):
@@ -712,7 +770,10 @@ class DraftCardPayload(BaseModel):
     type: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_-]*$")
     title: str = Field(min_length=1, max_length=160)
     subtitle: str | None = Field(default=None, max_length=300)
-    fact_ids: list[str] = Field(min_length=1, max_length=100)
+    # Mirrors MAX_MERGED_FACT_IDS: a cross-chapter merge may legitimately hold
+    # more facts than one chapter's original card, so the draft contract has to
+    # accept what the merge produces or the card cannot be materialized.
+    fact_ids: list[str] = Field(min_length=1, max_length=MAX_MERGED_FACT_IDS)
     fields: dict[str, Any]
     field_sources: dict[str, list[str]] = Field(default_factory=dict)
     open_questions: list[str] = Field(default_factory=list, max_length=30)
@@ -854,14 +915,19 @@ class PlannedCardPayload(BaseModel):
     type: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_-]*$")
     title: str = Field(min_length=1, max_length=160)
     purpose: str = Field(min_length=1, max_length=800)
-    fact_ids: list[str] = Field(min_length=1, max_length=100)
+    fact_ids: list[str] = Field(min_length=1, max_length=MAX_MERGED_FACT_IDS)
     focus: list[str] = Field(default_factory=list, max_length=30)
     open_questions: list[str] = Field(default_factory=list, max_length=30)
     runtime_groups: list[str] = Field(default_factory=list, max_length=20)
     chapter_ids: list[str] = Field(default_factory=list, max_length=24)
     story_beat_ids: list[str] = Field(default_factory=list, max_length=120)
+    # The single playable situation this card covers.  An environment card must
+    # never bundle unrelated situations: one card owns exactly one runtime state.
+    situation: str = Field(default="", max_length=160)
+    # Where this material sits relative to the situation the table starts in.
+    case_scope: Literal["current", "related", "conditional_example"] = "current"
 
-    @field_validator("title", "purpose")
+    @field_validator("title", "purpose", "situation")
     @classmethod
     def strip_required_text(cls, value: str) -> str:
         return value.strip()
@@ -1087,12 +1153,16 @@ def _facts_for_workspace(
 ) -> list[Any]:
     """Limit task-owned shelves to the source file and selected page scope."""
     task = prep.find_prep_job_by_workspace(workspace_id)
-    # Display materials are source assets, not GM-facing artifact input. They
-    # are created and associated separately after the board build.
+    # Handouts default to display assets; explicit chapter dispositions retain
+    # actionable source material such as letters that supply leads.
+    chapter_fact_ids = {
+        item.fact_id for item in bundle.fact_dispositions if item.kind == "chapter"
+    }
     usable = [
         fact
         for fact in bundle.facts
-        if fact.evidence_status != "model_candidate" and fact.kind != "handout"
+        if fact.evidence_status != "model_candidate"
+        and (fact.kind != "handout" or fact.id in chapter_fact_ids)
     ]
     if task is None:
         return sorted(usable, key=lambda fact: _fact_source_sort_key(fact, None))
@@ -1172,6 +1242,8 @@ def _local_digest_messages(
         "material such as background, scenes, locations, NPCs, factions, traversal situations, clue clusters, "
         "threats, timelines, outcomes, or resources. Preserve actionable details and uncertainty, "
         "but do not write final cards. "
+        + SOURCE_SEMANTIC_GUIDANCE
+        + CLOCK_SEMANTIC_GUIDANCE
         + _local_runtime_guidance(profile)
         + "Do not invent cross-batch relationships. kind must be one of ALLOWED_UNIT_KINDS_JSON, "
         "not the source fact kind or a final card type. Event material belongs to scene, timeline, "
@@ -1319,6 +1391,12 @@ def _global_plan_messages(
             "cross-environment consequences. Represent meaningful travel as an environment plan "
             "whose purpose and focus describe traversal; do not create a separate travel card. Do not generate or "
             "convert game statistics. "
+            "An environment card must cover exactly one playable situation: put its short name in "
+            "situation and never list more than one runtime_groups entry. When the source holds two "
+            "independently runnable situations, emit two environment cards instead of one combined "
+            "card. Set case_scope on every card: current for the situation the table starts in, "
+            "related for a connected but separate situation, and conditional_example for source play "
+            "reports or examples that are not established opening conditions. "
         )
     elif profile.runtime_navigation_mode == "location":
         runtime_guidance = (
@@ -1341,7 +1419,8 @@ def _global_plan_messages(
         "set brief=null and place summaries in chapter_briefs only. A brief must contain premise, current_situation, "
         "major_conflicts, opening_conditions, possible_endings, fact_ids, field_sources, and open_questions. "
         "Each planned card must contain type, title, "
-        "purpose, fact_ids, focus, open_questions, runtime_groups, chapter_ids, and story_beat_ids. "
+        "purpose, fact_ids, focus, open_questions, runtime_groups, chapter_ids, story_beat_ids, "
+        "situation, and case_scope. "
         "For environment cards, story_beat_ids explicitly identifies supplied chapter-local beats "
         "whose immediate situation this environment supports, and nothing else. NPC, enemy, and "
         "clock/support cards MUST use story_beat_ids=[]; their relevance to a beat does not make "
@@ -1361,10 +1440,15 @@ def _global_plan_messages(
         "new source. Each card will later reread the original fact_ids you select. Use only listed "
         "fact_ids, avoid duplicate cards, preserve conflicts as open questions, and keep each card's "
         "estimated original-fact input within the supplied character budget. "
+        + SOURCE_SEMANTIC_GUIDANCE
+        + CLOCK_SEMANTIC_GUIDANCE
         + runtime_guidance
         + "Player-facing source assets "
         "such as maps, letters, photos, newspapers, logs, and records are tracked separately and must "
-        "not become artifact cards. All user-facing text must be Chinese. For an environment-led "
+        "not become artifact cards merely as display assets. When a supplied handout fact is "
+        "assigned to a chapter, use its actionable leads or evidence in relevant card plans; "
+        "its handout kind does not make that content display-only. "
+        "All user-facing text must be Chinese. For an environment-led "
         "profile, runtime_groups are optional retrieval hints. Use a shared short semantic key only "
         "when source-backed material makes an environment and support card clearly relevant together. "
         "Do not invent an encounter, require an enemy or clock, or preselect what must appear in play. "
@@ -1380,6 +1464,10 @@ def _global_plan_messages(
             " The complete job covers all approved chapters through separate planning requests. "
             "THIS request generates ONLY REVIEWED_STRUCTURE_JSON.chapters. adventure_index and "
             "cross-chapter thread roles are context for continuity, not additional generation targets. "
+            "chapter_fact_ids lists the facts this request must account for, and "
+            "fact_threads lists, per thread, which of them carry it; "
+            "fact_shared_with_chapters does the same for each other chapter. Read all three "
+            "as roles of the facts already listed in GLOBAL_UNITS_JSON. "
             "Every card must list only applicable chapter IDs from chapters in THIS request. "
             "Shared support will be reconciled across chapter plans by the application. Return one "
             "chapter_briefs item for each chapter in THIS request, and none for adventure_index-only "
@@ -1679,6 +1767,24 @@ def _validate_global_plan(
             )
         data = card.model_dump(mode="json")
         groups = data.pop("runtime_groups", [])
+        situation = data.get("situation", "")
+        if card.type == "environment":
+            # One environment card owns exactly one runtime state.  More than one
+            # declared group means the model bundled independent situations; the
+            # step runner feeds this message back as a correction request.
+            if len(groups) > 1:
+                raise ArtifactGenerationError(
+                    f"环境卡“{card.title}”声明了 {len(groups)} 个独立情境"
+                    f"（{groups}）；每张环境卡只能覆盖一个可运行情境，"
+                    "请拆分为多张环境卡，并为每张填写 situation。"
+                )
+            situation = situation or (groups[0] if groups else "")
+            if not situation:
+                situation = card.title
+                payload.open_questions.append(
+                    f"环境卡“{card.title}”未声明可运行情境；已按标题暂定，请复核是否需要拆分。"
+                )
+        data["situation"] = situation
         data["runtime_group_ids"] = [group_id(group) for group in groups]
         digest = _stable_hash({"index": index, "card": data}).removeprefix("sha256:")[:16]
         planned.append(
@@ -1814,6 +1920,17 @@ def _compact_global_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{key: unit.get(key) for key in keys} for unit in units]
 
 
+def _prompt_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Serialise a plan for a prompt without planning-only keys."""
+    # Planning-only keys are dropped so a plan that carries none of them still
+    # serialises byte-identically and keeps its cached materialization step.
+    return {
+        key: value
+        for key, value in plan.items()
+        if key not in {"identity_key", "situation", "case_scope"}
+    }
+
+
 def _materialization_messages(
     profile: RuleProfile,
     plan: dict[str, Any],
@@ -1853,7 +1970,9 @@ def _materialization_messages(
         "the source explicitly supports them. Never use that exception for factual claims. "
         f"REQUIRED_FIELD_SHAPES_JSON={json.dumps(required_shapes, ensure_ascii=False)} "
         f"GM_AUTHORED_FIELDS_JSON={json.dumps(gm_authored_fields, ensure_ascii=False)} "
-        "All user-facing text must be Chinese."
+        + SOURCE_SEMANTIC_GUIDANCE
+        + CLOCK_SEMANTIC_GUIDANCE
+        + "All user-facing text must be Chinese."
     )
     user = (
         "[TASK:prep:artifact_materialize]\n"
@@ -1861,7 +1980,7 @@ def _materialization_messages(
         f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"CARD_DEFINITION_JSON={json.dumps(definition.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"LIST_FIELDS_JSON={json.dumps(list_fields, ensure_ascii=False)}\n"
-        f"CARD_PLAN_JSON={json.dumps(plan, ensure_ascii=False)}\n"
+        f"CARD_PLAN_JSON={json.dumps(_prompt_plan(plan), ensure_ascii=False)}\n"
         f"ORIGINAL_FACTS_JSON={json.dumps(facts, ensure_ascii=False)}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -1991,27 +2110,377 @@ def _generate_direct_step(
     )
 
 
-def _merge_chapter_plans(
-    existing_plans: list[dict[str, Any]], incoming_plans: list[dict[str, Any]]
+def _merge_match(
+    merged: list[dict[str, Any]], incoming: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Pick the card an incoming plan joins: title match first, identity second.
+
+    The title pass is deliberately identical to the pre-identity rule, so the card
+    a title match selects can never change.  Identity is a fallback reached only
+    when no title match exists, which makes reconciliation purely additive.
+    """
+    title = incoming["title"].casefold()
+    match = next(
+        (
+            item
+            for item in merged
+            if item["type"] == incoming["type"] and item["title"].casefold() == title
+        ),
+        None,
+    )
+    if match is not None:
+        return match
+    identity = incoming.get("identity_key")
+    if not identity:
+        return None
+    return next(
+        (
+            item
+            for item in merged
+            if item["type"] == incoming["type"] and item.get("identity_key") == identity
+        ),
+        None,
+    )
+
+
+class IdentityClusterPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=120)
+    plan_ids: list[str] = Field(min_length=1, max_length=60)
+
+    @field_validator("label")
+    @classmethod
+    def normalize_label(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("plan_ids")
+    @classmethod
+    def unique_plan_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+class IdentityReconciliationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clusters: list[IdentityClusterPayload] = Field(min_length=1, max_length=200)
+
+
+def _plan_thread_ids(
+    plans: list[dict[str, Any]], bundle: ExampleBundle
+) -> dict[str, set[str]]:
+    dispositions = {item.fact_id: item for item in bundle.fact_dispositions}
+    by_plan: dict[str, set[str]] = {}
+    for plan in plans:
+        threads: set[str] = set()
+        for fact_id in plan.get("fact_ids") or []:
+            disposition = dispositions.get(fact_id)
+            if disposition is not None:
+                threads.update(disposition.thread_ids or [])
+        by_plan[plan["id"]] = threads
+    return by_plan
+
+
+def _identity_candidate_components(
+    plans: list[dict[str, Any]], bundle: ExampleBundle
+) -> list[list[str]]:
+    """Same-type cards sharing a storyline or runtime group across chapters."""
+    if len(plans) < 2:
+        return []
+    threads_by_plan = _plan_thread_ids(plans, bundle)
+    by_id = {plan["id"]: plan for plan in plans}
+    buckets: dict[tuple[str, str], list[str]] = {}
+    for plan in plans:
+        plan_id = plan["id"]
+        signals = {f"thread:{item}" for item in threads_by_plan.get(plan_id, set())}
+        signals.update(f"group:{item}" for item in plan.get("runtime_group_ids") or [])
+        for signal in signals:
+            buckets.setdefault((plan["type"], signal), []).append(plan_id)
+    parent = {plan["id"]: plan["id"] for plan in plans}
+
+    def find(node: str) -> str:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for members in buckets.values():
+        for other in members[1:]:
+            left, right = find(members[0]), find(other)
+            if left != right:
+                parent[right] = left
+    components: dict[str, list[str]] = {}
+    for plan in plans:
+        components.setdefault(find(plan["id"]), []).append(plan["id"])
+    candidates: list[list[str]] = []
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        chapters = {
+            chapter_id
+            for plan_id in members
+            for chapter_id in by_id[plan_id].get("chapter_ids") or []
+        }
+        if len(chapters) < 2:
+            continue
+        candidates.append(sorted(members))
+    return sorted(candidates, key=lambda item: item[0])
+
+
+def _identity_candidate_payload(
+    component: list[str], by_id: dict[str, dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Merge a repeated cross-chapter card only while it remains materializable."""
+    return [
+        {
+            "plan_id": plan_id,
+            "type": by_id[plan_id]["type"],
+            "title": by_id[plan_id]["title"],
+            "purpose": by_id[plan_id].get("purpose"),
+            "focus": list(by_id[plan_id].get("focus") or [])[:8],
+            "chapter_ids": list(by_id[plan_id].get("chapter_ids") or []),
+        }
+        for plan_id in component
+    ]
+
+
+def _identity_reconcile_messages(
+    groups: list[list[dict[str, Any]]],
+) -> list[dict[str, str]]:
+    system = (
+        "You reconcile card identity across separately planned TRPG chapters. Each "
+        "candidate group lists planned cards that share a storyline or a runtime group "
+        "but were planned in different requests. Split every group into clusters of "
+        "cards describing the SAME single evolving pressure or the SAME playable "
+        "situation. Cards that merely belong to one storyline, or that describe "
+        "different pressures inside it, must stay in separate clusters; a cluster of "
+        "one card is a valid answer and means no merge. Return only one JSON object "
+        "with key clusters, each item having label and plan_ids. label is a short "
+        "Chinese name of the shared pressure or situation. Every candidate plan_id "
+        "must appear in exactly one cluster. Use only supplied plan_ids; never invent "
+        "one. " + SOURCE_SEMANTIC_GUIDANCE + CLOCK_SEMANTIC_GUIDANCE
+        + "All user-facing text must be Chinese."
+    )
+    user = json.dumps(
+        {
+            "schema": IdentityReconciliationPayload.model_json_schema(),
+            "candidate_groups": groups,
+        },
+        ensure_ascii=False,
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _validate_identity_clusters(raw: Any, allowed_ids: set[str]) -> dict[str, Any]:
+    try:
+        payload = IdentityReconciliationPayload.model_validate(raw)
+    except ValidationError as error:
+        raise ArtifactGenerationError(f"跨章节身份重整 JSON 不符合约定: {error}") from error
+    seen: list[str] = []
+    for cluster in payload.clusters:
+        unknown = [item for item in cluster.plan_ids if item not in allowed_ids]
+        if unknown:
+            raise ArtifactGenerationError(f"身份重整返回了候选之外的卡片: {unknown}")
+        seen.extend(cluster.plan_ids)
+    if len(seen) != len(set(seen)):
+        raise ArtifactGenerationError("身份重整把同一张候选卡放进了多个簇")
+    missing = sorted(allowed_ids - set(seen))
+    if missing:
+        raise ArtifactGenerationError(f"身份重整未覆盖候选卡: {missing}")
+    return payload.model_dump(mode="json")
+
+
+def _identity_keys_from_clusters(output: dict[str, Any]) -> dict[str, str]:
+    keys: dict[str, str] = {}
+    for cluster in output.get("clusters") or []:
+        members = list(dict.fromkeys(cluster.get("plan_ids") or []))
+        if len(members) < 2:
+            continue
+        label = " ".join(str(cluster.get("label") or "").split()).casefold()
+        # \W is Unicode-aware, so a Chinese label keeps its characters instead of
+        # collapsing to the "shared" fallback an ASCII-only class produced.
+        slug = re.sub(r"[\W_]+", "_", label, flags=re.UNICODE).strip("_")[:40] or "shared"
+        digest = hashlib.sha256("|".join(sorted(members)).encode("utf-8")).hexdigest()[:10]
+        for plan_id in members:
+            keys[plan_id] = f"identity_{slug}_{digest}"
+    return keys
+
+
+def _assign_plan_identities(
+    job: ArtifactDraftJob,
+    plans: list[dict[str, Any]],
+    bundle: ExampleBundle,
+    question_summary: Any,
+    client: Any,
+) -> list[dict[str, Any]]:
+    """Give cross-chapter cards one identity before the merge decides card count."""
+    components = _identity_candidate_components(plans, bundle)
+    if not components:
+        return plans
+    by_id = {plan["id"]: plan for plan in plans}
+    oversized = [item for item in components if len(item) > MAX_IDENTITY_CANDIDATE_PLANS]
+    components = [item for item in components if len(item) <= MAX_IDENTITY_CANDIDATE_PLANS]
+    if oversized:
+        question_summary.add([
+            f"有 {len(oversized)} 组跨章节候选超过 {MAX_IDENTITY_CANDIDATE_PLANS} 张卡，"
+            "本轮未做身份重整，这些卡片保持各自独立。"
+        ])
+    identity_by_plan: dict[str, str] = {}
+    chunk: list[list[dict[str, Any]]] = []
+    chunk_ids: list[str] = []
+    chunk_type: str | None = None
+    chunk_chars = 0
+    step_index = 0
+
+    def flush() -> None:
+        nonlocal chunk, chunk_ids, chunk_type, chunk_chars, step_index
+        if not chunk:
+            return
+        step_index += 1
+        allowed = set(chunk_ids)
+        try:
+            output = _run_json_step(
+                job,
+                stage="identity_reconcile",
+                step_index=step_index,
+                input_payload={
+                    "prompt_version": IDENTITY_RECONCILE_PROMPT_VERSION,
+                    "candidate_groups": chunk,
+                },
+                input_refs={"plan_ids": sorted(allowed)},
+                messages=_identity_reconcile_messages(chunk),
+                client=client,
+                max_tokens=IDENTITY_RECONCILE_MAX_TOKENS,
+                validator=lambda raw, expected=allowed: _validate_identity_clusters(
+                    raw, expected
+                ),
+            )
+        except Exception as error:  # noqa: BLE001
+            question_summary.add([
+                f"第 {step_index} 组跨章节身份重整失败：{error}；该组卡片保持各自独立。"
+            ])
+        else:
+            identity_by_plan.update(_identity_keys_from_clusters(output))
+        chunk = []
+        chunk_ids = []
+        chunk_type = None
+        chunk_chars = 0
+
+    for component in components:
+        group = _identity_candidate_payload(component, by_id)
+        size = len(json.dumps(group, ensure_ascii=False))
+        # Components are single-type, and a chunk stays single-type with them:
+        # a mixed prompt let the model cluster across types, and _merge_match is
+        # type-scoped in both passes, so those keys could never merge anything.
+        component_type = by_id[component[0]]["type"]
+        if chunk and (
+            component_type != chunk_type
+            or chunk_chars + size > IDENTITY_GROUP_CHAR_BUDGET
+            or len(chunk_ids) + len(component) > IDENTITY_MAX_PLANS_PER_CHUNK
+        ):
+            flush()
+        chunk.append(group)
+        chunk_ids.extend(component)
+        chunk_type = component_type
+        chunk_chars += size
+    flush()
+    if not identity_by_plan:
+        return plans
+    return [
+        (
+            {**plan, "identity_key": identity_by_plan[plan["id"]]}
+            if plan["id"] in identity_by_plan
+            else plan
+        )
+        for plan in plans
+    ]
+
+
+def _plan_merge_keys(plan: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every key under which this plan should have merged with another survivor."""
+    keys = [("title", f"{plan['type']}\x00{plan['title'].casefold()}")]
+    identity = plan.get("identity_key")
+    if isinstance(identity, str) and identity:
+        keys.append(("identity", f"{plan['type']}\x00{identity}"))
+    return keys
+
+
+def _report_unmerged_identities(
+    plans: list[dict[str, Any]], question_summary: Any
+) -> None:
+    """Report survivors that still share a merge key, with the size that split them."""
+    parent = {index: index for index in range(len(plans))}
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    seen_keys: dict[tuple[str, str], int] = {}
+    for index, plan in enumerate(plans):
+        for key in _plan_merge_keys(plan):
+            first = seen_keys.setdefault(key, index)
+            left, right = find(first), find(index)
+            if left != right:
+                parent[right] = left
+    groups: dict[int, list[int]] = {}
+    for index in range(len(plans)):
+        groups.setdefault(find(index), []).append(index)
+    duplicated = [members for members in groups.values() if len(members) > 1]
+    if not duplicated:
+        return
+    preview = "；".join(
+        "/".join(dict.fromkeys(plans[index]["title"] for index in members[:3]))[:60]
+        + f"（合并后 {sum(len(plans[index].get('fact_ids') or []) for index in members)} 条事实）"
+        for members in duplicated[:3]
+    )
+    question_summary.add([
+        f"有 {len(duplicated)} 组卡片共享同一合并键但仍各自落地。"
+        f"合并守卫只在事实闭包不超过单卡预算时合并：{preview}。"
+    ])
+
+
+def _fact_closure_budget(
+    fact_ids: list[str], facts_by_id: dict[str, Any]
+) -> tuple[int, int]:
+    """Measure one card's fact closure the way the materialize stage measures it."""
+    selected = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
+    payload = json.dumps(_fact_payload_from_facts(selected), ensure_ascii=False)
+    return len(payload), _estimate_tokens(payload)
+
+
+def _merge_chapter_plans(
+    existing_plans: list[dict[str, Any]],
+    incoming_plans: list[dict[str, Any]],
+    facts_by_id: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Merge a repeated cross-chapter card only while it remains materializable.
+
+    With facts supplied, the combined closure is measured against the same
+    character and token budget the materialize stage enforces, so a merge is
+    refused for the only reason that matters: the survivor could not be
+    materialized.  Without facts the caller falls back to the fact-count ceiling,
+    which callers holding no fact table still rely on.
+    """
     merged = [dict(item) for item in existing_plans]
     for incoming in incoming_plans:
-        match = next(
-            (
-                item
-                for item in merged
-                if item["type"] == incoming["type"]
-                and item["title"].casefold() == incoming["title"].casefold()
-            ),
-            None,
-        )
+        match = _merge_match(merged, incoming)
         combined_fact_ids = list(
             dict.fromkeys(
                 [*(match or {}).get("fact_ids", []), *incoming.get("fact_ids", [])]
             )
         )
-        if match is None or len(combined_fact_ids) > 100:
+        if match is None:
+            merged.append(dict(incoming))
+            continue
+        if facts_by_id is None:
+            too_large = len(combined_fact_ids) > MAX_MERGED_FACT_IDS
+        else:
+            chars, tokens = _fact_closure_budget(combined_fact_ids, facts_by_id)
+            too_large = (
+                chars > MAX_CARD_FACT_INPUT_CHARS or tokens > MAX_CARD_FACT_INPUT_TOKENS
+            )
+        if too_large:
             merged.append(dict(incoming))
             continue
         match["fact_ids"] = combined_fact_ids
@@ -2027,6 +2496,9 @@ def _merge_chapter_plans(
                     [*match.get(field_name, []), *incoming.get(field_name, [])]
                 )
             )
+        # The survivor now stands for both plans, so it must carry the identity
+        # too; otherwise a later member of the same cluster stays apart unseen.
+        match["identity_key"] = match.get("identity_key") or incoming.get("identity_key")
     return merged
 
 
@@ -2043,56 +2515,114 @@ class PlanningIndexSummary(BaseModel):
     summary: str = Field(min_length=1, max_length=1200)
 
 
+MAX_PLANNING_INDEX_REQUESTS = 120
+PLANNING_INDEX_MIN_SUMMARY_CHARS = 240
+PLANNING_INDEX_SUMMARY_CAP = 1200
+
+
 def _bounded_plan_input(job, plan_index, profile, units, sizes, tokens, context, client):
     """Condense indexes while keeping every source fact available for card planning."""
-    transport = PlanningTransport(client, list(sizes))
+    transport = PlanningTransport(client, list(sizes), context)
     current = _compact_global_units(units)
-    round_index = 0
-    while True:
-        messages = _global_plan_messages(profile, current, sizes, tokens, context)
-        request_chars = len(json.dumps(transport.messages(messages), ensure_ascii=False))
-        if request_chars <= MAX_FACT_INPUT_CHARS:
-            return current, messages, transport
-        # No source IDs, chapter identity, or provenance may be truncated to fit.
-        if len(current) <= 1:
+    initial_messages = _global_plan_messages(profile, current, sizes, tokens, context)
+    if len(json.dumps(transport.messages(initial_messages), ensure_ascii=False)) <= MAX_FACT_INPUT_CHARS:
+        return current, initial_messages, transport
+    # A lower bound keeps all identifiers and budgets but no index prose.
+    minimum_units = [{"id": "minimum", "kind": "background", "title": "", "summary": "",
+                      "fact_ids": list(sizes)}]
+    minimum_messages = _global_plan_messages(profile, minimum_units, sizes, tokens, context)
+    minimum_chars = len(json.dumps(transport.messages(minimum_messages), ensure_ascii=False))
+    if minimum_chars > MAX_FACT_INPUT_CHARS:
+        raise ArtifactGenerationError(
+            f"规划请求过大：固定章节上下文与事实编号至少占 {minimum_chars:,} 字符，"
+            f"超过 {MAX_FACT_INPUT_CHARS:,} 字符预算；未调用索引汇总或截断事实。"
+        )
+    # Collapsing a fixed eight units per round discards independently runnable
+    # situations long before the request needs it, and repeating the round compounds
+    # the loss.  Derive the grouping from the real budget and condense only once.
+    unit_count = len(current)
+    blank_units = [dict(unit, title="", summary="", open_questions=[]) for unit in current]
+    blank_chars = len(json.dumps(
+        transport.messages(_global_plan_messages(profile, blank_units, sizes, tokens, context)),
+        ensure_ascii=False,
+    ))
+    per_unit = max(1, (blank_chars - minimum_chars) // max(1, unit_count - 1))
+    prose_budget = MAX_FACT_INPUT_CHARS - (minimum_chars - per_unit)
+    group_size = unit_count
+    for candidate in range(2, unit_count + 1):
+        entries = -(-unit_count // candidate)
+        if entries * (per_unit + 160 + PLANNING_INDEX_MIN_SUMMARY_CHARS) <= prose_budget:
+            group_size = candidate
+            break
+    group_size = max(group_size, -(-unit_count // MAX_PLANNING_INDEX_REQUESTS))
+    entries = -(-unit_count // group_size)
+    summary_chars = min(
+        PLANNING_INDEX_SUMMARY_CAP,
+        max(PLANNING_INDEX_MIN_SUMMARY_CHARS, prose_budget // max(1, entries) - per_unit - 160),
+    )
+    condensed = []
+    for group_index, offset in enumerate(range(0, unit_count, group_size), start=1):
+        group = current[offset:offset + group_size]
+        prompt = [{"role": "system", "content": (
+            "Summarize this same-chapter TRPG planning index, not the original source. "
+            'Return exactly one JSON object: {"title":"...","summary":"..."}. '
+            "Keep the English field names title and summary; write their string values in Chinese. "
+            "Do not return headings, Markdown, Chinese field names, or text outside the JSON object. "
+            "Preserve named playable situations, "
+            "NPC motives, actionable leads, conflicts, and alternatives. Do not invent connections or "
+            "merge distinct places into one scene. This is a retrieval index, not a final card or "
+            "a required route. All original fact IDs are preserved separately by the application. "
+            f"Keep title within 160 characters and summary within {summary_chars} characters. "
+            + SOURCE_SEMANTIC_GUIDANCE
+            + CLOCK_SEMANTIC_GUIDANCE
+        )}, {"role": "user", "content": json.dumps({
+            "schema": PlanningIndexSummary.model_json_schema(),
+            "units": [{k: v for k, v in unit.items() if k not in {"fact_ids", "id"}} for unit in group],
+        }, ensure_ascii=False)}]
+        if len(json.dumps(prompt, ensure_ascii=False)) > MAX_FACT_INPUT_CHARS:
+            raise ArtifactGenerationError("规划索引汇总请求超过预算；未截断事实或发送请求")
+        output = _run_json_step(
+            job, stage=f"planning_index_{plan_index}_0", step_index=group_index,
+            input_payload={"version": "planning-index-v3", "units": group,
+                           "summary_chars": summary_chars},
+            input_refs={"fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"]))},
+            messages=prompt, client=client, max_tokens=2500,
+            validator=lambda raw: PlanningIndexSummary.model_validate(raw).model_dump(mode="json"),
+        )
+        output["summary"] = (output.get("summary") or "")[:summary_chars]
+        condensed.append({
+            "id": f"planning_index_{plan_index}_0_{group_index}",
+            "kind": "background", **output,
+            "fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"])),
+            "entity_keys": [], "relationship_hints": [], "open_questions": [],
+        })
+    messages = _global_plan_messages(profile, condensed, sizes, tokens, context)
+    while len(json.dumps(transport.messages(messages), ensure_ascii=False)) > MAX_FACT_INPUT_CHARS:
+        if not _shrink_summaries(condensed):
             raise ArtifactGenerationError(
-                f"规划请求过大：索引已汇总，但必要章节上下文与事实编号仍占 {request_chars:,} 字符，"
-                f"超过 {MAX_FACT_INPUT_CHARS:,} 字符预算。保留全部事实，未发送超预算请求。"
+                f"规划请求过大：索引已汇总，但必要章节上下文与事实编号仍超过 "
+                f"{MAX_FACT_INPUT_CHARS:,} 字符预算。保留全部事实，未发送超预算请求。"
             )
-        condensed = []
-        for group_index, offset in enumerate(range(0, len(current), 8), start=1):
-            group = current[offset:offset + 8]
-            prompt = [{"role": "system", "content": (
-                "Summarize this same-chapter TRPG planning index, not the original source. "
-                'Return exactly one JSON object: {"title":"...","summary":"..."}. '
-                "Keep the English field names title and summary; write their string values in Chinese. "
-                "Do not return headings, Markdown, Chinese field names, or text outside the JSON object. "
-                "Preserve named playable situations, "
-                "NPC motives, actionable leads, conflicts, and alternatives. Do not invent connections or "
-                "merge distinct places into one scene. This is a retrieval index, not a final card or "
-                "a required route. All original fact IDs are preserved separately by the application. "
-                "Keep title within 160 characters and summary within 1200 characters."
-            )}, {"role": "user", "content": json.dumps({
-                "schema": PlanningIndexSummary.model_json_schema(),
-                "units": [{k: v for k, v in unit.items() if k not in {"fact_ids", "id"}} for unit in group],
-            }, ensure_ascii=False)}]
-            if len(json.dumps(prompt, ensure_ascii=False)) > MAX_FACT_INPUT_CHARS:
-                raise ArtifactGenerationError("规划索引汇总请求超过预算；未截断事实或发送请求")
-            output = _run_json_step(
-                job, stage=f"planning_index_{plan_index}_{round_index}", step_index=group_index,
-                input_payload={"version": "planning-index-v1", "units": group},
-                input_refs={"fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"]))},
-                messages=prompt, client=client, max_tokens=2500,
-                validator=lambda raw: PlanningIndexSummary.model_validate(raw).model_dump(mode="json"),
-            )
-            condensed.append({
-                "id": f"planning_index_{plan_index}_{round_index}_{group_index}",
-                "kind": "background", **output,
-                "fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"])),
-                "entity_keys": [], "relationship_hints": [], "open_questions": [],
-            })
-        current = condensed
-        round_index += 1
+        messages = _global_plan_messages(profile, condensed, sizes, tokens, context)
+    return condensed, messages, transport
+
+
+def _shrink_summaries(condensed: list[dict[str, Any]]) -> bool:
+    """Shrink every planned index summary by a quarter.
+
+    Reporting whether anything shrank lets the caller tell "still too big, keep
+    shrinking" apart from "nothing left to shrink", so an over-budget planning
+    request can never spin forever.  There is deliberately no per-summary floor:
+    a floor of one character would leave a length-1 summary unchanged and stall
+    the loop, so a length-1 summary shrinks to empty instead.
+    """
+    shrank = False
+    for item in condensed:
+        summary = item.get("summary")
+        if summary:
+            item["summary"] = summary[: len(summary) * 3 // 4]
+            shrank = True
+    return shrank
 
 
 def _generate_hierarchical_artifacts(
@@ -2242,6 +2772,30 @@ def _generate_hierarchical_artifacts(
                     ]
                     if member_ids:
                         chapter_units.append({**unit, "fact_ids": member_ids})
+                # A request only carries the facts its units name, and the budget
+                # maps are filtered to exactly those, so this is the set the plan
+                # has to account for in this chapter.
+                scope_ids = {
+                    fact_id for unit in chapter_units for fact_id in unit["fact_ids"]
+                }
+                # A per-fact disposition record costs about 110 characters and a
+                # large chapter holds several hundred, so the list alone pushed the
+                # request past the planning budget.  Every fact the scope covers is
+                # already named by its units, and its kind is always "chapter" for
+                # this profile, so only two things still carry information: which
+                # threads a fact supports, and whether it also belongs to another
+                # chapter.  Both are sent transposed, which repeats a thread id
+                # once instead of once per fact.
+                fact_threads: dict[str, list[str]] = {}
+                shared_with: dict[str, list[str]] = {}
+                for item in structure_context["fact_dispositions"]:
+                    if item["fact_id"] not in scope_ids:
+                        continue
+                    for thread_id in item["thread_ids"]:
+                        fact_threads.setdefault(thread_id, []).append(item["fact_id"])
+                    for other in item["chapter_ids"]:
+                        if other != chapter.id:
+                            shared_with.setdefault(other, []).append(item["fact_id"])
                 chapter_context = {
                     "chapters": [
                         item
@@ -2259,10 +2813,21 @@ def _generate_hierarchical_artifacts(
                         for item in structure_context["beats"]
                         if item["chapter_id"] == chapter.id
                     ],
-                    "fact_dispositions": [
-                        item
-                        for item in structure_context["fact_dispositions"]
-                        if item["fact_id"] in scope_fact_ids
+                    # Records rather than maps on purpose: PlanningTransport only
+                    # rewrites identifiers found under field names such as
+                    # thread_id, chapter_id and fact_ids.  A map keyed by a thread
+                    # id left every fact id at its full 40-character length, which
+                    # cost more than the per-fact records this replaced.
+                    # The facts this scope must account for, stated once so the
+                    # planner never has to reconstruct them from the units.
+                    "chapter_fact_ids": sorted(scope_ids),
+                    "fact_threads": [
+                        {"thread_id": thread_id, "fact_ids": sorted(fact_ids)}
+                        for thread_id, fact_ids in sorted(fact_threads.items())
+                    ],
+                    "fact_shared_with_chapters": [
+                        {"chapter_id": chapter_id, "fact_ids": sorted(fact_ids)}
+                        for chapter_id, fact_ids in sorted(shared_with.items())
                     ],
                 }
                 planning_scopes.append(
@@ -2331,13 +2896,21 @@ def _generate_hierarchical_artifacts(
     runtime_brief = None
     chapter_briefs = []
     uncovered = []
+    collected_plans: list[dict[str, Any]] = []
     for output in plan_outputs:
         output = _normalize_runtime_group_anchors(output, profile)
         runtime_brief = runtime_brief or output.get("brief")
         chapter_briefs.extend(output.get("chapter_briefs") or [])
         question_summary.add(list(output.get("open_questions") or []))
         uncovered.extend(output.get("uncovered_fact_ids") or [])
-        plans = _merge_chapter_plans(plans, output["cards"])
+        collected_plans.extend(output["cards"])
+    # Identity must be settled before merging: the merge decides how many cards
+    # exist, and each surviving card owns exactly one runtime state.
+    collected_plans = _assign_plan_identities(
+        job, collected_plans, bundle, question_summary, client
+    )
+    plans = _merge_chapter_plans([], collected_plans, facts_by_id)
+    _report_unmerged_identities(plans, question_summary)
     if uncovered:
         question_summary.add(
             [f"全局计划未使用 {len(uncovered)} 条已提升事实；请在产物复核时检查覆盖范围。"]
@@ -2352,6 +2925,7 @@ def _generate_hierarchical_artifacts(
 
     generated_cards: list[DerivedCard] = []
     failed_cards: list[str] = []
+    consecutive_failures = 0
     for card_index, plan in enumerate(plans, start=1):
         current = _job_from_store(job.id)
         if current.status != "running":
@@ -2369,14 +2943,14 @@ def _generate_hierarchical_artifacts(
                 input_payload={
                     "prompt_version": PROMPT_VERSION,
                     "profile_id": profile.id,
-                    "plan": plan,
+                    "plan": _prompt_plan(plan),
                     "facts": fact_payload,
                 },
                 input_refs={
                     "planned_card_id": plan["id"],
                     "fact_ids": plan["fact_ids"],
                 },
-                messages=_materialization_messages(profile, plan, fact_payload),
+                messages=_materialization_messages(profile, _prompt_plan(plan), fact_payload),
                 client=client,
                 max_tokens=ARTIFACT_MAX_TOKENS,
                 validator=lambda raw, selected_bundle=subset_bundle, card_plan=plan: (
@@ -2394,13 +2968,21 @@ def _generate_hierarchical_artifacts(
             failed_cards.append(
                 f"第 {card_index}/{len(plans)} 张计划卡（{plan['title']}）：{error}"
             )
+            consecutive_failures += 1
             job = _save_job(
                 _job_from_store(job.id),
                 completed_cards=card_index,
                 card_count=len(generated_cards),
                 **_question_summary_fields(question_summary),
             )
+            if consecutive_failures >= MAX_CONSECUTIVE_MATERIALIZE_FAILURES:
+                raise ArtifactGenerationError(
+                    f"连续 {consecutive_failures} 张计划卡素材化失败（最后一张："
+                    f"{plan['title']}）。上游可能不可用，已中止本轮生成；已成功的 "
+                    f"{len(generated_cards)} 张卡保存在步骤缓存中，重试会直接复用它们。"
+                ) from error
             continue
+        consecutive_failures = 0
         generated_cards.extend(DerivedCard.model_validate(card) for card in output["cards"])
         question_summary.add(list(output.get("open_questions") or []))
         job = _save_job(
@@ -2454,7 +3036,10 @@ def _prompt_messages(
         "in fact_ids, while the clock structure itself may be a GM-facing transformation. If support "
         "is missing for a factual claim, record a short open question instead of asserting it. Generate a coherent one-session working set, not "
         "one card per fact. Repeating a card type is allowed when the material has multiple "
-        "scenes, people, threats, or clocks. All user-facing text must be Chinese."
+        "scenes, people, threats, or clocks. "
+        + SOURCE_SEMANTIC_GUIDANCE
+        + CLOCK_SEMANTIC_GUIDANCE
+        + "All user-facing text must be Chinese."
     )
     anchor_instruction = (
         "A runtime profile must include at least one location or environment card. "
@@ -2619,8 +3204,21 @@ def _validate_and_build(
                 if fact_id not in closure:
                     closure.append(fact_id)
             field_sources[field_name] = refs
-        if len(closure) > 100:
-            raise ArtifactGenerationError(f"产物 {draft.title} 的事实闭包超过允许上限")
+        # The operative limit is the character/token budget shared with the
+        # planning and merge guards; the fact count is only a structural ceiling,
+        # so a card that passed planning can never be refused here for its count.
+        closure_chars, closure_tokens = _fact_closure_budget(
+            closure, {fact.id: fact for fact in bundle.facts}
+        )
+        if (
+            len(closure) > MAX_MERGED_FACT_IDS
+            or closure_chars > MAX_CARD_FACT_INPUT_CHARS
+            or closure_tokens > MAX_CARD_FACT_INPUT_TOKENS
+        ):
+            raise ArtifactGenerationError(
+                f"产物 {draft.title} 的事实闭包 {len(closure)} 条 / "
+                f"{closure_chars} 字符超过允许上限"
+            )
 
         cards.append(
             DerivedCard(

@@ -5,6 +5,10 @@ from pathlib import Path
 
 import httpx
 
+
+from _live_guard import require_live_tests
+
+require_live_tests("test_light")
 BASE = "http://127.0.0.1:8000"
 ROOT = Path(__file__).resolve().parent.parent
 PDF = ROOT.parent / "无光的灯塔.pdf"

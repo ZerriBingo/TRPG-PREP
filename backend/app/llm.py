@@ -599,14 +599,15 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
 
     definitions = profile.get("card_definitions", [])
     cards = []
-    dispositions = structure.get("fact_dispositions", []) if isinstance(structure, dict) else []
+    # The scope states the facts it must account for directly; the per-fact
+    # disposition records this once read cost more than a large chapter's whole
+    # planning budget and are no longer sent.
+    scope_fact_ids = (
+        structure.get("chapter_fact_ids", []) if isinstance(structure, dict) else []
+    )
     chapter_briefs = []
     for chapter in chapters:
-        applicable = [
-            item["fact_id"]
-            for item in dispositions
-            if chapter["id"] in item.get("chapter_ids", [])
-        ]
+        applicable = list(scope_fact_ids)
         chapter_briefs.append(
             {
                 "chapter_id": chapter["id"],
@@ -623,11 +624,8 @@ def _fake_global_plan_output(messages: list[dict]) -> dict:
                 "reference_fact_ids": applicable,
             }
         )
-    global_references = [
-        item["fact_id"]
-        for item in dispositions
-        if item.get("kind") == "global_reference"
-    ]
+    # Every fact in a chapter scope is chapter-owned, so nothing is a global reference.
+    global_references: list[str] = []
     runtime_brief = (
         {
             "premise": "离线测试用运行包，围绕所选事实组织可运行局势。",
@@ -814,10 +812,10 @@ def _fake_structure_consolidate_output(messages: list[dict]) -> dict:
         ],
         "beats": [
             {
-                "key": "situation_changes",
+                "key": f"situation_changes_{chapter['key']}",
                 "title": "局势发生变化",
                 "summary": "这是可能发生的发展，不规定运行顺序。",
-                "chapter_key": chapters[0]["key"],
+                "chapter_key": chapter["key"],
                 "thread_keys": ["objective"],
                 "thread_developments": {"objective": {
                     "development": "调查可能揭示各方对目标的不同诉求。",
@@ -826,6 +824,7 @@ def _fake_structure_consolidate_output(messages: list[dict]) -> dict:
                 "interplay": "队伍选择回应哪一方，会影响后续获得的信息；不预设解决路线。",
                 "fact_ids": fact_ids[: min(3, len(fact_ids))],
             }
+            for chapter in chapters
         ],
     }
 

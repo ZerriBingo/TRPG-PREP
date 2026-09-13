@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../frontend/workbench.js'), 'utf8');
-const names = ['planAnchorIds', 'runtimeConfirmedSceneCards', 'runtimeChapterIncludes', 'runtimeBeatIncludes'];
+const names = ['planAnchorIds', 'runtimeConfirmedSceneCards', 'runtimeChapterIncludes', 'runtimeBeatIncludes',
+  'runtimeCards', 'runtimePlanCards', 'renderRuntimeOverview', 'sourceHtml'];
 const functions = names.map(name => {
   const start = source.indexOf(`function ${name}(`);
   assert(start >= 0);
@@ -41,4 +42,53 @@ plan.navigation_mode = 'location';
 plan.location_card_ids = cards.map(c => c.id);
 assert.deepEqual(selected(), cards.map(c => c.id));
 assert.deepEqual(cards[0].story_beat_ids, ['beat']);
+plan.navigation_mode = 'environment';
+context.runtimeNarrative.chapter = 'all';
+context.runtimeNarrative.beat = 'beat';
+cards.forEach(c => { c.type = 'npc'; });
+const support = expression => Array.from(vm.runInContext(expression, context));
+assert.deepEqual(support('runtimePlanCards().map(c => c.id)'), ['direct', 'thread', 'unrelated']);
+assert.deepEqual(support('runtimeCards(["npc"]).map(c => c.id)'), ['direct', 'thread', 'unrelated']);
+context.runtimeNarrative.beat = 'all';
+assert.deepEqual(support('runtimePlanCards().map(c => c.id)'), cards.map(c => c.id));
+context.runtimeNarrative.chapter = 'two';
+assert.deepEqual(support('runtimeCards(["npc"]).map(c => c.id)'), ['other']);
+context.runtimeNarrative.chapter = 'all';
+context.runtimeNarrative.beat = 'missing';
+assert.deepEqual(support('runtimePlanCards().map(c => c.id)'), cards.map(c => c.id));
+
+const elements = new Map();
+Object.assign(context, {
+  $: id => { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); },
+  esc: value => String(value ?? ''),
+  badge: () => '',
+  label: value => value,
+  factEvidenceStatus: () => 'confirmed',
+  factSourceRefs: fact => fact.source_refs || [],
+  sourceRefLabel: ref => `p${ref.page}`,
+  runtimeCardFieldsHtml: () => '',
+  beatThreadDevelopmentHtml: () => '',
+  chapterThreadDistributionHtml: () => '',
+});
+const bundle = context.state.data.bundle;
+Object.assign(bundle, {
+  id: 'bundle',
+  adventure_chapters: [{id: 'one', title: 'Chapter one', summary: '', reference_fact_ids: []}],
+  facts: [{id: 'handout', text: 'Letter source text', source_refs: [{page: 42}]},
+    {id: 'global', text: 'Global reference text'}],
+  fact_dispositions: [{fact_id: 'handout', kind: 'display_material'},
+    {fact_id: 'global', kind: 'global_reference'}],
+  display_materials: [],
+});
+vm.runInContext('renderRuntimeOverview()', context);
+const references = elements.get('runtime-chapter-reference').innerHTML;
+assert.match(references, /Letter source text/);
+assert.match(references, /p42/);
+assert.match(references, /Global reference text/);
+assert.match(references, /展示材料来源参考/);
+assert.deepEqual(bundle.display_materials, []);
+bundle.fact_dispositions = [];
+vm.runInContext('renderRuntimeOverview()', context);
+assert.equal(elements.get('runtime-chapter-reference').innerHTML, '');
 console.log('PASS: only explicit same-chapter links recommend environments; other chapter environments stay available');
+console.log('PASS: support filters use the effective chapter; display dispositions retain source references without display records');

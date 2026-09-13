@@ -4,6 +4,10 @@ from pathlib import Path
 
 import httpx
 
+
+from _live_guard import require_live_tests
+
+require_live_tests("test_incremental")
 ROOT = Path(__file__).resolve().parent.parent
 c = httpx.Client(base_url="http://127.0.0.1:8000", timeout=60)
 

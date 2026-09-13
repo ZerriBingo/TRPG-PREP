@@ -3963,8 +3963,11 @@ function runtimePlanCards() {
 const runtimeNarrative = {workspace: null, chapter: "all", beat: "all"};
 
 function runtimeChapterIncludes(card) {
-  return currentPlan()?.navigation_mode !== "environment" || runtimeNarrative.chapter === "all" ||
-    (card.chapter_ids || []).includes(runtimeNarrative.chapter);
+  if (currentPlan()?.navigation_mode !== "environment") return true;
+  const chapter = runtimeNarrative.chapter === "all"
+    ? (state.data?.bundle?.story_beats || []).find((beat) => beat.id === runtimeNarrative.beat)?.chapter_id
+    : runtimeNarrative.chapter;
+  return !chapter || (card.chapter_ids || []).includes(chapter);
 }
 
 function runtimeBeatIncludes(card) {
@@ -4025,9 +4028,11 @@ function renderRuntimeOverview() {
       ...runtimePlanCards().flatMap((card) => card.fact_ids || [])]);
     const referenceOnly = refs.filter((id) => !covered.has(id));
     const globals = (bundle.fact_dispositions || []).filter((item) => item.kind === 'global_reference').map((item) => item.fact_id);
+    const displayRefs = (bundle.fact_dispositions || []).filter((item) => item.kind === 'display_material').map((item) => item.fact_id);
     $("runtime-chapter-reference").innerHTML =
       (refs.length ? '<details><summary>章节参考资料 · ' + refs.length + ' · 仅参考 ' + referenceOnly.length + '</summary>' + sourceHtml(refs) + '</details>' : '') +
-      (globals.length ? '<details><summary>全局参考资料 · ' + globals.length + '</summary>' + sourceHtml(globals) + '</details>' : '');
+      (globals.length ? '<details><summary>全局参考资料 · ' + globals.length + '</summary>' + sourceHtml(globals) + '</details>' : '') +
+      (displayRefs.length ? '<details><summary>展示材料来源参考 · ' + displayRefs.length + '</summary>' + sourceHtml(displayRefs) + '</details>' : '');
     return;
   }
   const brief = bundle?.runtime_brief;

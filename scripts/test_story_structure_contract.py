@@ -188,6 +188,7 @@ def main() -> None:
     else:
         raise AssertionError("beat threads must apply to its chapter")
     skeleton["threads"][0]["chapter_roles"]["one"] = "introduce"
+    skeleton["threads"][0]["chapter_roles"]["two"] = "background"
     assert _validate_skeleton(skeleton, set())["beats"][0]["chapter_key"] == "one"
     validate_bundle(
         bundle(

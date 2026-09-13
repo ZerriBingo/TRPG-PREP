@@ -8,6 +8,10 @@ from pathlib import Path
 
 import httpx
 
+
+from _live_guard import require_live_tests
+
+require_live_tests("test_e2e")
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 PDF = next(Path(__file__).resolve().parent.parent.parent.glob("*.pdf"), None)
 if PDF is None:

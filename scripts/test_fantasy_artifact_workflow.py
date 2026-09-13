@@ -165,7 +165,7 @@ async def main() -> None:
                 proposed_bundle = proposed.json()["bundle"]
                 assert len(proposed_bundle["adventure_chapters"]) == 2
                 assert len(proposed_bundle["story_threads"]) == 1
-                assert len(proposed_bundle["story_beats"]) == 1
+                assert len(proposed_bundle["story_beats"]) == len(proposed_bundle["adventure_chapters"])
                 assert len(proposed_bundle["fact_dispositions"]) == len(facts)
                 assert {
                     item["fact_id"] for item in proposed_bundle["fact_dispositions"]

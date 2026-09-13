@@ -41,6 +41,11 @@ SKELETON = {
         "interplay": "Accepting or questioning the offer changes access to the secret, without fixing a route.",
     }],
 }
+SKELETON["beats"].append({
+    **deepcopy(SKELETON["beats"][0]),
+    "key": "secret_revealed", "chapter_key": "chapter2_reveal",
+    "title": "The secret can be revealed",
+})
 ASSIGNMENTS = {
     "fact_invitation": {"kind": "chapter", "chapter_keys": ["chapter1_opening"]},
     "fact_secret": {
@@ -82,7 +87,7 @@ class ResponseClient:
         return deepcopy(self.assignments)
 
 
-def run_case(raw, *, valid=True, skeleton=None):
+def run_case(raw, *, valid=True, skeleton=None, handout=False):
     with tempfile.TemporaryDirectory() as directory:
         with patch.object(storage, "DB_PATH", Path(directory) / "structure.db"):
             storage.init_db()
@@ -90,6 +95,8 @@ def run_case(raw, *, valid=True, skeleton=None):
                 id=fact_id, text=fact_id, kind="event", visibility="explicit",
                 source_refs=[SourceRef(file="fixture://structure", page=1)],
             ) for fact_id in ASSIGNMENTS]
+            if handout:
+                facts[0].kind = "handout"
             bundle = ExampleBundle(
                 id="structure_response_workflow", name="Structure response workflow",
                 profile_ids=["daggerheart"], facts=facts, cards=[], plans=[],
@@ -111,6 +118,8 @@ def run_case(raw, *, valid=True, skeleton=None):
                 assert result.status == "completed", result.error
                 assert client.assignment_calls == 1, "shape-only variations need no model retry"
                 assert len(output.adventure_chapters) == 2
+                invitation = next(item for item in output.fact_dispositions if item.fact_id == "fact_invitation")
+                assert invitation.kind == "chapter" and invitation.chapter_ids
                 assert {item.fact_id for item in output.fact_dispositions} == set(ASSIGNMENTS)
                 secret = next(item for item in output.fact_dispositions if item.fact_id == "fact_secret")
                 assert len(secret.chapter_ids) == 2
@@ -129,6 +138,12 @@ def run_case(raw, *, valid=True, skeleton=None):
 
 
 def main():
+    run_case({"assignments": deepcopy(ASSIGNMENTS)}, handout=True)
+    missing_development = deepcopy(SKELETON)
+    missing_development["beats"].pop()
+    run_case({"assignments": deepcopy(ASSIGNMENTS)}, valid=False, skeleton=missing_development)
+    missing_development["threads"][0]["chapter_roles"]["chapter2_reveal"] = "background"
+    run_case({"assignments": deepcopy(ASSIGNMENTS)}, skeleton=missing_development)
     run_case({"assignments": deepcopy(ASSIGNMENTS)})
     for defect in ("missing_progress", "unknown_thread", "blank_change", "missing_interplay"):
         broken = deepcopy(SKELETON)
