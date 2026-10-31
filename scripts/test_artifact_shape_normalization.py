@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from backend.app import artifacts as artifacts_module  # noqa: E402
+from backend.app.fact_input import fact_batches  # noqa: E402
 from backend.app.artifacts import (  # noqa: E402
     ArtifactGenerationError,
-    _fact_batches,
     _merge_chapter_plans,
     _materialization_messages,
     _validate_global_plan,
@@ -490,7 +490,7 @@ tiny_facts = [
     )
     for index in range(201)
 ]
-tiny_batches = _fact_batches(tiny_facts)
+tiny_batches = fact_batches(tiny_facts)
 assert [len(item) for item in tiny_batches] == [200, 1]
 
 local_units = _validate_local_digest(

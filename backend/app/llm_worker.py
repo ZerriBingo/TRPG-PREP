@@ -26,10 +26,12 @@ def _url(base_url: str) -> str:
     return base + "/v1/chat/completions"
 
 
-def main() -> None:
-    cfg = json.loads(sys.stdin.read())
-    url = _url(cfg["base_url"])
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", "User-Agent": BROWSER_UA}
+def build_payload(cfg: dict) -> dict:
+    """Build the upstream request body from the worker's input.
+
+    A reasoning-effort hint is forwarded only when one is configured, because an
+    upstream that does not recognise the value rejects the whole request.
+    """
     payload = {
         "model": cfg["model"],
         "messages": cfg["messages"],
@@ -38,6 +40,17 @@ def main() -> None:
     }
     if cfg.get("stream"):
         payload["stream"] = True
+    effort = str(cfg.get("reasoning_effort") or "").strip()
+    if effort:
+        payload["reasoning_effort"] = effort
+    return payload
+
+
+def main() -> None:
+    cfg = json.loads(sys.stdin.read())
+    url = _url(cfg["base_url"])
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", "User-Agent": BROWSER_UA}
+    payload = build_payload(cfg)
     try:
         request_timeout = cfg.get("request_timeout")
         read_timeout = max(float(request_timeout or 240), 1.0)
@@ -45,12 +58,20 @@ def main() -> None:
                       headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
+        choice = (data.get("choices") or [{}])[0]
         if cfg.get("stream"):
             # 非流式响应直接取 content
-            content = data["choices"][0]["message"]["content"]
+            content = choice["message"]["content"]
         else:
-            content = data["choices"][0]["message"]["content"]
-        print(json.dumps({"content": content}, ensure_ascii=False))
+            content = choice["message"]["content"]
+        # finish_reason tells a caller why a reply can be empty: a reasoning model that
+        # spends the whole budget thinking returns content=null with finish_reason=length.
+        # ensure_ascii keeps the frame pure ASCII: this process is started with the console
+        # code page (GBK on Windows), so printing Chinese directly raised UnicodeEncodeError
+        # for some characters and the call failed for a reason that had nothing to do with
+        # the upstream.  JSON escapes survive any encoding and decode back to the same text.
+        print(json.dumps({"content": content,
+                          "finish_reason": choice.get("finish_reason")}, ensure_ascii=True))
     except Exception as e:  # noqa: BLE001
         response = getattr(e, "response", None)
         status = getattr(response, "status_code", None)
@@ -62,6 +83,12 @@ def main() -> None:
         error_name = type(e).__name__
         error_text = str(e)
         lowered = error_text.casefold()
+        retry_after = ""
+        try:
+            if response is not None:
+                retry_after = str((response.headers or {}).get("retry-after") or "")
+        except Exception:  # noqa: BLE001
+            retry_after = ""
         if response is not None and isinstance(status, int) and status > 0:
             kind = "http"
         elif "timed out" in lowered or "timeout" in lowered or "operation timed out" in lowered:
@@ -72,8 +99,8 @@ def main() -> None:
             kind = "response"
         print(json.dumps({"error": f"{type(e).__name__}: {e}",
                           "kind": kind, "status": status, "body": body,
-                          "error_type": error_name,
-                          "timeout": cfg.get("request_timeout")}, ensure_ascii=False))
+                          "error_type": error_name, "retry_after": retry_after,
+                          "timeout": cfg.get("request_timeout")}, ensure_ascii=True))
 
 
 if __name__ == "__main__":

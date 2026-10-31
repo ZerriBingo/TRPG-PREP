@@ -6,7 +6,7 @@ TRPG-PREP turns uploaded module source into traceable GM preparation material. T
 
 ## Current Priority
 
-Stabilize the new-project chapter workflow before adding new product features. Every generated artifact must remain traceable to promoted fact IDs and must be reproducible from an explicit preparation scope. Historical runs and incidents are evidence for diagnosis, not requirements by themselves.
+Choose maintenance work and acceptance criteria from `docs/IMPLEMENTATION_BACKLOG.md`, following the owner-confirmed goals and ruleset boundaries in `docs/PRODUCT_GUARDRAILS.md` (2026-10-31). Every generated artifact must remain traceable to promoted fact IDs and reproducible from an explicit preparation scope. Historical runs and incidents are evidence for diagnosis, not requirements by themselves.
 
 ## Product Simplicity Principle
 
@@ -19,6 +19,9 @@ Reality-horror runtime is a complete table-side reference surface: chapter overv
 ## Domain Terms
 
 - **Workspace**: one GM preparation project and its saved analysis versions.
+- **Preparation board**: a preparation style with its own information needs, such as reality-horror or fantasy/adventure; it does not prescribe the rules used at the table.
+- **Play ruleset**: the rules the GM uses to run the game; it is distinct from the rules under which a source module was written.
+- **Design reference**: material whose preparation or game-design methods inform the product, such as Cthulhu Dark or Daggerheart; it does not determine the play ruleset.
 - **Source facts**: extracted, reviewed evidence tied to source pages.
 - **Candidate**: a model-generated, source-bound proposal that still requires GM review.
 - **Approved fact**: a candidate explicitly accepted as source material, inference, or GM-authored content.
@@ -77,4 +80,4 @@ Reality-horror runtime is a complete table-side reference surface: chapter overv
 
 ## Verification
 
-Run focused Python checks plus JavaScript syntax checks before pushing. Real upstream experiments use an isolated database copy, and a release claim requires a fresh end-to-end user workflow rather than fixture-only or API-only evidence.
+Run focused Python checks plus JavaScript syntax checks before pushing. Real upstream experiments use an isolated database copy, and a release claim requires a fresh end-to-end user workflow rather than fixture-only or API-only evidence. A stage reached only through injected fixtures or hand-written API calls is component-complete, never product-complete.

@@ -3,7 +3,7 @@
   "name": "通用模组整理档案",
   "version": "0.1",
   "profile_kind": "prep",
-  "summary": "把 D&D、COC 等长模组整理成来源可追溯的场景入口、人物功能、威胁逻辑和时间压力，供目标规则档案重新编排。",
+  "summary": "把 D&D、COC 等长模组整理成来源可追溯的场景入口、人物功能、威胁逻辑和时间压力，供各备团板块按需取用，不要求先做规则转换。",
   "card_definitions": [
     {
       "type": "scene_extract",

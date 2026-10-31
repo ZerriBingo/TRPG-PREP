@@ -4,7 +4,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .models import DerivedCard, DisplayMaterial, ExampleBundle, RuleProfile, SceneBeat, ScenePlan, SessionState, SourceFact
 
@@ -565,6 +565,42 @@ def validate_bundle(
                     f"display material {material.id} link is not listed on beat {link.beat_id}"
                 )
     return fact_index
+
+
+def validate_prep_selection(
+    bundle: ExampleBundle,
+    profiles: Mapping[str, RuleProfile],
+    profile_id: str,
+    card_ids: Sequence[str],
+) -> list[str]:
+    """Validate one board's saved preparation selection.
+
+    A selection is a reading aid for the coming session: it points at approved cards
+    of this project and board, and nothing else. Duplicates, unknown ids, another
+    board's cards and cards that are not explicitly approved are rejected rather than
+    dropped, so a client can never save something the runtime would then refuse to
+    show as approved content.
+    """
+    profile = profiles.get(profile_id)
+    if profile is None or profile_id not in bundle.profile_ids:
+        raise DomainValidationError("准备选择指向了本项目之外的板块")
+    if profile.profile_kind != "runtime":
+        raise DomainValidationError("准备选择只能用于运行板块")
+
+    cards_by_id = {card.id: card for card in bundle.cards}
+    seen: set[str] = set()
+    for card_id in card_ids:
+        if card_id in seen:
+            raise DomainValidationError(f"准备选择包含重复卡片：{card_id}")
+        seen.add(card_id)
+        card = cards_by_id.get(card_id)
+        if card is None:
+            raise DomainValidationError(f"准备选择包含不存在的卡片：{card_id}")
+        if card.profile_id != profile_id:
+            raise DomainValidationError(f"准备选择包含其他板块的卡片：{card_id}")
+        if card.edit_state != "approved":
+            raise DomainValidationError(f"准备选择包含未批准卡片：{card_id}")
+    return list(card_ids)
 
 
 def validate_session(session: SessionState, bundle: ExampleBundle) -> None:

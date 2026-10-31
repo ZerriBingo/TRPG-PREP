@@ -70,6 +70,12 @@
             <label>Base URL<input id="prep-config-base-url" type="url" required></label>
             <label>模型<input id="prep-config-model" list="prep-model-options" required></label>
             <label>API Key<input id="prep-config-api-key" type="password" autocomplete="off" placeholder="留空保留已保存密钥"></label>
+            <label>推理档位<select id="prep-config-reasoning-effort">
+              <option value="">不发送（默认）</option>
+              <option value="low">low（最省）</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select></label>
             <label class="prep-fake-toggle"><input id="prep-config-fake" type="checkbox">使用离线 FakeLLM</label>
             <div class="prep-config-actions">
               <button id="prep-config-save" class="edit-button" type="submit">保存</button>
@@ -85,6 +91,7 @@
         <summary>已上传来源</summary>
         <div class="prep-source-inline-head">
           <span class="muted">按内容去重；正在被任务、事实或产物引用的文件不可删除。</span>
+          <span id="prep-source-status" class="status"></span>
           <button id="prep-source-refresh" class="edit-button toolbar-action" type="button">刷新</button>
         </div>
         <div id="prep-source-file-list" class="prep-source-file-list"></div>
@@ -201,6 +208,22 @@
     </section>
 
     <section id="view-cards" class="view">
+      <section class="panel prep-selection-panel">
+        <div class="panel-head">
+          <div>
+            <h2>本次准备 <span id="prep-selection-board" class="badge"></span></h2>
+            <span id="prep-selection-status" class="status"></span>
+          </div>
+          <div class="row-actions">
+            <select id="prep-selection-profile" aria-label="本次准备所属板块" hidden></select>
+            <button id="prep-selection-save" class="action-link" type="button" disabled>保存本次准备</button>
+            <button id="prep-selection-clear" class="edit-button" type="button" disabled>清空选择</button>
+          </div>
+        </div>
+        <p class="muted">只挑选这次可能用到的已批准资料；不规定玩家路线，也不改变运行计划、运行位置或运行状态。保存后刷新页面仍可取回。</p>
+        <div id="prep-selection-list" class="prep-selection-list"></div>
+        <div id="prep-selection-error" class="review-detail-error"></div>
+      </section>
       <section class="panel card-toolbar">
         <select id="card-profile">
           <option value="all">全部板块</option>
@@ -281,6 +304,28 @@
         <div id="profile-runtime" hidden></div>
         <div id="runtime-plan-status" class="runtime-plan-status" hidden></div>
       </section>
+      <section class="panel runtime-scene-panel">
+        <div class="panel-head"><h2 id="runtime-anchor-title">运行场景</h2><span id="runtime-anchor-description" class="muted">自由切换，不预设行动路线</span></div>
+        <div class="runtime-reference-toolbar">
+          <input id="runtime-reference-search" type="search" placeholder="搜索本项目已批准的人物、地点、威胁…" aria-label="搜索本项目已批准资料">
+          <select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="environment">环境</option><option value="npc">人物</option><option value="threat">威胁</option><option value="enemy">对手</option><option value="handout">展示材料</option></select>
+        </div>
+        <div id="runtime-retrieval" class="runtime-retrieval" hidden>
+          <p id="runtime-retrieval-status" class="runtime-retrieval-status muted"></p>
+          <div id="runtime-retrieval-list" class="runtime-retrieval-list"></div>
+          <div id="runtime-retrieval-detail" class="runtime-retrieval-detail"></div>
+        </div>
+        <details id="runtime-prep-selection" class="runtime-prep-selection" hidden>
+          <summary>本次准备材料 <span id="runtime-prep-selection-count" class="muted"></span></summary>
+          <div id="runtime-prep-selection-list" class="runtime-related-list"></div>
+        </details>
+        <div id="scene-holder"></div>
+        <details class="runtime-scene-switcher" open>
+          <summary>切换场景 <span id="runtime-scene-count" class="muted"></span></summary>
+          <div id="runtime-exploration-list" class="runtime-exploration-list"></div>
+        </details>
+      </section>
+      <div id="beat-holder"></div>
       <section class="panel runtime-overview-panel">
         <div class="panel-head"><h2 id="runtime-overview-title">运行总览</h2><span id="runtime-overview-description" class="muted">当前范围的整体情势与可能结果</span></div>
         <div id="runtime-narrative-controls" class="runtime-reference-toolbar" hidden>
@@ -294,15 +339,8 @@
         <div class="panel-head"><h2>推进钟</h2><span class="muted">每次推进都写入运行日志</span></div>
         <div id="runtime-clocks" class="runtime-list"></div>
       </section>
-      <section class="panel runtime-exploration-panel">
-        <div class="panel-head"><h2 id="runtime-anchor-title">运行场景</h2><span id="runtime-anchor-description" class="muted">自由切换，不预设行动路线</span></div>
-        <div class="runtime-reference-toolbar"><input id="runtime-reference-search" type="search" placeholder="搜索当前运行资料"><select id="runtime-reference-filter"><option value="all">全部资料</option><option value="location">地点</option><option value="environment">环境</option><option value="npc">人物</option><option value="threat">威胁</option><option value="enemy">对手</option><option value="handout">展示材料</option></select></div>
-        <div id="runtime-exploration-list" class="runtime-exploration-list"></div>
-      </section>
-      <div id="scene-holder"></div>
-      <div id="beat-holder"></div>
       <section class="panel runtime-reference-panel">
-        <div class="panel-head"><h2>运行资料</h2><span class="muted">当前运行计划中的全部已批准卡片</span></div>
+        <div class="panel-head"><h2>运行资料</h2><span id="runtime-reference-description" class="muted">当前运行计划中的全部已批准卡片</span></div>
         <div id="runtime-reference-list" class="runtime-reference-list masonry-grid"></div>
       </section>
       <section class="panel runtime-materials-panel">

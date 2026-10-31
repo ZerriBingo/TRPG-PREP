@@ -637,7 +637,7 @@ def _refine_broad_semantic_segments(
                 raw = client.chat(
                     _semantic_prompt_messages(job, segment_signatures, refine=True),
                     temperature=0.0,
-                    max_tokens=3000,
+                    max_tokens=8000,
                 )
                 refined = _normalize_semantic_segments(parse_json(raw), [segment])
             except Exception:  # noqa: BLE001
@@ -710,7 +710,7 @@ def _prepare_semantic_windows(job: PrepJob, path: Path, client) -> PrepJob:
         raw = client.chat(
             _semantic_prompt_messages(job, signatures),
             temperature=0.0,
-            max_tokens=3000,
+            max_tokens=8000,
         )
         segments = _normalize_semantic_segments(
             parse_json(raw), job.scope.page_spans
@@ -990,6 +990,18 @@ def _normalize_prep_response(
             candidate["source_refs"] = refs
 
         candidate["confidence"] = _normalize_confidence(candidate.get("confidence"))
+        # A malformed entry — some providers emit a bare {"confidence": null} — used to reach
+        # strict validation, which rejected the entire window and discarded every good
+        # candidate beside it.  An entry with no text, or with no usable kind, carries no
+        # fact, so drop it here.  The raw response stays in the run summary, so nothing is
+        # lost: it is recoverable from there.
+        text = candidate.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        candidate["text"] = text.strip()
+        candidate_kind = candidate.get("kind")
+        if not isinstance(candidate_kind, str) or not candidate_kind.strip():
+            continue
         for field in ("possible_links", "open_questions"):
             value = candidate.get(field)
             if isinstance(value, str):
@@ -2341,11 +2353,11 @@ def _run_consolidation_task(
         raw_response = client.chat(
             _consolidation_prompt_messages(job, segment_id, segment_span, input_text),
             temperature=0.1,
-            max_tokens=6000,
+            max_tokens=32000,
         )
     except Exception as error:  # noqa: BLE001
         _, run, _ = shadow.submit_shadow_result(
-            task.id, transport_error=str(error)[:2000]
+            task.id, transport_error=str(error)[:2000] or type(error).__name__,
         )
         return task, [], run.transport_error or "semantic segment consolidation failed"
 
@@ -2902,11 +2914,26 @@ def _execute_window(job: PrepJob, window: ExtractionWindow, path: Path, client) 
         raw_response = client.chat(
             _prompt_messages(job, window, excerpt),
             temperature=0.1,
-            max_tokens=6000,
+            max_tokens=32000,
+            # A window of source text with a reasoning model can take minutes; the
+            # default read budget is far too short for the extraction stage.
+            request_timeout=600,
         )
+        if not str(raw_response or "").strip():
+            # An empty reply used to be handed to submit_shadow_result as raw_response="",
+            # which rejects it with "provide exactly one of raw_response or transport_error"
+            # and the window then reported that the upstream was unavailable.  That message
+            # sent every reader after the wrong cause.  State what actually happened.
+            reason = "模型没有返回任何内容"
+            if getattr(client, "last_finish_reason", None) == "length":
+                reason += (
+                    "（finish_reason=length：输出预算在写出正文前被用尽，"
+                    "通常是该模型把预算花在推理上）"
+                )
+            raise RuntimeError(f"{reason}，本窗口未能抽取候选事实。")
     except Exception as error:  # noqa: BLE001
         _, run, _ = shadow.submit_shadow_result(
-            task.id, transport_error=str(error)[:2000]
+            task.id, transport_error=str(error)[:2000] or type(error).__name__,
         )
         current = _job_from_store(job.id)
         _replace_window(

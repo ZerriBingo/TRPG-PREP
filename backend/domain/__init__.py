@@ -28,6 +28,7 @@ from .service import (
     is_handout_fact,
     validate_session,
     validate_bundle,
+    validate_prep_selection,
 )
 
 __all__ = [
@@ -82,4 +83,5 @@ __all__ = [
     "parse_page_spans",
     "validate_bundle",
     "validate_session",
+    "validate_prep_selection",
 ]

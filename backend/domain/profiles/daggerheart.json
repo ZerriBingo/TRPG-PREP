@@ -11,28 +11,28 @@
       "display_name": "环境卡",
       "description": "把探索、社交、穿越、战斗或事件组织成一个可运行局势。",
       "required_fields": ["environment_type", "opening_image", "narrative_function", "impulses", "usable_features"],
-      "optional_fields": ["hazards", "gm_responses", "phase_changes", "exit_outcomes", "positioning", "sensory_details", "triggers", "potential_adversaries", "source_statistics"]
+      "optional_fields": ["hazards", "gm_responses", "phase_changes", "exit_outcomes", "positioning", "sensory_details", "triggers", "potential_adversaries", "source_statistics", "assumed_state", "table_questions"]
     },
     {
       "type": "npc",
       "display_name": "人物卡",
       "description": "记录非敌对或立场可变人物的目标、交换内容、关系压力和态度变化。",
       "required_fields": ["short_term_goal", "long_term_goal", "offers", "relationship_pressure", "attitude_changes"],
-      "optional_fields": ["first_impression", "secret", "voice_notes"]
+      "optional_fields": ["first_impression", "secret", "voice_notes", "assumed_state", "table_questions"]
     },
     {
       "type": "enemy",
       "display_name": "对手卡",
       "description": "记录明确对抗者的动机、当前目标、行动、前兆、受创变化和多种解决方式。",
       "required_fields": ["motives", "current_objective", "signature_actions", "danger_signs", "damaged_behavior", "resolutions"],
-      "optional_fields": ["source_statblock", "retreat_condition", "narrative_role"]
+      "optional_fields": ["source_statblock", "retreat_condition", "narrative_role", "assumed_state", "table_questions"]
     },
     {
       "type": "encounter_clock",
       "display_name": "遭遇钟",
       "description": "追踪援军、警报、崩塌、追击、谈判耐心、仪式或阶段变化。",
       "required_fields": ["name", "stages", "advance_condition"],
-      "optional_fields": ["current_stage", "final_consequence"]
+      "optional_fields": ["current_stage", "final_consequence", "assumed_state", "table_questions"]
     }
   ],
   "risk_axes": ["stress", "positioning", "attention", "relationships"],

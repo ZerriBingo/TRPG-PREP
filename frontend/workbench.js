@@ -6,6 +6,8 @@ const state = {
   initialView: new URLSearchParams(location.search).get("view") || "prep",
   workspaces: [],
   editMode: false,
+  eventsBound: false,
+  loadFailure: null,
   dirty: false,
   saving: false,
   savedAt: null,
@@ -40,15 +42,28 @@ const state = {
     pollTimer: null
   },
   runtimeProfileId: null,
+  runtimeRetrieval: {
+    cardId: null
+  },
+  // 本次准备：每个运行板块一份已保存的材料选择。它是阅读辅助，不是运行集合，
+  // 也从不参与 SessionState 或计划成员。
+  prepSelection: {
+    profileId: null,
+    boards: {}
+  },
   session: null,
   sessionUpdatedAt: null,
   sessionState: "new",
   sessionSaving: false,
   sessionDirty: false,
   sourceFiles: [],
+  timings: {
+    projectReadyMs: null
+  },
   prep: {
     jobs: [],
     config: null,
+    configError: "",
     models: [],
     uploads: [],
     uploadItems: [],
@@ -58,7 +73,16 @@ const state = {
     configSaving: false,
     error: "",
     notice: "",
-    pollTimer: null
+    pollTimer: null,
+    // Source-management details (page counts, hashes, references) are loaded
+    // independently of project material; their state is reported on its own so a
+    // slow or failing request never looks like an unusable project.
+    source: {
+      state: "idle",
+      error: "",
+      elapsedMs: null,
+      token: 0
+    }
   },
   review: {
     tasks: [],
@@ -86,6 +110,11 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
 
 function formatApiError(payload, fallback = "请求失败") {
   const detail = payload?.detail;
+  // A structured detail carries the server's own GM-facing reason.
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const message = detail.message || detail.msg;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
   if (Array.isArray(detail)) {
     const messages = detail.map((item) => {
       if (typeof item === "string") return item;
@@ -107,6 +136,10 @@ function formatApiError(payload, fallback = "请求失败") {
 // diagnostics.  Keep those details out of the GM-facing workbench while
 // preserving the original error object for callers that need it.
 function userFacingError(error, fallback = "请求失败") {
+  // Reasons supplied by this application (for example a project that cannot open
+  // under the current contract) are already accurate; never compress them into a
+  // generic "refresh and retry" hint.
+  if (error && error.apiReason) return String(error.apiReason);
   const raw = error instanceof Error ? error.message : String(error || "");
   if (!raw.trim()) return fallback;
   if (/candidate|候选|fact|事实|card|卡片|plan|场景|workspace|工作区|task|任务|job|作业/i.test(raw)) {
@@ -209,6 +242,7 @@ const fieldLabels = {
   premise: "冒险前提", current_situation: "当前局势", major_conflicts: "主要矛盾",
   opening_conditions: "开场条件", possible_endings: "可能结局", factions: "重要阵营",
   cross_environment_consequences: "跨局势后果", environment_type: "环境倾向",
+  assumed_state: "前置状态", table_questions: "桌边创作提示",
   narrative_function: "叙事功能", impulses: "环境冲动", gm_responses: "GM 响应",
   phase_changes: "阶段变化", exit_outcomes: "退出结果", triggers: "触发条件",
   potential_adversaries: "可能对手", source_statistics: "原文数值参考",
@@ -216,6 +250,7 @@ const fieldLabels = {
   hidden_clues: "隐藏线索", gm_moves: "GM 移动", risk_if_pressed: "施压风险",
   exit_conditions: "退场条件", role: "身份", wants: "想要", offers: "能给什么",
   pressure_point: "施压点", refusal_consequence: "拒绝后果", manifestation: "表现",
+  first_impression: "初次印象", secret: "秘密", voice_notes: "说话方式",
   intention: "意图", danger_signs: "危险前兆", escalation: "升级",
   noncombat_exits: "非战斗解法", usable_features: "可利用物", hazards: "危险物",
   positioning: "距离与位置", environment_changes: "环境变化", signature_actions: "标志行动",
@@ -448,8 +483,8 @@ function renderPrep() {
   const llmStatus = $("prep-llm-status");
   if (!llmStatus) return;
   if (!config) {
-    llmStatus.className = "status loading";
-    llmStatus.textContent = "读取模型配置";
+    llmStatus.className = state.prep.configError ? "status error" : "status loading";
+    llmStatus.textContent = state.prep.configError || "读取模型配置";
   } else if (config.fake) {
     llmStatus.className = "status ok";
     llmStatus.textContent = "FakeLLM · " + config.model;
@@ -579,10 +614,12 @@ async function loadPrepConfig() {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(formatApiError(payload, "模型配置加载失败"));
   state.prep.config = payload;
+  state.prep.configError = "";
   $("prep-config-base-url").value = payload.base_url || "";
   $("prep-config-model").value = payload.model || "";
   $("prep-config-fake").checked = Boolean(payload.fake);
   $("prep-config-api-key").value = "";
+  $("prep-config-reasoning-effort").value = payload.reasoning_effort || "";
   $("prep-config-api-key").placeholder = payload.has_key
     ? "已保存密钥；留空保持不变"
     : "输入 API Key";
@@ -593,6 +630,7 @@ async function persistPrepConfig() {
   const payload = {
     base_url: $("prep-config-base-url").value.trim(),
     model: $("prep-config-model").value.trim(),
+    reasoning_effort: $("prep-config-reasoning-effort").value,
     fake: $("prep-config-fake").checked
   };
   const apiKey = $("prep-config-api-key").value.trim();
@@ -2171,59 +2209,159 @@ function renderSourceFiles() {
   const host = $("prep-source-file-list");
   if (!host) return;
   const items = state.prep.uploadItems || [];
+  const source = state.prep.source || {};
   if (!items.length) {
-    host.innerHTML = '<div class="empty-state prep-source-empty">尚未上传 PDF。</div>';
+    if (source.state === "error") {
+      host.innerHTML = '<div class="empty-state prep-source-empty">来源详情读取失败：' +
+        esc(source.error) + '。这不影响已整理资料的查看；可点“刷新”重试。</div>';
+    } else if (source.state === "ready") {
+      host.innerHTML = '<div class="empty-state prep-source-empty">尚未上传 PDF。</div>';
+    } else {
+      host.innerHTML = '<div class="empty-state prep-source-empty">正在读取来源详情…</div>';
+    }
     return;
   }
   host.innerHTML = items.map((item) => {
     const references = Array.isArray(item.references) ? item.references : [];
-    const referenceText = item.referenced
-      ? `正在使用 · ${references.slice(0, 3).map((ref) => ref.label || ref.kind || "已引用").join("、")}`
-      : "未被任务或书架引用，可删除";
+    // A just-uploaded file is usable before the listing reports its references.
+    // Until then the deletion state is unknown, so it is neither claimed free nor
+    // reported as in use.
+    const pending = item.references_pending === true;
+    const referenceText = pending
+      ? (source.state === "error" ? "引用状态未知 · 详情读取失败，可刷新重试" : "引用状态确认中…")
+      : item.referenced
+        ? `正在使用 · ${references.slice(0, 3).map((ref) => ref.label || ref.kind || "已引用").join("、")}`
+        : "未被任务或书架引用，可删除";
     const referenceDetail = references.length > 3 ? ` 等 ${references.length} 处` : "";
+    const blocked = item.referenced || pending;
+    const deleteTitle = pending ? "引用状态确认中，暂不能删除" : item.referenced ? "文件仍被使用，不能删除" : "删除这个已上传 PDF";
     return `<article class="prep-source-item">
       <div class="prep-source-item-main">
         <strong title="${esc(item.file)}">${esc(item.original_name || sourceBasename(item.file))}</strong>
         <span class="muted">${item.page_count ? `${item.page_count} 页` : "页数未知"} · ${formatFileSize(item.size_bytes)}</span>
-        <span class="prep-source-reference ${item.referenced ? "referenced" : "available"}">${esc(referenceText + referenceDetail)}</span>
+        <span class="prep-source-reference ${pending ? "pending" : item.referenced ? "referenced" : "available"}">${esc(referenceText + referenceDetail)}</span>
       </div>
-      <button type="button" class="edit-button danger" data-source-delete="${esc(item.file)}" ${item.referenced ? "disabled" : ""} title="${item.referenced ? "文件仍被使用，不能删除" : "删除这个已上传 PDF"}">删除</button>
+      <button type="button" class="edit-button danger" data-source-delete="${esc(item.file)}" ${blocked ? "disabled" : ""} title="${deleteTitle}">删除</button>
     </article>`;
   }).join("");
 }
 
-async function loadSourceFiles() {
-  const response = await fetch("/api/domain/source-files", {cache: "no-store"});
-  if (!response.ok) throw new Error("来源 PDF 列表加载失败: HTTP " + response.status);
-  const payload = await response.json();
-  state.sourceFiles = Array.isArray(payload.files) ? payload.files : [];
-  state.prep.uploads = Array.isArray(payload.uploads)
-    ? payload.uploads
-    : state.sourceFiles.filter((file) => file.startsWith("data/uploads/"));
-  state.prep.uploadItems = Array.isArray(payload.upload_items)
-    ? payload.upload_items
-    : state.prep.uploads.map((file) => ({
-      file,
-      original_name: sourceBasename(file),
-      page_count: null,
-      size_bytes: null,
-      referenced: false,
-      references: []
-    }));
-  const resources = Array.isArray(payload.resources)
-    ? payload.resources
-    : state.sourceFiles.filter((file) => file.startsWith("Resource/"));
+function renderSourceOptions() {
+  const jobSelect = $("prep-job-source");
+  if (!jobSelect) return;
   const optionItems = (files) => files.map((file) =>
     '<option value="' + esc(file) + '">' + esc(file.split("/").pop()) + '</option>'
   ).join("");
-
-  const jobSelect = $("prep-job-source");
+  const uploads = state.prep.uploads || [];
   const jobSelected = jobSelect.value;
   jobSelect.innerHTML = '<option value="">' +
-    (state.prep.uploads.length ? '选择已上传 PDF' : '请先上传 PDF') + '</option>' +
-    optionItems(state.prep.uploads);
-  if (state.prep.uploads.includes(jobSelected)) jobSelect.value = jobSelected;
+    (uploads.length ? '选择已上传 PDF' : '请先上传 PDF') + '</option>' +
+    optionItems(uploads);
+  if (uploads.includes(jobSelected)) jobSelect.value = jobSelected;
+}
+
+// A successful upload response already describes the new file, so choosing it must
+// not wait for the slower detail listing. References stay unknown until that listing
+// arrives; the entry is marked pending rather than free or in use.
+function adoptUploadedSource(payload) {
+  if (!payload || !payload.file) return null;
+  const file = payload.file;
+  const existing = (state.prep.uploadItems || []).find((entry) => entry.file === file);
+  const adopted = {
+    file,
+    original_name: payload.original_name || sourceBasename(file),
+    page_count: payload.page_count ?? existing?.page_count ?? null,
+    size_bytes: payload.size_bytes ?? existing?.size_bytes ?? null,
+    referenced: existing ? existing.referenced : false,
+    references: existing && Array.isArray(existing.references) ? existing.references : [],
+    references_pending: existing ? existing.references_pending === true : true
+  };
+  state.prep.uploadItems = existing
+    ? state.prep.uploadItems.map((entry) => entry.file === file ? adopted : entry)
+    : [adopted, ...(state.prep.uploadItems || [])];
+  if (!(state.prep.uploads || []).includes(file)) {
+    state.prep.uploads = [...(state.prep.uploads || []), file];
+  }
+  if (!(state.sourceFiles || []).includes(file)) {
+    state.sourceFiles = [...(state.sourceFiles || []), file];
+  }
+  renderSourceOptions();
   renderSourceFiles();
+  $("prep-job-source").value = file;
+  return file;
+}
+
+function formatElapsed(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return "";
+  return (value / 1000).toFixed(1) + " 秒";
+}
+
+function renderSourceStatus() {
+  const host = $("prep-source-status");
+  if (!host) return;
+  const source = state.prep.source || {};
+  if (source.state === "error") {
+    host.className = "status error";
+    host.textContent = "来源详情读取失败" + (source.elapsedMs === null ? "" : "（" + formatElapsed(source.elapsedMs) + "）") +
+      "：" + source.error;
+  } else if (source.state === "ready") {
+    host.className = "status ok";
+    host.textContent = "来源详情已加载" +
+      (source.elapsedMs === null ? "" : " · " + formatElapsed(source.elapsedMs));
+  } else if (source.state === "loading") {
+    host.className = "status loading";
+    host.textContent = "正在读取来源详情…（已有资料不受影响）";
+  } else {
+    host.className = "status";
+    host.textContent = "";
+  }
+}
+
+async function loadSourceFiles({rethrow = true} = {}) {
+  const token = (state.prep.source.token || 0) + 1;
+  state.prep.source.token = token;
+  state.prep.source.state = "loading";
+  state.prep.source.error = "";
+  state.prep.source.elapsedMs = null;
+  const startedAt = Date.now();
+  renderSourceStatus();
+  renderSourceFiles();
+  try {
+    const response = await fetch("/api/domain/source-files", {cache: "no-store"});
+    if (!response.ok) throw new Error("来源 PDF 列表加载失败: HTTP " + response.status);
+    const payload = await response.json();
+    if (token !== state.prep.source.token) return false;
+    state.sourceFiles = Array.isArray(payload.files) ? payload.files : [];
+    state.prep.uploads = Array.isArray(payload.uploads)
+      ? payload.uploads
+      : state.sourceFiles.filter((file) => file.startsWith("data/uploads/"));
+    state.prep.uploadItems = Array.isArray(payload.upload_items)
+      ? payload.upload_items
+      : state.prep.uploads.map((file) => ({
+        file,
+        original_name: sourceBasename(file),
+        page_count: null,
+        size_bytes: null,
+        referenced: false,
+        references: []
+      }));
+    renderSourceOptions();
+    state.prep.source.state = "ready";
+    state.prep.source.elapsedMs = Date.now() - startedAt;
+    renderSourceFiles();
+    return true;
+  } catch (error) {
+    if (token !== state.prep.source.token) return false;
+    state.prep.source.state = "error";
+    state.prep.source.error = userFacingError(error, "来源 PDF 列表加载失败");
+    state.prep.source.elapsedMs = Date.now() - startedAt;
+    renderSourceFiles();
+    if (rethrow) throw error;
+    return false;
+  } finally {
+    if (token === state.prep.source.token) renderSourceStatus();
+  }
 }
 
 async function loadWorkspaces() {
@@ -2254,9 +2392,18 @@ async function refreshWorkbenchData() {
       {cache: "no-store"}
     );
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(formatApiError(payload, "书架刷新失败"));
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const error = new Error(formatApiError(payload, "书架刷新失败"));
+      if (detail && typeof detail === "object" && detail.message) {
+        error.apiReason = String(detail.message);
+        error.apiCode = String(detail.code || "");
+      }
+      throw error;
+    }
     if (refreshToken !== state.workbenchRefreshToken) return;
     state.data = payload;
+    clearLoadFailure();
     state.savedAt = payload.saved_at;
     state.savedState = payload.saved_state;
     if (payload.artifact_job) setArtifactJob(payload.artifact_job);
@@ -2280,18 +2427,63 @@ async function refreshWorkbenchData() {
       $("card-type").value = previousType;
     }
     await loadSession();
+    syncPrepSelectionFromBundle();
     renderAll();
   } finally {
     if (refreshToken === state.workbenchRefreshToken) state.workbenchLoading = false;
   }
 }
 
+// A refused or failed project is described once and re-rendered by every later
+// pass, so returning to the shelf cannot erase the reason that is still true.
+function showLoadFailure(error, fallback) {
+  const permanent = ["model_invalid", "contract_incompatible"].includes(error?.apiCode);
+  state.loadFailure = {
+    message: userFacingError(error, fallback),
+    code: error?.apiCode || "",
+    permanent
+  };
+  // This new failure supersedes the previously displayed error.
+  const panel = $("global-error");
+  if (panel) panel.textContent = "";
+}
+
+function clearLoadFailure() {
+  state.loadFailure = null;
+  const panel = $("global-error");
+  const message = panel?.querySelector("[data-workspace-load-failure]");
+  if (message) {
+    message.remove();
+    panel.hidden = !panel.textContent.trim();
+  }
+}
+
+function renderLoadFailure() {
+  const panel = $("global-error");
+  if (!panel) return false;
+  const failure = state.loadFailure;
+  if (!failure) return false;
+  // Other operations write this shared panel too. Keep their newer failure until
+  // it is handled, including when a background poll redraws the workbench.
+  if (!panel.hidden && panel.textContent.trim()
+      && !panel.querySelector("[data-workspace-load-failure]")) return true;
+  panel.hidden = false;
+  panel.innerHTML = '<div data-workspace-load-failure><strong>' + esc(failure.message) + "</strong>" +
+    '<p class="muted">' + (failure.permanent
+      ? "项目内容仍保留，刷新不会改变这个结果；请从上方书架选择其他项目。"
+      : "可以稍后刷新重试，或从上方书架选择其他项目。") + "</p>" +
+    (failure.code ? '<p class="muted">错误类别：' + esc(failure.code) + "</p>" : "") + "</div>";
+  return true;
+}
+
 function renderEmptyWorkspace() {
   const status = $("connection-status");
-  if (status) { status.className = "status"; status.textContent = "请选择书架工作区"; }
-  const panel = $("global-error");
-  if (panel) { panel.hidden = true; panel.textContent = ""; }
-  ["shelf-summary", "bundle-detail", "fact-grid", "plan-list", "scene-holder", "beat-holder", "runtime-exploration-list", "profile-grid"].forEach((id) => {
+  const failed = renderLoadFailure();
+  if (status) {
+    status.className = failed ? "status error" : "status";
+    status.textContent = failed ? "项目无法打开" : "请选择书架工作区";
+  }
+  ["shelf-summary", "bundle-detail", "fact-grid", "plan-list", "scene-holder", "beat-holder", "runtime-exploration-list", "profile-grid", "prep-selection-list"].forEach((id) => {
     const element = $(id);
     if (element) element.innerHTML = '<div class="empty-state">请先从书架选择一个工作区。</div>';
   });
@@ -2322,8 +2514,14 @@ function fillWorkspaceSelector() {
     };
     workspaces.unshift(current);
   }
+  const unavailableLabel = (item) => item.validation_kind === "model_invalid"
+    ? " · 数据无法读取"
+    : item.validation_kind === "contract_incompatible"
+      ? " · 当前契约无法打开"
+      : item.validation_error ? " · 无法打开" : "";
   select.innerHTML = '<option value="">请选择书架工作区</option>' + workspaces.map((item) =>
-    `<option value="${esc(item.id)}">${esc(item.name)}${item.validation_error ? " · 数据需修复" : item.kind === "prep" ? " · 备团" : ""}</option>`
+    `<option value="${esc(item.id)}"${item.validation_error ? ` title="${esc(item.validation_error)}"` : ""}>` +
+    `${esc(item.name)}${unavailableLabel(item)}${!item.validation_error && item.kind === "prep" ? " · 备团" : ""}</option>`
   ).join("");
   select.value = state.exampleId || "";
   const renameButton = $("rename-workspace");
@@ -2412,11 +2610,14 @@ async function uploadPrepSource() {
     const response = await fetch("/api/domain/source-files", {method: "POST", body});
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "PDF 上传失败"));
-    await loadSourceFiles();
-    $("prep-job-source").value = payload.file;
+    // The upload is finished here. Making it selectable uses only this response, so
+    // a slow or failing detail listing cannot hold the upload UI or block choosing
+    // the file for a prep task.
+    adoptUploadedSource(payload);
     $("prep-source-upload-status").textContent =
       "已上传 · " + payload.page_count + " 页 · " + payload.original_name;
     input.value = "";
+    loadSourceFiles({rethrow: false});
   } catch (error) {
     $("prep-source-upload-status").textContent = userFacingError(error, "来源上传失败");
   } finally {
@@ -2427,7 +2628,7 @@ async function uploadPrepSource() {
 
 async function deletePrepSource(file) {
   const item = (state.prep.uploadItems || []).find((entry) => entry.file === file);
-  if (!item || item.referenced) return;
+  if (!item || item.referenced || item.references_pending) return;
   if (!window.confirm(`删除已上传文件“${item.original_name || sourceBasename(file)}”？`)) return;
   state.prep.error = "";
   try {
@@ -2437,7 +2638,12 @@ async function deletePrepSource(file) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(formatApiError(payload, "上传文件删除失败"));
     if ($("prep-job-source").value === file) $("prep-job-source").value = "";
-    await loadSourceFiles();
+    state.prep.uploadItems = (state.prep.uploadItems || []).filter((entry) => entry.file !== file);
+    state.prep.uploads = (state.prep.uploads || []).filter((entry) => entry !== file);
+    state.sourceFiles = (state.sourceFiles || []).filter((entry) => entry !== file);
+    renderSourceOptions();
+    renderSourceFiles();
+    await loadSourceFiles({rethrow: false});
     $("prep-source-upload-status").textContent = "已删除上传文件";
   } catch (error) {
     state.prep.error = userFacingError(error, "上传文件删除失败");
@@ -2973,16 +3179,6 @@ function runtimeGroupCards(anchor) {
   );
 }
 
-function runtimeGroupHtml(anchor) {
-  const cards = runtimeGroupCards(anchor).filter((card) =>
-    !["clock", "operation_clock", "encounter_clock"].includes(card.type)
-  );
-  if (!cards.length) return "";
-  return '<section class="runtime-section"><h3>同组人物与对手</h3><div class="runtime-reference-list masonry-grid">' +
-    cards.map((card) => '<article class="domain-card runtime-reference-card"><div class="card-title-row"><div class="card-title">' + esc(card.title) + '</div>' + badge(profileDefinition(card.profile_id, card.type).display_name, 'neutral') + '</div>' + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids) + '</article>').join('') +
-    '</div></section>';
-}
-
 function currentPlan() {
   if (!state.session?.current_plan_id) return null;
   return state.data.bundle.plans.find((plan) => plan.id === state.session.current_plan_id) || null;
@@ -3117,7 +3313,12 @@ function renderBeat() {
 function changeRuntimeScene(cardId) {
   const card = runtimeConfirmedSceneCards()
     .find((item) => item.id === cardId);
-  if (!card || !state.session || state.session.current_card_id === card.id) return;
+  if (!card || !state.session) return;
+  state.runtimeRetrieval.cardId = null;
+  if (state.session.current_card_id === card.id) {
+    renderRuntime();
+    return;
+  }
   state.session.current_card_id = card.id;
   sessionLog('scene_changed', '切换场景：' + card.title, {
     subjectType: 'scene',
@@ -3140,7 +3341,11 @@ async function startPlan(planId) {
   );
   if (hasRuntimeState) {
     const action = currentPlanId === plan.id ? '重新开始这个计划' : '切换到这个计划';
-    if (!confirm('当前运行已有状态，' + action + '会重置本次运行的线索、时钟、备注和日志。继续吗？')) return false;
+    // 如实列出 startPlan 实际重置的内容（含触发状态与运行位置），并说明什么会保留。
+    if (!confirm(
+      '当前运行已有状态。' + action + '会重置本次运行的：触发状态、已揭示线索、推进钟、备注、日志，'
+      + '并把运行位置重置到该计划的第一个场景。已批准资料与本次准备选择会保留。继续吗？'
+    )) return false;
   }
   state.runtimeProfileId = plan.profile_id;
   if ($("runtime-profile")) $("runtime-profile").value = plan.profile_id;
@@ -3206,18 +3411,15 @@ function showView(viewName) {
     view.classList.toggle("active", view.id === `view-${viewName}`);
   });
   if (viewName === "prep") {
-    if (!state.prep.config) {
-      loadPrepConfig().catch((error) => {
-        state.prep.error = userFacingError(error, "模型配置加载失败");
-        renderPrep();
-      });
-    }
+    loadPrepConfigDeferred();
     loadPrepJobs();
   }
   if (viewName === "review") loadReviewQueue();
   if (viewName === "shelf" && state.exampleId) {
     refreshWorkbenchData().catch((error) => {
-      state.artifacts.error = userFacingError(error, "书架刷新失败");
+      // The open project's own content is still valid; the reason is stored before
+      // the re-render so the empty-workspace pass cannot clear it.
+      showLoadFailure(error, "书架刷新失败");
       renderAll();
     });
   }
@@ -3467,6 +3669,267 @@ async function saveReviewSourceRefs(candidateId) {
   }
 }
 
+// ---------- 本次准备：按板块保存的材料选择 ----------
+// 保存的是卡片引用；展示始终读取当前批准版本。它是阅读辅助，不影响计划成员、
+// 运行位置或任何运行状态。
+function prepSelectionProfiles() {
+  if (!state.data?.bundle) return [];
+  return enabledProfiles();
+}
+
+function prepSelectionProfileId() {
+  const profiles = prepSelectionProfiles();
+  const current = state.prepSelection.profileId;
+  if (profiles.some((item) => item.id === current)) return current;
+  const runtime = profiles.find((item) => item.id === state.runtimeProfileId);
+  return (runtime || profiles[0])?.id || null;
+}
+
+function prepSelectionKey(profileId) {
+  return (state.exampleId || "") + "::" + (profileId || "");
+}
+
+// 草稿与已保存状态按“真实项目 + 板块”共同隔离：同一页面接纳另一个项目时，
+// 旧项目的未保存草稿不会出现在新项目里，返回旧项目时也能取回。
+function prepSelectionBoard(profileId = prepSelectionProfileId()) {
+  if (!profileId) return null;
+  const key = prepSelectionKey(profileId);
+  if (!state.prepSelection.boards[key]) {
+    state.prepSelection.boards[key] = {
+      exampleId: state.exampleId, profileId,
+      saved: [], draft: [], dirty: false, notice: "", error: "", revision: 0, saving: false
+    };
+  }
+  return state.prepSelection.boards[key];
+}
+
+// 服务端是权威：未改动的板块跟随最新读取结果，未保存的草稿不会被覆盖。
+function syncPrepSelectionFromBundle() {
+  const selections = state.data?.bundle?.prep_selections || {};
+  prepSelectionProfiles().forEach((item) => {
+    const board = prepSelectionBoard(item.id);
+    if (board.dirty) return;
+    const saved = Array.isArray(selections[item.id]) ? [...selections[item.id]] : [];
+    board.saved = saved;
+    board.draft = [...saved];
+  });
+  state.prepSelection.profileId = prepSelectionProfileId();
+}
+
+function prepSelectionCardEntries(board, profileId) {
+  const cards = state.data?.bundle?.cards || [];
+  const byId = new Map(cards.map((card) => [card.id, card]));
+  return (board?.draft || []).map((cardId) => {
+    const card = byId.get(cardId);
+    const available = Boolean(
+      card && card.edit_state === "approved" && card.profile_id === profileId
+    );
+    return {cardId, card: available ? card : null, available};
+  });
+}
+
+function prepSelectionDirty() {
+  return Object.values(state.prepSelection.boards)
+    .some((board) => board.dirty && board.exampleId === state.exampleId);
+}
+
+function renderPrepSelection() {
+  const host = $("prep-selection-list");
+  if (!host) return;
+  const profiles = prepSelectionProfiles();
+  const profileId = prepSelectionProfileId();
+  const board = prepSelectionBoard(profileId);
+  $("prep-selection-board").textContent = profileId
+    ? profileDisplayName(profileId)
+    : "当前项目没有运行板块";
+  const status = $("prep-selection-status");
+  if (!board) {
+    status.className = "status";
+    status.textContent = "";
+    host.innerHTML = '<div class="empty-state">当前项目没有可保存准备选择的运行板块。</div>';
+    $("prep-selection-save").disabled = true;
+    $("prep-selection-clear").disabled = true;
+    return;
+  }
+  const entries = prepSelectionCardEntries(board, profileId);
+  const unavailable = entries.filter((entry) => !entry.available).length;
+  if (board.dirty) {
+    status.className = "status loading";
+    status.textContent = "未保存的更改 · " + entries.length + " 张";
+  } else if (board.error) {
+    status.className = "status error";
+    status.textContent = board.error;
+  } else {
+    status.className = "status ok";
+    status.textContent = (board.notice || "已保存") + " · " + board.saved.length + " 张" +
+      (unavailable ? " · " + unavailable + " 条引用已不可用" : "");
+  }
+  $("prep-selection-save").disabled = board.saving || !board.dirty;
+  $("prep-selection-save").textContent = board.saving ? "保存中…" : "保存本次准备";
+  $("prep-selection-clear").disabled = board.saving || !board.draft.length;
+  $("prep-selection-error").textContent = board.error || "";
+  $("prep-selection-profile").innerHTML = profiles.map((item) =>
+    '<option value="' + esc(item.id) + '">' + esc(profileDisplayName(item.id)) + "</option>"
+  ).join("");
+  $("prep-selection-profile").value = profileId || "";
+  $("prep-selection-profile").hidden = profiles.length < 2;
+  host.innerHTML = entries.length
+    ? entries.map((entry) => entry.available
+      ? '<div class="prep-selection-item"><div><strong>' + esc(entry.card.title) + "</strong> " +
+        badge(profileDefinition(entry.card.profile_id, entry.card.type).display_name, "neutral") +
+        '<p class="muted">' + esc(profileDisplayName(entry.card.profile_id)) + " · " +
+        esc(prepSelectionScopeLabel(entry.card)) + "</p></div>" +
+        '<div class="row-actions"><button class="edit-button" data-prep-open="' + esc(entry.cardId) + '">查看</button>' +
+        '<button class="edit-button danger" data-prep-remove="' + esc(entry.cardId) + '">移除</button></div></div>'
+      : '<div class="prep-selection-item unavailable"><div><strong>已不可用的资料</strong>' +
+        '<p class="muted">' + esc(entry.cardId) + " · 未批准、已删除或已换到其他板块；可以移除后重新选择。相关卡片不会按同名自动重建。</p></div>" +
+        '<div class="row-actions"><button class="edit-button danger" data-prep-remove="' + esc(entry.cardId) + '">移除</button></div></div>'
+    ).join("")
+    : '<div class="empty-state">还没有选择材料。在下方产物卡片上点“加入准备”。</div>';
+}
+
+function prepSelectionScopeLabel(card) {
+  const chapters = (state.data?.bundle?.adventure_chapters || []);
+  const chapterIds = card.chapter_ids || [];
+  if (!chapterIds.length) return "全局资料";
+  return chapterIds.map((id) => chapters.find((chapter) => chapter.id === id)?.title || id).join("、");
+}
+
+function togglePrepSelection(cardId) {
+  const profileId = prepSelectionProfileId();
+  const board = prepSelectionBoard(profileId);
+  if (!board) return;
+  const index = board.draft.indexOf(cardId);
+  if (index >= 0) {
+    // 移除始终可用：即使引用已经不可用，也必须能清掉它。
+    board.draft.splice(index, 1);
+    board.dirty = true;
+    board.revision += 1;
+    board.notice = "";
+    renderPrepSelection();
+    renderCards();
+    return;
+  }
+  const card = (state.data?.bundle?.cards || []).find((item) => item.id === cardId);
+  if (!card || card.edit_state !== "approved" || card.profile_id !== profileId) return;
+  board.draft.push(cardId);
+  board.dirty = true;
+  board.revision += 1;
+  board.notice = "";
+  renderPrepSelection();
+  renderCards();
+}
+
+function clearPrepSelection() {
+  const board = prepSelectionBoard();
+  if (!board) return;
+  board.draft = [];
+  board.dirty = true;
+  board.revision += 1;
+  board.notice = "";
+  renderPrepSelection();
+  renderCards();
+}
+
+async function savePrepSelection() {
+  const profileId = prepSelectionProfileId();
+  const board = prepSelectionBoard(profileId);
+  if (!board || board.saving || !board.dirty) return;
+  const requestExample = state.exampleId;
+  const requestKey = prepSelectionKey(profileId);
+  // 提交的是请求发出时的快照；之后的新改动由 revision 识别并保留。
+  const snapshot = [...board.draft];
+  const revisionAtRequest = board.revision;
+  board.saving = true;
+  board.error = "";
+  renderPrepSelection();
+  try {
+    const response = await fetch(
+      "/api/domain/examples/" + encodeURIComponent(requestExample) + "/prep-selection",
+      {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({profile_id: profileId, card_ids: snapshot})
+      }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(formatApiError(payload, "本次准备保存失败"));
+    const target = state.prepSelection.boards[requestKey];
+    if (!target) return;
+    target.saved = [...payload.card_ids];
+    if (target.revision === revisionAtRequest) {
+      target.draft = [...payload.card_ids];
+      target.dirty = false;
+      target.notice = "已保存 " + localDateTime(payload.saved_at);
+    } else {
+      // 保存期间又改过：服务端拿到的是快照，界面保留新改动并继续提示未保存。
+      target.dirty = true;
+      target.notice = "已保存 " + payload.card_ids.length + " 张；保存期间的改动尚未保存";
+    }
+    if (state.exampleId === requestExample && state.data?.bundle) {
+      state.data.bundle.prep_selections = {
+        ...(state.data.bundle.prep_selections || {}),
+        [profileId]: [...payload.card_ids]
+      };
+    }
+  } catch (error) {
+    // 失败保留草稿，显示原因并可重试；不报告成功。
+    const target = state.prepSelection.boards[requestKey];
+    if (target) target.error = userFacingError(error, "本次准备保存失败");
+  } finally {
+    const target = state.prepSelection.boards[requestKey];
+    if (target) target.saving = false;
+    if (state.exampleId === requestExample) {
+      renderPrepSelection();
+      renderRuntimePrepSelection();
+    }
+  }
+}
+
+// 运行页的快捷区读取已保存的选择；它不替代 R2 的项目内速查。
+function renderRuntimePrepSelection() {
+  const host = $("runtime-prep-selection");
+  if (!host) return;
+  const profileId = state.runtimeProfileId;
+  const saved = (state.data?.bundle?.prep_selections || {})[profileId] || [];
+  const cards = state.data?.bundle?.cards || [];
+  const byId = new Map(cards.map((card) => [card.id, card]));
+  const available = saved
+    .map((cardId) => byId.get(cardId))
+    .filter((card) => card && card.edit_state === "approved" && card.profile_id === profileId);
+  const staleCount = saved.length - available.length;
+  host.hidden = !saved.length;
+  if (!saved.length) {
+    $("runtime-prep-selection-count").textContent = "";
+    $("runtime-prep-selection-list").innerHTML = "";
+    return;
+  }
+  $("runtime-prep-selection-count").textContent = "· " + available.length + " 张" +
+    (staleCount ? " · " + staleCount + " 条引用已不可用" : "");
+  // 时钟有自己的入口：这里只说明在哪看、怎么推进，不生成普通详情按钮。
+  const shownClocks = new Set(
+    [...document.querySelectorAll("#runtime-clocks [data-clock-card]")].map((el) => el.dataset.clockCard)
+  );
+  const clockItems = available.filter((card) => runtimeClockTypes.includes(card.type)).map((card) => {
+    const stages = Array.isArray(card.fields.stages) ? card.fields.stages : [];
+    const stage = state.session?.clock_stages?.[card.id] ?? 0;
+    const shown = shownClocks.has(card.id);
+    return '<div class="runtime-prep-clock"><strong>' + esc(card.title) + "</strong> " +
+      badge("推进钟", "accent") +
+      '<span class="muted"> ' + (shown
+        ? "阶段 " + (stage + 1) + "/" + Math.max(stages.length, 1) + " · 在下方“推进钟”区域查看与推进"
+        : "当前运行范围未显示此钟；请核对计划、章节及局势分组。准备选择不会扩大运行范围。") + "</span>" +
+      (shown ? ' <button type="button" class="edit-button" data-clock-locate="' + esc(card.id) + '">定位</button>' : "") +
+      "</div>";
+  }).join("");
+  const cardItems = available.filter((card) => !runtimeClockTypes.includes(card.type)).map((card) =>
+    '<button type="button" class="retrieval-related" data-retrieval-card="' + esc(card.id) + '">' +
+    "<strong>" + esc(card.title) + "</strong><span>" +
+    esc(profileDefinition(card.profile_id, card.type).display_name) + " · 已批准</span></button>").join("");
+  $("runtime-prep-selection-list").innerHTML = (cardItems + clockItems) ||
+    '<p class="muted">已保存的选择目前没有可用卡片；可在产物页移除后重新保存。</p>';
+}
+
 function renderCards() {
   const chapters = state.data.bundle.adventure_chapters || [];
   const chapterById = new Map(chapters.map((chapter) => [chapter.id, chapter]));
@@ -3513,6 +3976,9 @@ function renderCards() {
       : card.edit_state === "edited"
         ? badge("已修改，待批准", "needs_review")
         : badge("模型草案，待批准", "needs_review");
+    const prepProfileId = prepSelectionProfileId();
+    const prepSelected = card.edit_state === "approved" && card.profile_id === prepProfileId &&
+      (prepSelectionBoard(prepProfileId)?.draft || []).includes(card.id);
     return `
       <article class="domain-card work-card ${state.selectedCardId === card.id ? "selected" : ""}" data-card-id="${esc(card.id)}">
         <div class="card-title-row work-card-head">
@@ -3527,6 +3993,7 @@ function renderCards() {
             ${statusBadge}
             ${cardHasModelCandidate(card) ? badge(evidenceStatusLabels.model_candidate, "model_candidate") : ""}
             ${badge(definition.display_name, "accent")}
+            ${card.edit_state === "approved" && card.profile_id === prepProfileId ? `<button class="edit-button" data-prep-toggle="${esc(card.id)}">${prepSelected ? "移出准备" : "加入准备"}</button>` : ""}
             ${card.edit_state !== "approved" || state.editMode ? `<button class="edit-button" data-edit-card="${esc(card.id)}">编辑</button>` : ""}
             ${card.edit_state !== "approved" ? `<button class="action-link" data-card-review-action="approve" data-card-review-id="${esc(card.id)}" ${state.artifacts.reviewing ? "disabled" : ""}>批准</button>` : `<button class="edit-button" data-card-review-action="reopen" data-card-review-id="${esc(card.id)}" ${state.artifacts.reviewing || isReferenced ? "disabled" : ""} ${isReferenced ? 'title="已被运行场景引用"' : ""}>退回修改</button>`}
             ${card.edit_state !== "approved" || state.editMode ? `<button class="edit-button danger" data-delete-card="${esc(card.id)}" ${isReferenced ? 'disabled title="已被运行场景引用"' : ""}>删除</button>` : ""}
@@ -3724,40 +4191,6 @@ function renderReview() {
   if (contentBasis) contentBasis.value = selected.content_basis || "model_candidate";
 }
 
-function renderRuntimeLegacy() {
-  const item = profile(state.runtimeProfileId);
-  if (!item) return;
-  const moves = [...item.risk_axes, ...item.failure_moves, ...item.gm_moves]
-    .map((move) => `<li>${esc(label(move))}</li>`).join("");
-  const prompts = Object.entries(item.prompts).map(([key, value]) => `
-    <div class="definition-item"><span class="definition-key">${esc(runtimeLabels[key] || key)}</span><span>${esc(value)}</span></div>
-  `).join("");
-
-  $("profile-runtime").innerHTML = `
-    <div class="runtime-grid">
-      <article class="domain-card">
-        <div class="card-title-row"><div class="card-title">${esc(profileDisplayName(item.id))}</div>${badge(profileKindLabels[item.profile_kind || "runtime"], "accent")}</div>
-        <p class="muted">${esc(profileDisplaySummary(item.id))}</p>
-        <h3>现场语义</h3><ul class="muted">${moves}</ul>
-        ${prompts ? `<h3>即兴提问</h3><div class="definition-list">${prompts}</div>` : ""}
-      </article>
-      <div id="current-scene"></div>
-    </div>
-  `;
-
-  const sceneCard = state.data.bundle.cards.find((card) =>
-    card.profile_id === state.runtimeProfileId &&
-    ["location", "environment"].includes(card.type)
-  );
-  $("current-scene").innerHTML = sceneCard ? `
-    <article class="domain-card selected">
-      <div class="card-title-row"><div class="card-title">${esc(sceneCard.title)}</div>${badge("当前场景", "accent")}</div>
-      ${fieldsHtml(sceneCard)}
-      ${sourceHtml(sceneCard.fact_ids)}
-    </article>
-  ` : `<div class="empty-state">当前板块暂无场景级卡。</div>`;
-}
-
 function runtimeCardFieldsHtml(card) {
   return Object.entries(card.fields)
     .filter(([key]) => !["direct_clues", "hidden_clues", "current_stage", "first_triggers", "fact_ids", "field_sources", "open_questions"].includes(key))
@@ -3875,17 +4308,23 @@ function renderRuntime() {
   ).join("");
   $("profile-runtime").innerHTML =
     '<div class="runtime-profile-summary"><div><strong>' + esc(profileDisplayName(item.id)) + '</strong> ' + badge(profileKindLabels[item.profile_kind || "runtime"], 'accent') + '</div>' +
-    '<p class="muted">' + esc(profileDisplaySummary(item.id)) + '</p><div class="runtime-semantic-row">' +
+    '<p class="muted">' + esc(profileDisplaySummary(item.id)) + '</p>' +
+    '<p class="muted runtime-reference-note">以下关注与提示是备团方法参考，说明如何组织材料；它们不替代你在桌上实际使用的规则，也不要求你按参考规则做检定或结算。</p>' +
+    '<div class="runtime-semantic-row">' +
     item.risk_axes.map((move) => badge(label(move))).join("") + '</div>' +
     (prompts ? '<details class="runtime-prompts"><summary>即兴提问</summary><div class="definition-list">' + prompts + '</div></details>' : '') +
     '</div>';
   $("gm-move-select").innerHTML = moves || '<option value="">当前板块暂无 GM 移动</option>';
 
-  const runtimeQuery = ($("runtime-reference-search")?.value || '').trim().toLowerCase();
+  const runtimeQuery = runtimeRetrievalQuery().toLowerCase();
   const sceneCards = runtimeConfirmedSceneCards().filter((card) =>
-    (!runtimeQuery || [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(' ').toLowerCase().includes(runtimeQuery))
+    (!runtimeQuery || runtimeCardSearchText(card).includes(runtimeQuery))
   );
   const scene = currentRuntimeCard();
+  renderRuntimeRetrieval();
+  $("runtime-scene-count").textContent = sceneCards.length
+    ? "· " + sceneCards.length + " 个" + (environmentLed ? "局势" : "地点")
+    : "";
   $("runtime-exploration-list").innerHTML = sceneCards.length
     ? sceneCards.map((card) => '<button type="button" class="exploration-node ' + (card.id === scene?.id ? 'selected' : '') + '" data-runtime-scene="' + esc(card.id) + '"><strong>' + esc(card.title) + '</strong><span>' + esc(profileDefinition(card.profile_id, card.type).display_name) + '</span></button>').join("")
     : '<div class="empty-state">当前计划还没有可运行的' + (environmentLed ? '局势' : '地点') + '。</div>';
@@ -3901,7 +4340,7 @@ function renderRuntime() {
   }
   $("scene-holder").innerHTML = scene ?
     '<article class="domain-card selected runtime-scene-card"><div class="card-title-row"><div><div class="card-title">' + esc(scene.title) + '</div><p class="card-subtitle">' + esc(scene.subtitle || (environmentLed ? '当前局势' : '当前地点')) + '</p></div>' + badge(environmentLed ? '当前局势' : '当前地点', 'accent') + '</div>' +
-    runtimeCardFieldsHtml(scene) + (environmentLed ? runtimeGroupHtml(scene) : locationTriggersHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues)) + locationMaterialsHtml(activePlan, scene) + sourceHtml(scene.fact_ids) + '</article>' :
+    runtimeCardFieldsHtml(scene) + runtimeRelatedHtml(scene) + (environmentLed ? '' : locationTriggersHtml(scene) + clueHtml(scene, 'direct', scene.fields.direct_clues) + clueHtml(scene, 'hidden', scene.fields.hidden_clues)) + locationMaterialsHtml(activePlan, scene) + sourceHtml(scene.fact_ids) + '</article>' :
     '<div class="empty-state">当前板块暂无场景级卡。请先完成该板块的产物生成与复核。</div>';
 
   const allClocks = runtimeCards(["clock", "operation_clock", "encounter_clock"]);
@@ -3912,11 +4351,12 @@ function renderRuntime() {
   $("runtime-clocks").innerHTML = clocks.map((clock) => {
     const stages = Array.isArray(clock.fields.stages) ? clock.fields.stages : [];
     const stage = state.session.clock_stages[clock.id] ?? 0;
-    return '<article class="runtime-clock"><div class="card-title-row"><strong>' + esc(clock.title) + '</strong><span class="badge accent">' + (stage + 1) + ' / ' + Math.max(stages.length, 1) + '</span></div>' +
+    return '<article class="runtime-clock" data-clock-card="' + esc(clock.id) + '"><div class="card-title-row"><strong>' + esc(clock.title) + '</strong><span class="badge accent">' + (stage + 1) + ' / ' + Math.max(stages.length, 1) + '</span></div>' +
       '<p class="muted">' + esc(stages[stage] || '未定义阶段') + '</p><div class="runtime-clock-track">' +
       stages.map((value, index) => '<span class="clock-step ' + (index <= stage ? 'filled' : '') + '">' + (index + 1) + '</span>').join("") + '</div>' +
       '<div class="row-actions"><button class="edit-button" data-clock-action="' + esc(clock.id) + '" data-clock-delta="-1" ' + (stage <= 0 ? 'disabled' : '') + '>退回</button><button class="edit-button" data-clock-action="' + esc(clock.id) + '" data-clock-delta="1" ' + (stage >= stages.length - 1 ? 'disabled' : '') + '>推进</button></div></article>';
   }).join("") || '<div class="empty-state">当前板块暂无推进钟。</div>';
+  renderRuntimePrepSelection();
 
   document.querySelectorAll("#runtime-clocks .runtime-clock").forEach((element, index) => {
     const clock = clocks[index];
@@ -3978,6 +4418,276 @@ function runtimeBeatIncludes(card) {
   return (card.story_beat_ids || []).includes(beat.id);
 }
 
+const runtimeClockTypes = ["clock", "operation_clock", "encounter_clock"];
+
+// Retrieval answers a question about the whole approved project, not only the cards
+// already gathered into the running plan. Provenance and plan/chapter membership are
+// reported on each hit instead of being silently applied as a filter.
+//
+// Only explicitly approved cards qualify. The workbench payload also carries drafts,
+// so a missing or unknown edit_state is not treated as approved.
+function runtimeSearchCards() {
+  return (state.data?.bundle?.cards || []).filter((card) =>
+    card.profile_id === state.runtimeProfileId &&
+    card.edit_state === "approved" &&
+    !runtimeClockTypes.includes(card.type)
+  );
+}
+
+function runtimeCardSearchText(card) {
+  return [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(" ").toLowerCase();
+}
+
+function runtimeRetrievalQuery() {
+  return ($("runtime-reference-search")?.value || "").trim();
+}
+
+function runtimeRetrievalType() {
+  return $("runtime-reference-filter")?.value || "all";
+}
+
+function runtimeRetrievalList() {
+  const query = runtimeRetrievalQuery().toLowerCase();
+  const type = runtimeRetrievalType();
+  const cards = runtimeSearchCards().filter((card) => type === "all" || card.type === type);
+  return query ? cards.filter((card) => runtimeCardSearchText(card).includes(query)) : cards;
+}
+
+function runtimeRetrievalChapterTitle(card) {
+  const chapters = state.data?.bundle?.adventure_chapters || [];
+  const ids = card.chapter_ids || [];
+  return chapters.filter((chapter) => ids.includes(chapter.id)).map((chapter) => chapter.title).join("、");
+}
+
+function runtimeRetrievalScopeLabels(card) {
+  const labels = [];
+  const plan = currentPlan();
+  if (plan && !(plan.card_ids || []).includes(card.id)) labels.push("不在当前计划");
+  if (!runtimeChapterIncludes(card)) labels.push("本章外");
+  return labels;
+}
+
+function runtimeRetrievalScopeText() {
+  const cards = runtimeSearchCards();
+  const plan = currentPlan();
+  const parts = ["检索本项目已批准的 " + cards.length + " 张卡片"];
+  if (plan) {
+    const planIds = new Set(plan.card_ids || []);
+    const inPlan = cards.filter((card) => planIds.has(card.id)).length;
+    parts.push(inPlan === cards.length ? "全部在运行计划内" : "运行计划内 " + inPlan + " 张，其余可随时查阅");
+  }
+  const chapters = state.data?.bundle?.adventure_chapters || [];
+  if (plan?.navigation_mode === "environment" && chapters.length) {
+    const beat = (state.data?.bundle?.story_beats || []).find((item) => item.id === runtimeNarrative.beat);
+    const chapterId = runtimeNarrative.chapter === "all" ? beat?.chapter_id : runtimeNarrative.chapter;
+    const chapter = chapters.find((item) => item.id === chapterId);
+    const outside = runtimeRetrievalList().filter((card) => !runtimeChapterIncludes(card)).length;
+    parts.push("章节筛选：" + (chapter ? chapter.title : "全部章节") +
+      (outside ? "（" + outside + " 条匹配在本章外，仍可查看）" : ""));
+  }
+  return parts.join(" · ");
+}
+
+function runtimeCardExcerpt(card) {
+  const definition = profileDefinition(card.profile_id, card.type);
+  const keys = [...(definition.required_fields || []), ...(definition.optional_fields || [])];
+  for (const key of keys) {
+    const value = String(formatValue((card.fields || {})[key] ?? "")).trim();
+    if (value) return value.length > 56 ? value.slice(0, 56) + "…" : value;
+  }
+  return "";
+}
+
+function runtimeFieldGapHtml(card) {
+  const definition = profileDefinition(card.profile_id, card.type);
+  const filled = (key) => String(formatValue((card.fields || {})[key] ?? "")).trim();
+  const missingRequired = (definition.required_fields || []).filter((key) => !filled(key));
+  const missingOptional = (definition.optional_fields || []).filter((key) => !filled(key));
+  if (!missingRequired.length && !missingOptional.length) return "";
+  const optionalText = missingOptional.length > 6
+    ? missingOptional.slice(0, 6).map((key) => label(key)).join("、") + " 等 " + missingOptional.length + " 项"
+    : missingOptional.map((key) => label(key)).join("、");
+  return '<p class="runtime-field-gap">' +
+    (missingRequired.length
+      ? '<strong>必需字段未填写：</strong>' + esc(missingRequired.map((key) => label(key)).join("、")) + "。"
+      : "") +
+    (missingOptional.length
+      ? '<span class="muted">可选字段未填写：' + esc(optionalText) + "（卡片本身没有提供，未作推测）。</span>"
+      : "") +
+    "</p>";
+}
+
+function runtimeRetrievalSelectedCard() {
+  const id = state.runtimeRetrieval.cardId;
+  return id ? runtimeSearchCards().find((card) => card.id === id) || null : null;
+}
+
+function runtimeRetrievalHitHtml(card, selectedId) {
+  const labels = runtimeRetrievalScopeLabels(card);
+  const excerpt = runtimeCardExcerpt(card);
+  return '<button type="button" class="retrieval-hit' + (card.id === selectedId ? " selected" : "") +
+    '" data-retrieval-card="' + esc(card.id) + '">' +
+    "<strong>" + esc(card.title) + "</strong>" +
+    '<span class="retrieval-meta">' + esc(profileDefinition(card.profile_id, card.type).display_name) +
+    (labels.length ? " · " + esc(labels.join(" · ")) : "") + "</span>" +
+    (excerpt ? '<span class="retrieval-excerpt">' + esc(excerpt) + "</span>" : "") +
+    "</button>";
+}
+
+// One handler serves both surfaces that can select a card: the retrieval panel above
+// the scene and the related-person buttons inside the scene card itself.
+function handleRuntimeRetrievalClick(event) {
+  const hit = event.target.closest("[data-retrieval-card]");
+  if (hit) {
+    state.runtimeRetrieval.cardId = hit.dataset.retrievalCard;
+    renderRuntimeRetrieval();
+    return;
+  }
+  if (event.target.closest("[data-retrieval-close]")) {
+    state.runtimeRetrieval.cardId = null;
+    renderRuntimeRetrieval();
+    return;
+  }
+  const clockLocate = event.target.closest("[data-clock-locate]");
+  if (clockLocate) {
+    const clock = document.querySelector('[data-clock-card="' + clockLocate.dataset.clockLocate + '"]');
+    if (clock && clock.scrollIntoView) clock.scrollIntoView({block: "center"});
+    return;
+  }
+  const switchButton = event.target.closest("[data-retrieval-switch]");
+  if (switchButton) changeRuntimeScene(switchButton.dataset.retrievalSwitch);
+}
+
+function renderRuntimeRetrieval() {
+  const host = $("runtime-retrieval");
+  if (!host) return;
+  const query = runtimeRetrievalQuery();
+  const type = runtimeRetrievalType();
+  const selectedId = state.runtimeRetrieval.cardId;
+  const open = Boolean(query || type !== "all" || selectedId);
+  host.hidden = !open;
+  if (!open) {
+    $("runtime-retrieval-status").textContent = "";
+    $("runtime-retrieval-list").innerHTML = "";
+    $("runtime-retrieval-detail").innerHTML = "";
+    return;
+  }
+  const cards = runtimeRetrievalList();
+  const status = $("runtime-retrieval-status");
+  if (query && !cards.length) {
+    status.textContent = "没有匹配“" + query + "”的卡片 · " + runtimeRetrievalScopeText() +
+      "。可换关键词或把类型改为“全部资料”；检索只覆盖本项目已批准资料。";
+  } else if (query) {
+    status.textContent = "匹配 " + cards.length + " 条 · " + runtimeRetrievalScopeText() +
+      (cards.length > 1 ? " · 多个候选请自行选择，不按同名合并。" : "");
+  } else if (!cards.length) {
+    status.textContent = "该类型在本项目没有已批准卡片 · " + runtimeRetrievalScopeText();
+  } else {
+    status.textContent = "按类型浏览 " + cards.length + " 张 · " + runtimeRetrievalScopeText();
+  }
+  $("runtime-retrieval-list").innerHTML = cards.length
+    ? cards.map((card) => runtimeRetrievalHitHtml(card, selectedId)).join("")
+    : "";
+  renderRuntimeRetrievalDetail();
+}
+
+// Switching is only effective for the scenes the running plan currently allows.
+// Offering the button elsewhere would produce a click that silently does nothing, so
+// the detail keeps such cards readable and states why they cannot be switched.
+function runtimeSceneSwitchable(card) {
+  return runtimeConfirmedSceneCards().some((item) => item.id === card.id);
+}
+
+function runtimeSceneSwitchNote(card) {
+  const plan = currentPlan();
+  if (!plan) return "尚未开始运行计划，仅供查阅。";
+  if (!(plan.card_ids || []).includes(card.id)) return "不在当前运行计划内，仅供查阅。";
+  if (!runtimeChapterIncludes(card)) return "不在当前章节筛选内，仅供查阅；调整章节后可切换。";
+  return "当前节拍未包含此场景，仅供查阅；切换到“全部环境”后可切换。";
+}
+
+function renderRuntimeRetrievalDetail() {
+  const host = $("runtime-retrieval-detail");
+  if (!host) return;
+  const card = runtimeRetrievalSelectedCard();
+  if (!card) {
+    host.innerHTML = "";
+    return;
+  }
+  const definition = profileDefinition(card.profile_id, card.type);
+  const labels = runtimeRetrievalScopeLabels(card);
+  const environmentLed = currentPlan()?.navigation_mode === "environment";
+  const scene = currentRuntimeCard();
+  const sceneLabel = environmentLed ? "局势" : "地点";
+  const chapterTitle = runtimeRetrievalChapterTitle(card);
+  const sceneCardType = ["location", "environment"].includes(card.type) && scene?.id !== card.id;
+  const switchable = sceneCardType && runtimeSceneSwitchable(card);
+  const actions = [
+    scene && scene.id !== card.id
+      ? '<button type="button" class="edit-button" data-retrieval-close="1">返回当前' + sceneLabel + "：" + esc(scene.title) + "</button>"
+      : "",
+    switchable
+      ? '<button type="button" class="edit-button" data-retrieval-switch="' + esc(card.id) + '">切换到该' + sceneLabel + "</button>"
+      : ""
+  ].join("");
+  const switchNote = sceneCardType && !switchable
+    ? '<p class="runtime-field-gap muted">不可直接切换：' + esc(runtimeSceneSwitchNote(card)) + "</p>"
+    : "";
+  host.innerHTML = '<article class="domain-card runtime-retrieval-card">' +
+    '<div class="card-title-row"><div><div class="card-title">' + esc(card.title) + "</div>" +
+    '<p class="card-subtitle">' + esc([definition.display_name, chapterTitle].filter(Boolean).join(" · ")) + "</p></div>" +
+    labels.map((text) => badge(text, "neutral")).join("") + "</div>" +
+    runtimeCardFieldsHtml(card) + runtimeFieldGapHtml(card) + sourceHtml(card.fact_ids) + switchNote +
+    (actions ? '<div class="row-actions">' + actions + "</div>" : "") +
+    "</article>";
+}
+
+// A related card is only offered when the approved artifact links it by reviewed
+// grouping or by an explicit card id. Names that merely look alike are not merged;
+// they belong to the search above, where the GM chooses.
+function runtimeRelatedCards(scene) {
+  if (!scene) return [];
+  const approved = new Map(runtimeSearchCards().map((card) => [card.id, card]));
+  const related = new Map();
+  runtimeGroupCards(scene).forEach((card) => {
+    const linked = approved.get(card.id);
+    if (card.id !== scene.id && linked) related.set(card.id, {card: linked, via: "同组"});
+  });
+  const text = JSON.stringify(scene.fields || {});
+  for (const match of text.matchAll(/card_[A-Za-z0-9_]+/g)) {
+    const card = approved.get(match[0]);
+    if (card && card.id !== scene.id && !related.has(card.id)) {
+      related.set(card.id, {card, via: "卡内链接"});
+    }
+  }
+  return [...related.values()];
+}
+
+function runtimeRelatedHtml(scene) {
+  const related = runtimeRelatedCards(scene);
+  if (!related.length) {
+    return '<section class="runtime-section runtime-related"><h3>相关人物与对手</h3>' +
+      '<p class="muted">这张卡片没有已审核的关联卡片。可用上方搜索按姓名查找；工具不会按同名自动合并。</p></section>';
+  }
+  // An environment is the operating surface for its scene, so its support cards stay
+  // readable beside it. A location keeps them one click away, which is what makes the
+  // lookup adjacent to the search instead of another long card in the same column.
+  if (currentPlan()?.navigation_mode === "environment") {
+    return '<section class="runtime-section runtime-related"><h3>相关人物与对手 · 已审核关联</h3>' +
+      '<div class="runtime-reference-list masonry-grid">' + related.map(({card}) =>
+        '<article class="domain-card runtime-reference-card"><div class="card-title-row"><div class="card-title">' +
+        esc(card.title) + "</div>" + badge(profileDefinition(card.profile_id, card.type).display_name, "neutral") +
+        "</div>" + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids) + "</article>").join("") +
+      "</div></section>";
+  }
+  return '<section class="runtime-section runtime-related"><h3>相关人物与对手 · 已审核关联</h3>' +
+    '<div class="runtime-related-list">' + related.map(({card, via}) =>
+      '<button type="button" class="retrieval-related" data-retrieval-card="' + esc(card.id) + '">' +
+      "<strong>" + esc(card.title) + "</strong><span>" +
+      esc(profileDefinition(card.profile_id, card.type).display_name + " · " + via) + "</span></button>").join("") +
+    "</div></section>";
+}
+
 function renderRuntimeOverview() {
   const host = $("runtime-overview");
   if (!host) return;
@@ -3985,6 +4695,7 @@ function renderRuntimeOverview() {
   const chapters = currentPlan()?.navigation_mode === "environment" ? bundle?.adventure_chapters || [] : [];
   if (runtimeNarrative.workspace !== bundle?.id) {
     Object.assign(runtimeNarrative, {workspace: bundle?.id, chapter: "all", beat: "all"});
+    state.runtimeRetrieval.cardId = null;
   }
   $("runtime-narrative-controls").hidden = !chapters.length;
   $("runtime-chapter-reference").innerHTML = "";
@@ -4047,20 +4758,25 @@ function renderRuntimeOverview() {
     : '<div class="empty-state">当前运行计划没有运行包摘要。</div>';
 }
 
+// The reference panel is the browse-everything surface of the running plan. Search
+// results and type browsing live next to the search box, so this list stays complete
+// instead of showing the same filtered subset far below it.
 function renderRuntimeReferenceCards() {
   const host = $("runtime-reference-list");
   if (!host) return;
-  const query = ($("runtime-reference-search")?.value || '').trim().toLowerCase();
-  const type = $("runtime-reference-filter")?.value || 'all';
-  const cards = runtimePlanCards().filter((card) => {
-    if (card.type === 'location' || card.type === 'environment' || card.type === 'chapter_overview' || ['clock', 'operation_clock', 'encounter_clock'].includes(card.type)) return false;
-    if (type !== 'all' && card.type !== type) return false;
-    if (!query) return true;
-    return [card.title, card.subtitle, JSON.stringify(card.fields || {})].join(' ').toLowerCase().includes(query);
-  });
+  const cards = runtimePlanCards().filter((card) =>
+    card.type !== 'location' && card.type !== 'environment' && card.type !== 'chapter_overview' &&
+    !runtimeClockTypes.includes(card.type)
+  );
+  const description = $("runtime-reference-description");
+  if (description) {
+    description.textContent = cards.length
+      ? "当前运行计划中的全部已批准资料 · " + cards.length + " 张"
+      : "当前运行计划中还没有支持资料";
+  }
   host.innerHTML = cards.length
     ? cards.map((card) => '<article class="domain-card runtime-reference-card"><div class="card-title-row"><div class="card-title">' + esc(card.title) + '</div>' + badge(profileDefinition(card.profile_id, card.type).display_name, 'neutral') + '</div>' + runtimeCardFieldsHtml(card) + sourceHtml(card.fact_ids) + '</article>').join('')
-    : '<div class="empty-state">没有符合条件的运行资料。</div>';
+    : '<div class="empty-state">当前运行计划还没有人物、威胁或展示材料等支持资料。</div>';
 }
 
 function fillSelectors() {
@@ -4099,9 +4815,12 @@ function refreshCardTypes() {
 function renderAll() {
   renderPrep();
   if (!state.data?.bundle) {
+    // renderEmptyWorkspace renders the stored failure together with its status.
     renderEmptyWorkspace();
     return;
   }
+  // A project loaded: only a failure stored since then stays visible.
+  renderLoadFailure();
   $("edit-toggle").disabled = false;
   const exportBundle = $("export-bundle");
   if (exportBundle) {
@@ -4110,6 +4829,7 @@ function renderAll() {
   }
   renderShelf();
   renderFacts();
+  renderPrepSelection();
   renderCards();
   renderReview();
   renderRuntime();
@@ -4192,7 +4912,11 @@ async function saveSession() {
 }
 
 async function resetSession() {
-  if (!confirm('确定要清空本次运行的线索、时钟和日志吗？')) return;
+  // DELETE 后会新建一份会话：触发、线索、时钟、备注、日志与运行位置都会清空。
+  if (!confirm(
+    '确定要清空本次运行吗？会清空触发状态、已揭示线索、推进钟、备注、日志与当前运行位置；'
+    + '已批准资料与本次准备选择会保留。取消不会改变任何状态。'
+  )) return;
   const response = await fetch('/api/domain/examples/' + encodeURIComponent(state.exampleId) + '/session', {method: 'DELETE'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   await loadSession();
@@ -4279,6 +5003,8 @@ function recordLookupGap() {
 }
 
 function bindEvents() {
+  if (state.eventsBound) return;
+  state.eventsBound = true;
   document.querySelectorAll(".work-nav button").forEach((button) => {
     button.addEventListener("click", () => showView(button.dataset.view));
   });
@@ -4393,11 +5119,18 @@ function bindEvents() {
     state.review.page = page;
     renderReview();
   });
+  $("prep-selection-save").addEventListener("click", () => savePrepSelection());
+  $("prep-selection-clear").addEventListener("click", () => clearPrepSelection());
+  $("prep-selection-profile").addEventListener("change", (event) => {
+    state.prepSelection.profileId = event.target.value;
+    syncPrepSelectionFromBundle();
+    renderPrepSelection();
+    renderCards();
+  });
+  $("runtime-prep-selection")?.addEventListener("click", handleRuntimeRetrievalClick);
   $("prep-source-refresh").addEventListener("click", () => {
-    loadSourceFiles().catch((error) => {
-      state.prep.error = userFacingError(error, "来源 PDF 列表加载失败");
-      renderPrep();
-    });
+    // The failure is reported in the source panel itself; it is not a project error.
+    loadSourceFiles({rethrow: false});
   });
   $("prep-source-file-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-source-delete]");
@@ -4416,8 +5149,13 @@ function bindEvents() {
     state.runtimeProfileId = event.target.value;
     renderRuntime();
   });
-  $("runtime-reference-search")?.addEventListener("input", () => renderRuntime());
+  $("runtime-reference-search")?.addEventListener("input", () => {
+    state.runtimeRetrieval.cardId = null;
+    renderRuntime();
+  });
   $("runtime-reference-filter")?.addEventListener("change", () => renderRuntime());
+  $("runtime-retrieval")?.addEventListener("click", handleRuntimeRetrievalClick);
+  $("scene-holder")?.addEventListener("click", handleRuntimeRetrievalClick);
   $("scene-holder").addEventListener("change", (event) => {
     if (event.target.id === "runtime-scene-select") changeRuntimeScene(event.target.value);
     const trigger = event.target.closest("[data-trigger-state]");
@@ -4633,6 +5371,29 @@ function bindEvents() {
       reviewCards([cardReview.dataset.cardReviewId], cardReview.dataset.cardReviewAction);
       return;
     }
+    const prepToggle = event.target.closest("[data-prep-toggle]");
+    if (prepToggle) {
+      togglePrepSelection(prepToggle.dataset.prepToggle);
+      return;
+    }
+    const prepRemove = event.target.closest("[data-prep-remove]");
+    if (prepRemove) {
+      togglePrepSelection(prepRemove.dataset.prepRemove);
+      return;
+    }
+    const prepOpen = event.target.closest("[data-prep-open]");
+    if (prepOpen) {
+      const cardId = prepOpen.dataset.prepOpen;
+      state.selectedCardId = cardId;
+      state.cardProfile = "all";
+      state.cardType = "all";
+      state.cardChapter = "all";
+      showView("cards");
+      renderCards();
+      const target = document.querySelector('[data-card-id="' + cardId + '"]');
+      if (target && target.scrollIntoView) target.scrollIntoView({block: "center"});
+      return;
+    }
     const editCard = event.target.closest("[data-edit-card]");
     if (editCard) openCardEditor(editCard.dataset.editCard);
     const deleteFactButton = event.target.closest("[data-delete-fact]");
@@ -4676,19 +5437,45 @@ function bindEvents() {
     if (event.key === "Escape") closeModal();
   });
   window.addEventListener("beforeunload", (event) => {
-    if (state.dirty) event.preventDefault();
+    // 未保存的本次准备与未保存的书架修改一样需要提示。
+    if (state.dirty || prepSelectionDirty()) event.preventDefault();
   });
 }
 
+function recordProjectReady(startedAt) {
+  state.timings.projectReadyMs = Date.now() - startedAt;
+  return state.timings.projectReadyMs;
+}
+
+function loadPrepConfigDeferred() {
+  if (state.prep.config) return;
+  loadPrepConfig().catch((error) => {
+    state.prep.configError = userFacingError(error, "模型配置加载失败");
+    renderPrep();
+  });
+}
+
+// Source-management details and model/prep-job status are supporting surfaces.
+// They start after the project material is rendered, and none of them can keep
+// an existing project out of its data and runtime views.
+function startDeferredLoads({viewHandled = false} = {}) {
+  loadSourceFiles({rethrow: false});
+  if (viewHandled && state.initialView === "prep") return;
+  loadPrepConfigDeferred();
+  loadPrepJobs();
+}
+
 async function init() {
+  const projectStartedAt = Date.now();
   try {
     await loadWorkspaces();
     if (!state.exampleId) {
       bindEvents();
-      await Promise.all([loadSourceFiles(), loadPrepConfig(), loadPrepJobs()]);
       renderPrep();
       renderEmptyWorkspace();
-      if (["prep", "shelf", "facts", "cards", "review", "runtime"].includes(state.initialView)) showView(state.initialView);
+      const viewHandled = ["prep", "shelf", "facts", "cards", "review", "runtime"].includes(state.initialView);
+      if (viewHandled) showView(state.initialView);
+      startDeferredLoads({viewHandled});
       return;
     }
     const exportBundle = $("export-bundle");
@@ -4701,8 +5488,18 @@ async function init() {
       `/api/domain/workbench?example=${encodeURIComponent(state.exampleId)}`,
       {cache: "no-store"}
     );
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      const detail = payload?.detail;
+      const error = new Error(formatApiError(payload, `请求失败（HTTP ${response.status}）`));
+      if (detail && typeof detail === "object" && detail.message) {
+        error.apiReason = String(detail.message);
+        error.apiCode = String(detail.code || "");
+      }
+      throw error;
+    }
     state.data = await response.json();
+    clearLoadFailure();
     state.savedAt = state.data.saved_at;
     state.savedState = state.data.saved_state;
     if (state.data.artifact_job) setArtifactJob(state.data.artifact_job);
@@ -4715,27 +5512,26 @@ async function init() {
     scheduleStructurePoll();
     state.artifacts.generating = artifactJobInFlight(state.artifacts.job);
     scheduleArtifactPoll();
-    await Promise.all([
-      loadSourceFiles(),
-      Promise.resolve(),
-      loadSession(),
-      loadPrepConfig(),
-      loadPrepJobs()
-    ]);
+    // Project-owned material first: session state belongs to the saved project,
+    // while source management details do not gate reading it.
+    await loadSession();
+    syncPrepSelectionFromBundle();
     fillSelectors();
     bindEvents();
     renderAll();
-    if (["prep", "shelf", "facts", "cards", "review", "runtime"].includes(state.initialView)) {
-      showView(state.initialView);
-    }
-    updateWorkStatus("领域数据已加载");
+    const viewHandled = ["prep", "shelf", "facts", "cards", "review", "runtime"].includes(state.initialView);
+    if (viewHandled) showView(state.initialView);
+    const projectReadyMs = recordProjectReady(projectStartedAt);
+    updateWorkStatus("资料已加载 · 项目可查 " + formatElapsed(projectReadyMs));
+    startDeferredLoads({viewHandled});
   } catch (error) {
-    const status = $("connection-status");
-    status.className = "status error";
-    status.textContent = "加载失败";
-    const panel = $("global-error");
-    panel.hidden = false;
-    panel.textContent = userFacingError(error, "工作台加载失败");
+    // A project that cannot be opened must not strand the page: bind navigation,
+    // drop the previous project's content, and keep saying why it is unavailable.
+    showLoadFailure(error, "工作台加载失败");
+    state.data = null;
+    bindEvents();
+    renderEmptyWorkspace();
+    renderLoadFailure();
   }
 }
 

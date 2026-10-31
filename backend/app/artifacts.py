@@ -12,6 +12,11 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from . import prep, storage
+from .fact_input import estimate_tokens as _estimate_tokens
+from .fact_input import fact_batches as shared_fact_batches
+from .fact_input import fact_payload as _fact_payload_from_facts
+from .persistent_step import run_json_step as _shared_run_json_step
+from .persistent_step import stable_hash as _stable_hash
 from .llm import make_client
 from .planning_transport import PlanningTransport
 from ..domain import PrepUnit, RuntimeBrief, load_profiles, validate_bundle
@@ -24,17 +29,53 @@ from ..domain.models import (
 )
 
 
-PROMPT_VERSION = "prep-artifact-draft-v8"
-GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v14"
+PROMPT_VERSION = "prep-artifact-draft-v13"
+GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v18"
 # Both versions participate in durable step hashes, so retries regenerate steps
 # produced under older semantics instead of reusing their successful outputs.
+
+# A board says how to organise preparation material; the published game it borrows
+# methods from is design reference, not the rules the GM plays with. Generation
+# messages therefore carry the card contract plus this one boundary, never the
+# board's rule-flavoured metadata (summary, risk axes, failure/GM moves, prompts).
+BOARD_REFERENCE_BOUNDARY = (
+    "BOARD_IS_ORGANISATION_NOT_RULES: BOARD_PROFILE_JSON describes how to organise "
+    "preparation material for a GM. It is a design reference, not the rules used at the "
+    "table. Never add or convert checks, statistics, difficulty, levels, armour, hit "
+    "points, or adversary types that the supplied facts do not state. Preserve supplied "
+    "rule statistics and mechanics as cited source material in supported source fields; "
+    "when a card has no such field, keep the original rule text accessible through its "
+    "cited facts rather than inventing a field. Preserve source-backed non-mechanical "
+    "quantities, dates, times, and distances in appropriate narrative fields.\n"
+)
+
+
+def _board_prompt_payload(
+    profile: RuleProfile,
+    *,
+    definitions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The part of a board a generation message may see: structure, never rule mechanics."""
+    payload: dict[str, Any] = {
+        "id": profile.id,
+        "profile_kind": profile.profile_kind,
+        "runtime_navigation_mode": profile.runtime_navigation_mode,
+        "runtime_anchor_type": profile.runtime_anchor_type,
+    }
+    if definitions is not None:
+        payload["card_definitions"] = definitions
+    return payload
 SOURCE_SEMANTIC_GUIDANCE = (
     "Distinguish source play reports and examples from default current state. Preserve whether "
     "a passage describes established setup, historical background, one group's past play, or a "
     "conditional example. Do not promote reported player choices, discoveries, victories, deaths, "
     "or other outcomes into opening conditions, current situation, or inevitable future events. "
     "Keep example outcomes conditional and background historical; when the source does not "
-    "establish a starting state, record the uncertainty in open_questions. "
+    "establish a starting state, state what the material assumes in assumed_state rather than "
+    "asking whether it happened. Which optional events have occurred, and where a table stands in "
+    "the timeline, depend on player action and differ at every table, so never turn them into "
+    "review questions. Reserve open_questions for contradictions, terminology gaps, or missing "
+    "framing that exist inside the source itself. "
     "Preserve reusable actionable capabilities from included facts, including what an NPC, "
     "creature, object, or environment can do, its triggers, limits, costs, and counterplay when "
     "supplied. An illustrative use may support a reusable capability only when the source "
@@ -61,11 +102,6 @@ MAX_FACT_INPUT_CHARS = 120_000
 # Keep individual model requests comfortably below the hard input ceiling.  A
 # single artifact job may contain several of these batches; the final cards are
 # merged and validated before they are written to the shelf.
-MAX_FACT_BATCH_CHARS = 80_000
-MAX_SINGLE_FACT_CHARS = MAX_FACT_BATCH_CHARS
-MAX_FACT_BATCH_TOKENS = 22_000
-MAX_SINGLE_FACT_TOKENS = MAX_FACT_BATCH_TOKENS
-MAX_FACTS_PER_BATCH = 200
 # This is a technical guard against an accidentally unbounded model response,
 # not a product rule that may force useful entities into one card.
 # Bound individual model responses, not the combined output of all chapters.
@@ -86,7 +122,7 @@ ARTIFACT_MAX_TOKENS = 9000
 # been collected.  A single request sees all candidates, so it cannot disagree
 # with itself the way per-chapter planning requests inevitably would.
 IDENTITY_RECONCILE_PROMPT_VERSION = "prep-artifact-identity-reconcile-v1"
-IDENTITY_RECONCILE_MAX_TOKENS = 3000
+IDENTITY_RECONCILE_MAX_TOKENS = 8000
 IDENTITY_GROUP_CHAR_BUDGET = 40_000
 # Keep a chunk's plan count well below IdentityReconciliationPayload.clusters
 # max_length, because validation requires every candidate to be covered once.
@@ -114,6 +150,7 @@ class ArtifactDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 LIST_FIELDS = {
     "immediate_actions",
+    "table_questions",
     "direct_clues",
     "hidden_clues",
     "gm_moves",
@@ -206,26 +243,21 @@ def _question_summary_fields(summary: _OpenQuestionSummary) -> dict[str, Any]:
     }
 
 
-def _stable_hash(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+def _artifact_resume_saved_response(stage: str, validator: Callable[[Any], dict[str, Any]]):
+    """A saved global plan is reusable only when a coverage gap is its whole problem."""
+    if stage != "global_plan":
+        return None
 
+    def hook(raw: Any) -> Any:
+        try:
+            validator(raw)
+        except PlanCoverageError:
+            return raw
+        except Exception:  # noqa: BLE001 - unusable saved response means a fresh call
+            return None
+        return None
 
-def _estimate_tokens(value: Any) -> int:
-    """Conservative fallback when the configured upstream exposes no tokenizer."""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    cjk_count = sum(
-        1
-        for character in text
-        if "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
-    )
-    other_count = max(len(text) - cjk_count, 0)
-    return cjk_count + (other_count + 3) // 4
-
-
-def _step_id(job_id: str, stage: str, step_index: int, input_hash: str) -> str:
-    digest = input_hash.removeprefix("sha256:")[:16]
-    return f"artifact_step_{job_id.removeprefix('artifact_job_')}_{stage}_{step_index}_{digest}"
+    return hook
 
 
 def _run_json_step(
@@ -240,129 +272,37 @@ def _run_json_step(
     max_tokens: int,
     validator: Callable[[Any], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Run or resume one validated LLM step while preserving every attempt."""
-    # A model switch is a new generation attempt, even when the source facts
-    # and stage inputs are identical.  Include the effective client identity
-    # in the step key so a retry cannot silently reuse a successful response
-    # produced by the model that just failed or was rate-limited.
-    step_input = {
-        **input_payload,
-        "_model_id": job.model_id,
-        "_fake_model": job.fake_model,
-    }
-    input_hash = _stable_hash(step_input)
-    existing = storage.load_artifact_job_step(job.id, stage, step_index, input_hash)
-    if existing and existing.get("status") == "succeeded" and existing.get("output"):
-        return existing["output"]
+    """Artifact binding of the shared durable step.
 
-    timestamp = storage.now()
-    step = existing or {
-        "id": _step_id(job.id, stage, step_index, input_hash),
-        "job_id": job.id,
-        "stage": stage,
-        "step_index": step_index,
-        "input_hash": input_hash,
-        "input_refs": {
-            **input_refs,
-            "model_id": job.model_id,
-            "fake_model": job.fake_model,
-        },
-        "attempts": [],
-        "created_at": timestamp,
-    }
-    attempts = list(step.get("attempts") or [])
-    resume_plan = None
-    if stage == "global_plan" and attempts and attempts[-1].get("response"):
-        try:
-            validator(attempts[-1]["response"])
-        except PlanCoverageError:
-            resume_plan = attempts[-1]["response"]
-        except Exception:
-            pass
-    working_messages = [dict(message) for message in messages]
-    step.update(status="running", updated_at=timestamp, error=None)
-    storage.save_artifact_job_step(step)
+    The mechanism lives in `persistent_step`. What stays here is what belongs to
+    artifacts: reusing a saved plan whose only defect is missing coverage, repairing
+    that coverage on the original plan instead of rewriting it, and treating the
+    coverage error as fatal rather than taking the bounded correction retry.
+    """
 
-    last_error: Exception | None = None
-    for correction_attempt in range(2):
-        raw: Any = None
-        attempt_number = len(attempts) + 1
-        started_at = storage.now()
-        try:
-            raw = resume_plan if resume_plan is not None else client.chat_json(
-                working_messages,
-                temperature=0.15,
-                max_tokens=max_tokens,
-                request_timeout=ARTIFACT_REQUEST_TIMEOUT,
-            )
-            resume_plan = None
-            try:
-                output = validator(raw)
-            except PlanCoverageError as coverage:
-                raw = _complete_plan_coverage(job, stage, step_index, raw, coverage, client, validator)
-                output = validator(raw)
-        except Exception as error:  # noqa: BLE001
-            last_error = error
-            attempts.append(
-                {
-                    "attempt": attempt_number,
-                    "status": "failed",
-                    "model_id": job.model_id,
-                    "fake_model": job.fake_model,
-                    "started_at": started_at,
-                    "finished_at": storage.now(),
-                    "response": raw,
-                    "error": str(error)[:2000],
-                }
-            )
-            step.update(
-                status="failed",
-                attempts=attempts,
-                error=str(error)[:2000],
-                updated_at=storage.now(),
-            )
-            storage.save_artifact_job_step(step)
-            if raw is None or correction_attempt == 1 or isinstance(error, PlanCoverageError):
-                raise
-            working_messages.extend(
-                [
-                    {"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
-                    {
-                        "role": "user",
-                        "content": (
-                            "The JSON was rejected by deterministic validation: "
-                            f"{error}. Return the complete corrected JSON object only."
-                        ),
-                    },
-                ]
-            )
-            step.update(status="running", error=None, updated_at=storage.now())
-            storage.save_artifact_job_step(step)
-            continue
-
-        attempts.append(
-            {
-                "attempt": attempt_number,
-                "status": "succeeded",
-                "model_id": job.model_id,
-                "fake_model": job.fake_model,
-                "started_at": started_at,
-                "finished_at": storage.now(),
-                "response": raw,
-                "error": None,
-            }
+    def recover(raw: Any, error: Exception) -> Any:
+        if not isinstance(error, PlanCoverageError):
+            raise error
+        return _complete_plan_coverage(
+            job, stage, step_index, raw, error, client, validator
         )
-        step.update(
-            status="succeeded",
-            attempts=attempts,
-            output=output,
-            error=None,
-            updated_at=storage.now(),
-        )
-        storage.save_artifact_job_step(step)
-        return output
 
-    raise last_error or ArtifactGenerationError(f"artifact step failed: {stage}/{step_index}")
+    return _shared_run_json_step(
+        job,
+        stage=stage,
+        step_index=step_index,
+        input_payload=input_payload,
+        input_refs=input_refs,
+        messages=messages,
+        client=client,
+        max_tokens=max_tokens,
+        validator=validator,
+        request_timeout=ARTIFACT_REQUEST_TIMEOUT,
+        resume_saved_response=_artifact_resume_saved_response(stage, validator),
+        recover_validation=recover,
+        fatal_error_types=(PlanCoverageError,),
+        error_factory=ArtifactGenerationError,
+    )
 
 
 def recover_interrupted_artifact_jobs() -> int:
@@ -1131,23 +1071,6 @@ def _unique_questions(values: list[str]) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in values if item.strip()))
 
 
-def _fact_payload_from_facts(facts: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": fact.id,
-            "text": fact.text,
-            "kind": fact.kind,
-            "visibility": fact.visibility,
-            "evidence_status": fact.evidence_status,
-            "source_refs": [ref.model_dump(mode="json") for ref in fact.source_refs],
-            "tags": fact.tags,
-            "notes": fact.notes,
-        }
-        for fact in facts
-        if fact.evidence_status != "model_candidate"
-    ]
-
-
 def _facts_for_workspace(
     bundle: ExampleBundle, workspace_id: str, unit: PrepUnit | None = None
 ) -> list[Any]:
@@ -1192,38 +1115,6 @@ def _fact_source_sort_key(fact: Any, preferred_file: str | None) -> tuple:
     return (2, "", 0, fact.id)
 
 
-def _fact_batches(facts: list[Any]) -> list[list[Any]]:
-    """Pack facts in source order using a conservative tokenizer fallback."""
-    batches: list[list[Any]] = []
-    current: list[Any] = []
-    for fact in facts:
-        single_payload = _fact_payload_from_facts([fact])
-        single_serialized = json.dumps(single_payload, ensure_ascii=False)
-        single_size = len(single_serialized)
-        single_tokens = _estimate_tokens(single_serialized)
-        if single_size > MAX_SINGLE_FACT_CHARS or single_tokens > MAX_SINGLE_FACT_TOKENS:
-            raise ArtifactGenerationError(
-                f"事实 {fact.id} 单条输入约 {single_size} 字符 / {single_tokens} 估算 token，"
-                "超过单批保护上限；请拆分或缩短该事实后重试。"
-            )
-        candidate = [*current, fact]
-        serialized = json.dumps(_fact_payload_from_facts(candidate), ensure_ascii=False)
-        size = len(serialized)
-        tokens = _estimate_tokens(serialized)
-        if current and (
-            size > MAX_FACT_BATCH_CHARS
-            or tokens > MAX_FACT_BATCH_TOKENS
-            or len(candidate) > MAX_FACTS_PER_BATCH
-        ):
-            batches.append(current)
-            current = [fact]
-        else:
-            current = candidate
-    if current:
-        batches.append(current)
-    return batches
-
-
 def _local_digest_messages(
     profile: RuleProfile,
     facts: list[dict[str, Any]],
@@ -1245,6 +1136,7 @@ def _local_digest_messages(
         + SOURCE_SEMANTIC_GUIDANCE
         + CLOCK_SEMANTIC_GUIDANCE
         + _local_runtime_guidance(profile)
+        + BOARD_REFERENCE_BOUNDARY
         + "Do not invent cross-batch relationships. kind must be one of ALLOWED_UNIT_KINDS_JSON, "
         "not the source fact kind or a final card type. Event material belongs to scene, timeline, "
         "or outcome according to its narrative function; event is not a local unit kind. "
@@ -1256,7 +1148,7 @@ def _local_digest_messages(
         f"BATCH_INDEX_JSON={batch_index}\n"
         f"BATCH_COUNT_JSON={batch_count}\n"
         f"CHAPTER_CONTEXT_JSON={json.dumps(chapter, ensure_ascii=False)}\n"
-        f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
+        f"BOARD_PROFILE_JSON={json.dumps(_board_prompt_payload(profile), ensure_ascii=False)}\n"
         f"ALLOWED_UNIT_KINDS_JSON={json.dumps(sorted(LOCAL_UNIT_KINDS), ensure_ascii=False)}\n"
         f"RESPONSE_SCHEMA_JSON={json.dumps(response_schema)}\n"
         f"LOCAL_FACTS_JSON={json.dumps(facts, ensure_ascii=False)}"
@@ -1443,6 +1335,7 @@ def _global_plan_messages(
         + SOURCE_SEMANTIC_GUIDANCE
         + CLOCK_SEMANTIC_GUIDANCE
         + runtime_guidance
+        + BOARD_REFERENCE_BOUNDARY
         + "Player-facing source assets "
         "such as maps, letters, photos, newspapers, logs, and records are tracked separately and must "
         "not become artifact cards merely as display assets. When a supplied handout fact is "
@@ -1452,7 +1345,12 @@ def _global_plan_messages(
         "profile, runtime_groups are optional retrieval hints. Use a shared short semantic key only "
         "when source-backed material makes an environment and support card clearly relevant together. "
         "Do not invent an encounter, require an enemy or clock, or preselect what must appear in play. "
-        "Reusable support may list multiple keys. "
+        "Reusable support may list multiple keys. A group denotes one situation or one recurring "
+        "entity, never a campaign-wide theme, and the same situation must reuse one canonical name "
+        "across chapters, with no chapter number, scope marker, or planning request in it. Write each "
+        "entry as a short lowercase ASCII key joined by underscores, such as trollskull_tavern, "
+        "because the key becomes the identifier encounter_<key>_<hash>; a Chinese name cannot be "
+        "slugged and collapses to a meaningless placeholder. "
         "Runtime brief metadata is not a card and does not need a runtime group. "
         "Follow RESPONSE_SCHEMA_JSON exactly. Do not add environment_type or other final card fields "
         "to a planned card; express operating modes in purpose/focus. opening_conditions is an array. "
@@ -1519,15 +1417,21 @@ def _global_plan_messages(
         "reference_fact_ids": [],
     }] if structure_context else [])
     # The planner needs card categories, not the final card field contract.
-    planning_profile = profile.model_dump(mode="json")
-    planning_profile["card_definitions"] = [
-        {key: value for key, value in definition.items() if key in {"type", "label", "description"}}
-        for definition in planning_profile["card_definitions"]
-    ]
+    planning_profile = _board_prompt_payload(
+        profile,
+        definitions=[
+            {
+                key: value
+                for key, value in definition.model_dump(mode="json").items()
+                if key in {"type", "label", "description"}
+            }
+            for definition in profile.card_definitions
+        ],
+    )
     user = (
         "[TASK:prep:artifact_global_plan]\n"
         f"PROMPT_VERSION_JSON={json.dumps(GLOBAL_PLAN_PROMPT_VERSION)}\n"
-        f"TARGET_PROFILE_JSON={json.dumps(planning_profile, ensure_ascii=False)}\n"
+        f"BOARD_PROFILE_JSON={json.dumps(planning_profile, ensure_ascii=False)}\n"
         f"RESPONSE_SCHEMA_JSON={json.dumps(schema, ensure_ascii=False)}\n"
         "EXAMPLE_IS_SHAPE_ONLY_JSON=true\n"
         f"CHAPTER_BRIEFS_EXAMPLE_JSON={json.dumps(chapter_example, ensure_ascii=False)}\n"
@@ -1682,7 +1586,7 @@ def _complete_plan_coverage(job, stage, index, raw, error, client, validator):
             input_payload={"version": "coverage-v2", "plan": raw, "facts": error.facts,
                            "chapters": error.chapters, "global": error.global_ids},
             input_refs={"fact_ids": [fact["id"] for fact in error.facts]},
-            messages=messages, client=client, max_tokens=4000, validator=merge,
+            messages=messages, client=client, max_tokens=8000, validator=merge,
         )
     except Exception as failure:
         # Keep the original plan intact instead of triggering a whole-plan rewrite.
@@ -1955,7 +1859,9 @@ def _materialization_messages(
         "the supplied plan and must not be returned or changed. Use only supplied original "
         "facts. Every factual field must cite one or more fact_ids from that card, and every populated "
         "field must have field_sources. Do not fill gaps from the planning summary; record an open "
-        "question instead. Every required field listed below MUST be present and non-empty. "
+        "question instead. Every required field listed below MUST be present and non-empty. When the "
+        "source does not establish a required field, state what the material assumes rather than "
+        "inventing detail, and record that assumption in assumed_state. "
         "Before returning, check the fields object key by key against REQUIRED_FIELD_SHAPES_JSON; "
         "array-shaped fields must be JSON arrays, never scalar strings. "
         "source_statistics, when supported, is a concise string quoting only supplied source information, "
@@ -1965,6 +1871,19 @@ def _materialization_messages(
         "For every optional field, actively inspect the supplied facts and include it whenever the "
         "facts support useful table-side content; omit it only when no useful content exists. In "
         "particular, check relevant_characters, hidden_clues, and return_changes separately. "
+        "assumed_state is one concise declarative sentence naming the situation this material "
+        "assumes, never a question about what happened. table_questions holds two to four short "
+        "prompts that invite the table to answer from their own game, grounded in this card's "
+        "fiction. "
+        "A preparation card is read at the table, not studied, so every array field stays "
+        "scannable mid-scene: usable_features holds two to five named features, each one line "
+        "pairing a trigger with its effect, and never an inventory, fee schedule, calendar, "
+        "roster, or gazetteer; supplied reference detail of that kind belongs in "
+        "source_statistics, and unsupported detail is left out because its facts stay "
+        "retrievable. impulses holds three to six short phrases, and hazards, triggers, and "
+        "phase_changes stay equally short. Begin environment_type with one scene rhythm — "
+        "探索, 社交, 穿越, or 事件 — followed by a short qualifier, so a GM reads the scene's "
+        "shape at a glance. "
         "Fields listed in GM_AUTHORED_FIELDS_JSON may be concise GM-authored operating prompts "
         "grounded in the card's source-backed fiction; mark those prompts with no field_sources unless "
         "the source explicitly supports them. Never use that exception for factual claims. "
@@ -1972,12 +1891,13 @@ def _materialization_messages(
         f"GM_AUTHORED_FIELDS_JSON={json.dumps(gm_authored_fields, ensure_ascii=False)} "
         + SOURCE_SEMANTIC_GUIDANCE
         + CLOCK_SEMANTIC_GUIDANCE
+        + BOARD_REFERENCE_BOUNDARY
         + "All user-facing text must be Chinese."
     )
     user = (
         "[TASK:prep:artifact_materialize]\n"
         f"PROMPT_VERSION_JSON={json.dumps(PROMPT_VERSION)}\n"
-        f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
+        f"BOARD_PROFILE_JSON={json.dumps(_board_prompt_payload(profile), ensure_ascii=False)}\n"
         f"CARD_DEFINITION_JSON={json.dumps(definition.model_dump(mode='json'), ensure_ascii=False)}\n"
         f"LIST_FIELDS_JSON={json.dumps(list_fields, ensure_ascii=False)}\n"
         f"CARD_PLAN_JSON={json.dumps(_prompt_plan(plan), ensure_ascii=False)}\n"
@@ -2504,9 +2424,9 @@ def _merge_chapter_plans(
 
 def _artifact_batches(bundle: ExampleBundle, facts: list[Any]) -> list[list[Any]]:
     if not bundle.adventure_chapters:
-        return _fact_batches(facts)
+        return shared_fact_batches(facts, error_factory=ArtifactGenerationError)
     return [batch for chapter in bundle.adventure_chapters
-            for batch in _fact_batches([fact for fact in facts if fact.id in set(chapter.fact_ids)])]
+            for batch in shared_fact_batches([fact for fact in facts if fact.id in set(chapter.fact_ids)], error_factory=ArtifactGenerationError)]
 
 
 class PlanningIndexSummary(BaseModel):
@@ -2586,7 +2506,7 @@ def _bounded_plan_input(job, plan_index, profile, units, sizes, tokens, context,
             input_payload={"version": "planning-index-v3", "units": group,
                            "summary_chars": summary_chars},
             input_refs={"fact_ids": list(dict.fromkeys(fid for u in group for fid in u["fact_ids"]))},
-            messages=prompt, client=client, max_tokens=2500,
+            messages=prompt, client=client, max_tokens=8000,
             validator=lambda raw: PlanningIndexSummary.model_validate(raw).model_dump(mode="json"),
         )
         output["summary"] = (output.get("summary") or "")[:summary_chars]
@@ -2644,7 +2564,7 @@ def _generate_hierarchical_artifacts(
     job = _save_job(job, phase="local_digest")
     local_units: list[dict[str, Any]] = []
     batch_chapters = [chapter.id for chapter in bundle.adventure_chapters
-                      for _ in _fact_batches([fact for fact in scoped_facts if fact.id in set(chapter.fact_ids)])]
+                      for _ in shared_fact_batches([fact for fact in scoped_facts if fact.id in set(chapter.fact_ids)], error_factory=ArtifactGenerationError)]
     question_summary = _OpenQuestionSummary()
     for batch_index, batch_facts in enumerate(batches, start=1):
         current = _job_from_store(job.id)
@@ -3039,6 +2959,7 @@ def _prompt_messages(
         "scenes, people, threats, or clocks. "
         + SOURCE_SEMANTIC_GUIDANCE
         + CLOCK_SEMANTIC_GUIDANCE
+        + BOARD_REFERENCE_BOUNDARY
         + "All user-facing text must be Chinese."
     )
     anchor_instruction = (
@@ -3056,7 +2977,7 @@ def _prompt_messages(
         "[TASK:prep:artifact_draft]\n"
         f"WORKSPACE_ID_JSON={json.dumps(bundle.id, ensure_ascii=False)}\n"
         f"WORKSPACE_NAME_JSON={json.dumps(bundle.name, ensure_ascii=False)}\n"
-        f"TARGET_PROFILE_JSON={json.dumps(profile.model_dump(mode='json'), ensure_ascii=False)}\n"
+        f"BOARD_PROFILE_JSON={json.dumps(_board_prompt_payload(profile, definitions=definitions), ensure_ascii=False)}\n"
         f"ALLOWED_CARD_DEFINITIONS_JSON={json.dumps(definitions, ensure_ascii=False)}\n"
         f"LIST_FIELD_SHAPES_JSON={json.dumps(field_shapes, ensure_ascii=False)}\n"
         "For each card, fields may contain only keys declared by its card definition. Fill every "

@@ -61,7 +61,11 @@ def main():
             self.calls += 1
             return {"decisions": [{"fact_id": "fact_item1",
                 "destination": "card", "card_index": 0, "reason": "Same scene pressure"}]}
-    with tempfile.TemporaryDirectory() as directory, patch.object(storage, "DB_PATH", Path(directory) / "test.db"):
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        patch.object(storage, "DB_PATH", Path(directory) / "test.db"),
+        patch.object(storage, "UPLOAD_DIR", Path(directory) / "uploads"),
+    ):
         storage.init_db()
         job, _ = a.create_artifact_job(bundle.id, "daggerheart", model_id="fixture", fake_model=True)
         client = Client()
@@ -76,6 +80,56 @@ def main():
         assert raw["cards"][0]["fact_ids"] == ["fact_item0"]
         assert merged["cards"][0]["fact_ids"] == ["fact_item0", "fact_item1"]
         assert validator(merged)["cards"][0]["chapter_ids"] == ["chapter_one"]
+
+        class ResumeClient:
+            def __init__(self):
+                self.responses = [raw, RuntimeError("offline"), {
+                    "decisions": [{"fact_id": "fact_item1", "chapter_id": "chapter_one",
+                        "destination": "card", "card_index": 0, "reason": "Same scene pressure"}]
+                }]
+                self.calls = 0
+
+            def chat_json(self, messages, **kwargs):
+                self.calls += 1
+                response = self.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return deepcopy(response)
+
+        resume_client = ResumeClient()
+        step_args = {
+            "job": job,
+            "stage": "global_plan",
+            "step_index": 2,
+            "input_payload": {"version": "resume-test", "facts": [f.id for f in facts]},
+            "input_refs": {"fact_ids": [f.id for f in facts]},
+            "messages": [{"role": "user", "content": "plan"}],
+            "client": resume_client,
+            "max_tokens": 100,
+            "validator": validator,
+        }
+        try:
+            a._run_json_step(**step_args)
+        except a.PlanCoverageError:
+            pass
+        else:
+            raise AssertionError("failed coverage repair must leave the parent step retryable")
+        assert resume_client.calls == 2, "initial plan plus failed repair should be two requests"
+        resumed_plan = a._run_json_step(**step_args)
+        assert resume_client.calls == 3, "retry must repair the saved plan without requesting it again"
+        assert resumed_plan["cards"][0]["fact_ids"] == ["fact_item0", "fact_item1"]
+        parent = storage.load_artifact_job_step(
+            job.id, "global_plan", 2,
+            a._stable_hash({"version": "resume-test", "facts": [f.id for f in facts],
+                            "_model_id": job.model_id, "_fake_model": job.fake_model}),
+        )
+        assert [item["status"] for item in parent["attempts"]] == ["failed", "succeeded"]
+        assert a._run_json_step(**step_args) == resumed_plan
+        assert resume_client.calls == 3, "successful parent and repair must be reused"
+        child = next(item for item in storage.list_artifact_job_steps(job.id)
+                     if item["stage"] == "global_plan_coverage" and item["step_index"] == 2)
+        assert [item["status"] for item in child["attempts"]] == ["failed", "succeeded"]
+        assert raw["cards"][0]["fact_ids"] == ["fact_item0"], "recovery must not mutate the plan"
         from backend.domain import StoryBeat
         bundle.story_beats = [StoryBeat(id="story_beat_one", title="Beat", summary="Situation", chapter_id="chapter_one")]
         linked = deepcopy(merged)

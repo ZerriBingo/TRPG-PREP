@@ -17,7 +17,7 @@ const cards = [card('direct', 'one', ['f1']), card('thread', 'one', ['f2']),
 const plan = {navigation_mode: 'environment', card_ids: cards.map(c => c.id), environment_card_ids: cards.map(c => c.id)};
 const beat = {id: 'beat', chapter_id: 'one', thread_ids: ['thread'], fact_ids: ['f1']};
 const context = {
-  state: {runtimeProfileId: 'daggerheart', data: {bundle: {cards, story_beats: [beat],
+  state: {runtimeProfileId: 'daggerheart', runtimeRetrieval: {cardId: null}, data: {bundle: {cards, story_beats: [beat],
     story_threads: [{id: 'thread', chapter_roles: {one: 'introduce', two: 'resolve'}, fact_ids: ['f2']}]}}},
   runtimeNarrative: {chapter: 'all', beat: 'beat'},
   currentPlan: () => plan,

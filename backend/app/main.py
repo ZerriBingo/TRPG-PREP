@@ -21,7 +21,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 import pymupdf as fitz
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -48,6 +48,7 @@ from ..domain import (
     load_profiles,
     is_handout_fact,
     validate_bundle,
+    validate_prep_selection,
     validate_session,
 )
 from .llm import make_client
@@ -180,19 +181,57 @@ def load_domain_example(example_id: str) -> ExampleBundle:
     return ExampleBundle.model_validate_json(example_path.read_text(encoding="utf-8"))
 
 
+# Stable categories for "this project cannot be opened under the current contract".
+# The bookshelf list and the open path share them so a project that cannot open is
+# never presented as healthy, and temporary request failures stay distinguishable.
+WORKSPACE_ERROR_KINDS = {
+    "model_invalid": "项目数据结构无法按当前版本读取。原始记录仍保留，可以删除或交维护者检查。",
+    "contract_incompatible": (
+        "项目含有当前板块契约不再接受的卡型或内容，无法按当前版本打开；项目内容仍保留。"
+    ),
+}
+
+
+def classify_stored_bundle(
+    raw: object, profiles: Mapping[str, object], expected_id: str
+) -> tuple[ExampleBundle | None, str | None, str]:
+    """Return (bundle, error_kind, technical_detail) for one stored project."""
+    try:
+        bundle = ExampleBundle.model_validate(raw)
+    except ValidationError as error:
+        return None, "model_invalid", str(error)[:800]
+    if bundle.id != expected_id:
+        return None, "model_invalid", (
+            f"stored workspace id {expected_id!r} does not match bundle id {bundle.id!r}"
+        )
+    try:
+        validate_bundle(bundle, profiles)
+    except DomainValidationError as error:
+        # Model-valid but the current card/board contract rejects the content.
+        return None, "contract_incompatible", str(error)[:800]
+    return bundle, None, ""
+
+
 def load_runtime_domain_example(example_id: str) -> tuple[ExampleBundle, str | None, str]:
     saved = storage.load_domain_bundle(example_id)
     if saved:
-        try:
-            saved_bundle = ExampleBundle.model_validate(saved[0])
-            validate_bundle(saved_bundle, load_profiles(DOMAIN_DIR / "profiles"))
+        saved_bundle, error_kind, detail = classify_stored_bundle(
+            saved[0], load_profiles(DOMAIN_DIR / "profiles"), example_id
+        )
+        if error_kind is None:
             return saved_bundle, saved[1], "saved"
-        except (DomainValidationError, ValidationError) as error:
-            example_path = DOMAIN_DIR / "examples" / f"{example_id}.json"
-            if not example_path.is_file():
-                raise HTTPException(422, f"书架工作区数据无效: {error}") from error
-            # 种子覆盖存档可能落后于 schema/profile 演进；回退到种子包。
-            return load_domain_example(example_id), None, "invalid"
+        example_path = DOMAIN_DIR / "examples" / f"{example_id}.json"
+        if not example_path.is_file():
+            raise HTTPException(
+                422,
+                detail={
+                    "code": error_kind,
+                    "message": WORKSPACE_ERROR_KINDS[error_kind],
+                    "detail": detail,
+                },
+            )
+        # 种子覆盖存档可能落后于 schema/profile 演进；回退到种子包。
+        return load_domain_example(example_id), None, "invalid"
     return load_domain_example(example_id), None, "seed"
 
 
@@ -232,7 +271,28 @@ class ConfigIn(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     fake: bool | None = None
+
+
+# Only values an upstream is likely to accept.  "none" and other spellings are rejected
+# by at least one upstream with HTTP 400, which would fail every call.
+REASONING_EFFORT_VALUES = ("", "low", "medium", "high")
+
+
+def _config_response(cfg: dict) -> dict:
+    return {"base_url": cfg["base_url"], "model": cfg["model"],
+            "reasoning_effort": cfg["reasoning_effort"], "fake": cfg["fake"],
+            "has_key": bool(cfg["api_key"])}
+
+
+class PrepSelectionIn(BaseModel):
+    """One board's preparation selection: approved card ids, nothing else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: str = Field(min_length=1, max_length=100)
+    card_ids: list[str] = Field(default_factory=list, max_length=500)
 
 
 class WorkspaceRenameIn(BaseModel):
@@ -473,16 +533,16 @@ def _upload_item(relative: str) -> dict:
 
 @app.get("/api/config")
 def get_config():
-    cfg = storage.get_config()
-    return {"base_url": cfg["base_url"], "model": cfg["model"], "fake": cfg["fake"],
-            "has_key": bool(cfg["api_key"])}
+    return _config_response(storage.get_config())
 
 
 @app.put("/api/config")
 def put_config(body: ConfigIn):
-    cfg = storage.set_config(body.model_dump(exclude_none=True))
-    return {"base_url": cfg["base_url"], "model": cfg["model"], "fake": cfg["fake"],
-            "has_key": bool(cfg["api_key"])}
+    if body.reasoning_effort is not None and body.reasoning_effort not in REASONING_EFFORT_VALUES:
+        raise HTTPException(
+            422, "reasoning_effort 只支持 low / medium / high，留空表示不发送该参数"
+        )
+    return _config_response(storage.set_config(body.model_dump(exclude_none=True)))
 
 
 @app.get("/api/models")
@@ -686,24 +746,32 @@ def get_domain_workspaces():
     workspaces: dict[str, dict] = {}
     # Seed bundles remain in the repository for automated fixtures, but are
     # intentionally absent from the user bookshelf.
-    for raw_bundle, updated_at in storage.list_domain_bundles():
-        validation_error = None
-        try:
-            bundle = ExampleBundle.model_validate(raw_bundle)
-        except ValidationError:
-            # A broken downstream structure must not hide an existing bookshelf.
-            workspace_id = raw_bundle.get("id")
-            if not isinstance(workspace_id, str) or workspace_id in SEED_DOMAIN_WORKSPACES:
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    for stored_id, raw_bundle, updated_at in storage.list_domain_bundles_with_ids():
+        bundle, error_kind, error_detail = classify_stored_bundle(
+            raw_bundle, profiles, stored_id
+        )
+        if error_kind is not None:
+            # The row id is the project identity. A damaged data body must not hide
+            # an existing project that can still be opened by that id (and refused
+            # with the same category), so the record survives even without body fields.
+            if stored_id in SEED_DOMAIN_WORKSPACES:
                 continue
-            workspaces[workspace_id] = {
-                "id": workspace_id,
-                "name": str(raw_bundle.get("name") or workspace_id),
-                "description": str(raw_bundle.get("description") or ""),
-                "kind": "prep" if workspace_id.startswith("prep_job_") else "saved",
+            body_name = raw_bundle.get("name") if isinstance(raw_bundle, dict) else None
+            body_description = (
+                raw_bundle.get("description") if isinstance(raw_bundle, dict) else None
+            )
+            workspaces[stored_id] = {
+                "id": stored_id,
+                "name": str(body_name) if isinstance(body_name, str) and body_name.strip() else stored_id,
+                "description": str(body_description or ""),
+                "kind": "prep" if stored_id.startswith("prep_job_") else "saved",
                 "updated_at": updated_at,
                 "can_rename": False,
                 "can_delete": True,
-                "validation_error": "工作区数据需要修复；事实记录仍保留，请勿重复送入书架。",
+                "validation_error": WORKSPACE_ERROR_KINDS[error_kind],
+                "validation_kind": error_kind,
+                "validation_detail": error_detail,
             }
             continue
         if bundle.id in SEED_DOMAIN_WORKSPACES:
@@ -723,7 +791,9 @@ def get_domain_workspaces():
             "updated_at": updated_at,
             "can_rename": kind != "seed",
             "can_delete": kind != "seed",
-            "validation_error": validation_error,
+            "validation_error": None,
+            "validation_kind": None,
+            "validation_detail": "",
         }
     return {
         "workspaces": sorted(
@@ -1784,6 +1854,39 @@ def reset_domain_session(example: str):
     return {"ok": True}
 
 
+@app.put("/api/domain/examples/{example}/prep-selection")
+def save_domain_prep_selection(example: str, body: PrepSelectionIn):
+    """Save one board's preparation selection and nothing else.
+
+    The bundle is re-read here and only this field is replaced, so a client holding an
+    older copy cannot overwrite plans, cards, or session state with a stale payload.
+    """
+    bundle, _, _ = load_runtime_domain_example(example)
+    profiles = load_profiles(DOMAIN_DIR / "profiles")
+    try:
+        card_ids = validate_prep_selection(bundle, profiles, body.profile_id, body.card_ids)
+    except DomainValidationError as error:
+        raise HTTPException(422, str(error)) from error
+    # Atomic single-path update: two boards saved at the same time both survive, and a
+    # concurrent bundle write cannot revert the selection.
+    updated_at = storage.update_domain_bundle_prep_selection(
+        example, body.profile_id, card_ids
+    )
+    if updated_at is None:
+        # Seed insertion must not overwrite a row created by another request. The
+        # same atomic updater applies this board after ensuring the row exists.
+        updated_at = storage.update_domain_bundle_prep_selection(
+            example, body.profile_id, card_ids,
+            seed_bundle=bundle.model_dump(mode="json", by_alias=True),
+        )
+    return {
+        "ok": True,
+        "saved_at": updated_at,
+        "profile_id": body.profile_id,
+        "card_ids": card_ids,
+    }
+
+
 @app.put("/api/domain/examples/{example}/bundle")
 def save_domain_bundle(example: str, bundle: ExampleBundle):
     if bundle.id != example:
@@ -1806,6 +1909,8 @@ def save_domain_bundle(example: str, bundle: ExampleBundle):
                 409,
                 "运行场景已经组装并锁定；请删除该场景后重新组装，不能直接编辑场景计划",
             )
+        # Preparation selections are written only through their own endpoint; the
+        # storage layer keeps the stored value even if this payload is stale.
     try:
         validate_bundle(bundle, profiles)
     except DomainValidationError as error:

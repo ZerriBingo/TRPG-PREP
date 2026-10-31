@@ -63,12 +63,16 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
             materialized.append(messages)
             assert payload(messages, "ORIGINAL_FACTS_JSON") == facts
             assert payload(messages, "CARD_PLAN_JSON") == plan
-            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v8"
+            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v13"
             system = messages[0]["content"]
             assert "source_statistics, when supported, is a concise string quoting only supplied source information" in system
             assert "Every factual field must cite one or more fact_ids" in system
             assert "Every required field listed below MUST be present and non-empty" in system
             assert "Never use that exception for factual claims" in system
+            assert "assumed_state is one concise declarative sentence" in system
+            assert "table_questions holds two to four short prompts" in system
+            assert "usable_features holds two to five named features" in system
+            assert "Begin environment_type with one scene rhythm" in system
 
         for messages in [local, scoped, unscoped, direct, *materialized]:
             system = messages[0]["content"]
@@ -78,7 +82,8 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
                 "without a supported evolving pressure", "factual triggers and consequences require",
                 "Distinguish source play reports and examples from default current state",
                 "Do not promote reported player choices", "Keep example outcomes conditional",
-                "record the uncertainty in open_questions", "Preserve reusable actionable capabilities",
+                "state what the material assumes in assumed_state",
+                "never turn them into review questions", "Preserve reusable actionable capabilities",
                 "triggers, limits, costs, and counterplay", "A fact ID alone is not coverage",
                 "reflect it in appropriate declared", "do not invent or convert statistics",
                 "Do not set current_stage from a play report's completed outcome",
@@ -86,20 +91,26 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
                 assert requirement in system, (profile_id, messages[1]["content"].splitlines()[0], requirement)
         assert payload(local, "LOCAL_FACTS_JSON") == facts
         assert payload(direct, "REVIEWED_FACTS_JSON") == facts
-        assert payload(local, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v8"
+        assert payload(local, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v13"
         for messages in (scoped, unscoped):
-            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-global-plan-v14"
+            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-global-plan-v18"
         # Problems 2 and 4: the planner must declare one situation per
         # environment card and mark how the material relates to the opening.
         assert "situation, and case_scope" in scoped[0]["content"]
         if profile.runtime_navigation_mode == "environment":
             assert "exactly one playable situation" in scoped[0]["content"]
             assert "Set case_scope on every card" in scoped[0]["content"]
+            # Runtime groups must stay canonical, so one situation keeps one key and the
+            # planning scope never leaks into a name. The key must also be ASCII: a Chinese
+            # name cannot be slugged and collapses to a placeholder identifier.
+            assert "reuse one canonical name across chapters" in scoped[0]["content"]
+            assert "never a campaign-wide theme" in scoped[0]["content"]
+            assert "short lowercase ASCII key joined by underscores" in scoped[0]["content"]
         assert payload(scoped, "REVIEWED_STRUCTURE_JSON") == structure
         assert "THIS request generates ONLY REVIEWED_STRUCTURE_JSON.chapters" in scoped[0]["content"]
 
-assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v8"
-assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v14"
+assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v13"
+assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v18"
 
 handouts = [fact.model_copy(update={"id": name, "kind": "handout"}) for name in (
     "letter", "asset", "unassigned", "reference", "candidate", "outside_scope",
