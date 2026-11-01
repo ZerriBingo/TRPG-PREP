@@ -1,6 +1,8 @@
 # Reassessment - 2026-08-31
 
-Status: active implementation direction, reviewed 2026-09-03.
+Status: active implementation direction, reviewed 2026-09-03; fantasy/adventure direction recorded 2026-09-13.
+
+The owner-confirmed product goals, preparation-time target, and ruleset boundaries are recorded in `PRODUCT_GUARDRAILS.md` under the sections dated 2026-10-31. Those decisions take precedence over conflicting earlier direction; implementation and release claims below remain historical evidence until revalidated. Current maintenance order and acceptance references are in `IMPLEMENTATION_BACKLOG.md`; the implementation order below describes the earlier board slices.
 
 ## Product Boundary
 
@@ -23,10 +25,21 @@ Status: active implementation direction, reviewed 2026-09-03.
 - NPC, threat, and clock cards remain available where their independent table-side value justifies them.
 - Display materials retain source pages and may be referenced from location/overview cards. The application does not crop or save user screenshots.
 
+## Fantasy/Adventure Artifacts
+
+- Preparation is organized around narrative function rather than separate combat, travel, or world-map products. `environment` is the primary runtime surface: exploration, social interaction, traversal, combat, and events may all be led by one card, and a situation that moves between those modes does not become several duplicate cards.
+- An environment card carries the scene's pressure, changing conditions, tactical and narrative prompts, and escalation cues. Adversary and clock cards are read alongside it as optional retrieval links and are never a preassembled encounter.
+- `npc`, `enemy`, and `encounter_clock` stay available where their independent table-side value justifies them. Travel and transition material is optional, supports detours, and never encodes a mandatory route.
+- Source statistics are preserved only as cited source material. Cross-board conversion is a GM-reviewable suggestion, never an automatic rewrite; the board does not generate replacement combat statistics or balance encounters automatically.
+- Character-specific connections initially appear as questions or unresolved preparation prompts. A later party-context input may answer them without turning character details into source facts.
+- Long-form preparation uses reviewed adventure chapters and cross-chapter story threads. Structure is proposed after fact review through bounded local observations and global consolidation, never from page cuts. Once the structure is approved, one artifact build covers every approved chapter: chapter-sized internal planning bounds each model request, while cross-chapter threads and fact dispositions stay visible to every scope.
+- Beats are chapter-local combinations of applicable story threads. The product does not classify threads as main or sub, and does not ask the user to assemble chapters or beats by hand.
+
 ## Runtime
 
 - Runtime is location-led and non-linear. A current location can lead play; triggers may be unhandled, active, or resolved without rewriting the approved artifact.
 - Location granularity belongs to semantic whole-board planning and should be judged by investigation, interaction, help-seeking, revisit, clue, and event value.
+- Reality-horror runtime is location-led and keeps non-linear exploration optional; fantasy/adventure runtime is environment-led. Neither infers a mandatory route from page order.
 
 ## Runtime UI Principles
 
@@ -38,11 +51,19 @@ Status: active implementation direction, reviewed 2026-09-03.
 
 ## Implementation Order
 
-1. Complete the location/overview artifact contract and location-led runtime flow.
-2. Audit existing interfaces against current preparation and table-side workflows; simplify or remove surfaces that do not earn their complexity.
-3. Finish display-material embedding in the artifact and runtime workflows.
-4. Run offline contract tests and browser smoke tests without invoking a real long-running upstream task.
-5. Ask the GM to run a fresh small reality-horror project, then the p96-p180 chapter, and report omissions and table-side retrieval friction.
+Reality-horror, satisfied by 0.1.4 and 0.1.5a0:
+
+1. The location/overview artifact contract and the location-led runtime flow are implemented and released.
+2. The interface audit continues as maintenance; surfaces that do not earn their complexity are removed rather than carried.
+3. Display-material embedding is implemented in the artifact and runtime workflows.
+4. Offline contract tests and browser smoke tests run without invoking a real long-running upstream task.
+5. The GM ran fresh reality-horror projects and reported omissions and table-side retrieval friction; the single-chapter runtime gate is established.
+
+Fantasy/adventure, current slice:
+
+6. Review facts, then propose and confirm the adventure structure: chapters, cross-chapter story threads, chapter-local beats, and one explicit disposition for every promoted fact.
+7. Generate every approved chapter in one artifact build, then review the result before anything reaches runtime.
+8. Ask the GM to run the resulting short adventure at the table and report which prepared situations, motives, and pressures were usable.
 
 ## Skill Routing
 

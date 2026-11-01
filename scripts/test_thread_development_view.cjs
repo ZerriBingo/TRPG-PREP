@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const source = fs.readFileSync(path.join(__dirname, '../frontend/workbench.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../frontend/workbench.js'), 'utf8').replace(/\r\n/g, '\n');
 const names = ['beatThreadDevelopmentHtml', 'storyThreadRoleLabel', 'chapterThreadDistributionHtml'];
 const functions = names.map(name => {
   const start = source.indexOf(`function ${name}(`);
@@ -20,6 +20,7 @@ const context = {thread, first, second, outside};
 vm.createContext(context);
 const escapeStart = source.indexOf('const esc =');
 const escapeEnd = source.indexOf('\n\n', escapeStart);
+assert(escapeStart >= 0 && escapeEnd > escapeStart, 'escape helper must be isolated from application startup');
 vm.runInContext(source.slice(escapeStart, escapeEnd) + '\n' + functions, context);
 const html = vm.runInContext('chapterThreadDistributionHtml({id:"one"}, [thread], [first, second, outside])', context);
 assert(html.includes('A contradiction emerges') && html.includes('A rival offers evidence'));

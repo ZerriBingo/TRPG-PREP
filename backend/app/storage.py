@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,16 +299,59 @@ def file_sha256(path: Path) -> str:
 # ---------- 领域运行包 ----------
 
 def save_domain_bundle(bundle_id: str, data: dict) -> str:
+    """Persist a bundle, keeping the preparation selections stored right now.
+
+    Selections belong to their own updater. Taking the stored value inside the statement
+    means a whole-bundle write that started from an older read cannot revert a selection
+    that landed meanwhile. A new row keeps whatever the payload carries.
+    """
     updated_at = now()
     conn = _conn()
     conn.execute(
         "INSERT INTO domain_bundles (id, data, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+        "ON CONFLICT(id) DO UPDATE SET "
+        "data = json_set("
+        "  excluded.data, '$.prep_selections',"
+        "  COALESCE(json_extract(domain_bundles.data, '$.prep_selections'), json('{}'))"
+        "), updated_at = excluded.updated_at",
         (bundle_id, json.dumps(data, ensure_ascii=False), updated_at),
     )
     conn.commit()
     conn.close()
     return updated_at
+
+
+def update_domain_bundle_prep_selection(
+    bundle_id: str, profile_id: str, card_ids: list[str], *, seed_bundle: dict | None = None
+) -> str | None:
+    """Atomically replace one board's preparation selection on the current row.
+
+    A single UPDATE on one JSON path, so two boards saved at the same time cannot
+    overwrite each other and a concurrent bundle write cannot lose the selection.
+    Returns None when the project has no stored row yet. A supplied seed is inserted
+    only if absent, in the same transaction, before updating the selected board.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", profile_id):
+        raise ValueError("invalid board id")
+    updated_at = now()
+    conn = _conn()
+    if seed_bundle is not None:
+        conn.execute(
+            "INSERT INTO domain_bundles (id, data, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            (bundle_id, json.dumps(seed_bundle, ensure_ascii=False), updated_at),
+        )
+    cursor = conn.execute(
+        "UPDATE domain_bundles SET data = json_set("
+        "  data, '$.prep_selections',"
+        "  json_set(COALESCE(json_extract(data, '$.prep_selections'), json('{}')), ?, json(?))"
+        "), updated_at = ? WHERE id = ?",
+        (f'$."{profile_id}"', json.dumps(card_ids), updated_at, bundle_id),
+    )
+    changed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated_at if changed else None
 
 
 def load_domain_bundle(bundle_id: str) -> tuple[dict, str] | None:
@@ -319,13 +363,22 @@ def load_domain_bundle(bundle_id: str) -> tuple[dict, str] | None:
     return (json.loads(row["data"]), row["updated_at"]) if row else None
 
 
-def list_domain_bundles() -> list[tuple[dict, str]]:
+def list_domain_bundles_with_ids() -> list[tuple[str, dict, str]]:
+    """Return (stored id, data, updated_at). The row id is the project identity, so a
+    damaged data body cannot make an existing project disappear from the bookshelf."""
     conn = _conn()
     rows = conn.execute(
-        "SELECT data, updated_at FROM domain_bundles ORDER BY updated_at DESC, id ASC"
+        "SELECT id, data, updated_at FROM domain_bundles ORDER BY updated_at DESC, id ASC"
     ).fetchall()
     conn.close()
-    return [(json.loads(row["data"]), row["updated_at"]) for row in rows]
+    return [(row["id"], json.loads(row["data"]), row["updated_at"]) for row in rows]
+
+
+def list_domain_bundles() -> list[tuple[dict, str]]:
+    return [
+        (data, updated_at)
+        for _bundle_id, data, updated_at in list_domain_bundles_with_ids()
+    ]
 
 
 def delete_domain_bundle(bundle_id: str) -> bool:
@@ -1176,6 +1229,10 @@ def get_config() -> dict:
         "base_url": cfg.get("base_url", "https://api.deepseek.com"),
         "api_key": cfg.get("api_key", ""),
         "model": cfg.get("model", "deepseek-chat"),
+        # Optional reasoning-effort hint for upstreams that accept one.  Empty means the
+        # parameter is not sent at all: an upstream that does not recognise a value
+        # rejects the whole request with HTTP 400, which is how "none" behaves.
+        "reasoning_effort": cfg.get("reasoning_effort", ""),
         "fake": cfg.get("fake", "1").strip().lower() in {"1", "true", "yes", "on"},
     }
 

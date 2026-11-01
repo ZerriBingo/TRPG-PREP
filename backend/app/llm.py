@@ -36,10 +36,37 @@ class _Retry(Exception):
 
 
 RETRY_STATUSES = {429, 502, 503, 524}
-RETRY_ATTEMPTS = 1
+# A rate-limited or overloaded upstream is a transient condition that states its own remedy, so
+# the call is retried.  A single attempt made the retry branch below unreachable — the condition
+# `attempt < RETRY_ATTEMPTS - 1` could never hold — which is why a 429 asking for a ten-second
+# wait failed a whole source window instead.
+RETRY_ATTEMPTS = 3
+MAX_RETRY_WAIT = 60.0
+# Seconds one upstream call may take when the caller does not say.  The worker applies the
+# same default, so a change here has to be mirrored in llm_worker.py.
+DEFAULT_READ_TIMEOUT = 240
 
 
-def _retry_delay(attempt: int, status: int = 0) -> float:
+def _retry_after(out: dict) -> float | None:
+    """Read the wait an upstream asked for, when it states one.
+
+    A rate limit arrives as {"error": {"message": ..., "retry_after": 10}} in the body, and no
+    Retry-After header reaches the caller, so the body is where to look.
+    """
+    header = str(out.get("retry_after") or "").strip()
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass
+    match = re.search(r'"retry_after"\s*:\s*([0-9]+(?:\.[0-9]+)?)', str(out.get("body") or ""))
+    return float(match.group(1)) if match else None
+
+
+def _retry_delay(attempt: int, status: int = 0, retry_after: float | None = None) -> float:
+    if retry_after is not None:
+        # Wait what the upstream asked for, within reason.
+        return max(0.0, min(retry_after, MAX_RETRY_WAIT))
     # 524 是网关上游长请求超时（常因模型首 token 慢），多等一会再重试。
     base = 3.0 if status == 524 else 2.0
     return base * (attempt + 1)  # base*1..base*4
@@ -180,6 +207,11 @@ class LLMClient:
         self.base_url = cfg["base_url"].rstrip("/")
         self.api_key = cfg["api_key"]
         self.model = cfg["model"]
+        # Optional; empty means the parameter is not sent, because an upstream that does
+        # not recognise a value rejects the whole request with HTTP 400.
+        self.reasoning_effort = str(cfg.get("reasoning_effort") or "")
+        # Why the last reply could be empty; see chat().
+        self.last_finish_reason: str | None = None
 
     def _url(self) -> str:
         return chat_url(self.base_url)
@@ -194,12 +226,17 @@ class LLMClient:
         payload = {
             "base_url": self.base_url, "api_key": self.api_key, "model": self.model,
             "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
-            "stream": stream,
+            "stream": stream, "reasoning_effort": self.reasoning_effort,
         }
         if request_timeout is not None:
             payload["request_timeout"] = request_timeout
         script = Path(__file__).with_name("llm_worker.py")
-        subprocess_timeout = max(float(request_timeout or 120), 1.0) + 10.0
+        # The parent must outwait the worker.  The worker allows itself
+        # max(request_timeout or DEFAULT_READ_TIMEOUT) seconds to read the reply, so a
+        # shorter parent timeout kills a call that is still inside its own budget and
+        # reports a timeout the upstream never caused.  A 120-second default here did
+        # exactly that to every long analysis request.
+        subprocess_timeout = max(float(request_timeout or DEFAULT_READ_TIMEOUT), 1.0) + 30.0
         proc = subprocess.run(
             [sys.executable, str(script)], input=json.dumps(payload),
             capture_output=True, text=True, timeout=subprocess_timeout,
@@ -273,15 +310,53 @@ class LLMClient:
                 if out.get("error"):
                     status = out.get("status")
                     if status in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1:
-                        time.sleep(_retry_delay(attempt, status or 0))
+                        time.sleep(_retry_delay(attempt, status or 0, _retry_after(out)))
                         continue
                     raise RuntimeError(self._format_worker_error(out))
-                return out["content"]
+                content = out.get("content")
+                self.last_finish_reason = out.get("finish_reason")
+                if (
+                    self.reasoning_effort
+                    and (content is None or not str(content).strip())
+                    and self.last_finish_reason == "length"
+                ):
+                    # The upstream could not honour the configured reasoning budget, so the
+                    # model spent the whole reply thinking and produced nothing.  Which
+                    # model the user runs is their choice and must never break the run, so
+                    # drop the hint for this client and repeat the call straight away.
+                    # RETRY_ATTEMPTS is 1, so this retry must happen here and not via the
+                    # loop's continue.
+                    print(
+                        "推理档位在该模型上无法满足，已自动忽略该档位并重试本次请求。",
+                        flush=True,
+                    )
+                    self.reasoning_effort = ""
+                    out = self._worker_call(
+                        messages,
+                        temperature,
+                        max_tokens,
+                        stream=False,
+                        request_timeout=request_timeout,
+                    )
+                    if out.get("error"):
+                        raise RuntimeError(self._format_worker_error(out))
+                    content = out.get("content")
+                    self.last_finish_reason = out.get("finish_reason")
+                if content is None:
+                    # Some upstreams answer with a null content field — a reasoning-only
+                    # or tool-call-only message.  Returning None here made chat_json
+                    # crash on `None.strip()`, so the caller saw an AttributeError
+                    # instead of the empty-response message it already knows how to
+                    # report.  Treat it as empty text.
+                    return ""
+                return str(content)
             except subprocess.TimeoutExpired:
                 if attempt < RETRY_ATTEMPTS - 1:
                     time.sleep(_retry_delay(attempt))
                     continue
-                timeout_label = request_timeout if request_timeout is not None else 120
+                timeout_label = (
+                    request_timeout if request_timeout is not None else DEFAULT_READ_TIMEOUT
+                )
                 raise RuntimeError(
                     f"API 请求超时（{timeout_label}s）\nURL: {self._url()}"
                 )
@@ -298,6 +373,13 @@ class LLMClient:
             # 非流式：curl_cffi 流式在 uvicorn 线程里会卡，非流式稳定
             text = self.chat(working_messages, **kw)
             if not text.strip():
+                if self.last_finish_reason == "length":
+                    # Retrying cannot help: the budget itself is the cause.  A reasoning
+                    # model spends max_tokens thinking before it writes any content.
+                    raise RuntimeError(
+                        "上游在开始输出正文前用尽了 max_tokens（finish_reason=length）。"
+                        "该模型会先进行推理，请提高 max_tokens，或改用不会推理的模型。"
+                    )
                 if _ == 0:
                     continue
                 raise RuntimeError(
@@ -458,7 +540,7 @@ def _fake_consolidation_output(messages: list[dict]) -> dict:
 
 def _fake_artifact_output(messages: list[dict]) -> dict:
     content = "\n".join(str(message.get("content", "")) for message in messages)
-    profile_match = re.search(r"^TARGET_PROFILE_JSON=(.+)$", content, re.MULTILINE)
+    profile_match = re.search(r"^BOARD_PROFILE_JSON=(.+)$", content, re.MULTILINE)
     facts_match = re.search(r"^REVIEWED_FACTS_JSON=(.+)$", content, re.MULTILINE)
     profile = json.loads(profile_match.group(1)) if profile_match else {}
     facts = json.loads(facts_match.group(1)) if facts_match else []
@@ -554,7 +636,7 @@ def _fake_local_digest_output(messages: list[dict]) -> dict:
 
 def _fake_global_plan_output(messages: list[dict]) -> dict:
     content = "\n".join(str(message.get("content", "")) for message in messages)
-    profile_match = re.search(r"^TARGET_PROFILE_JSON=(.+)$", content, re.MULTILINE)
+    profile_match = re.search(r"^BOARD_PROFILE_JSON=(.+)$", content, re.MULTILINE)
     units_match = re.search(r"^GLOBAL_UNITS_JSON=(.+)$", content, re.MULTILINE)
     sizes_match = re.search(r"^FACT_INPUT_CHARS_JSON=(.+)$", content, re.MULTILINE)
     tokens_match = re.search(r"^FACT_INPUT_TOKENS_JSON=(.+)$", content, re.MULTILINE)

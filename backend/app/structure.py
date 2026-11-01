@@ -10,7 +10,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from . import artifacts, storage
+from . import storage
+from .fact_input import fact_batches, fact_payload as project_fact_payload
+from .persistent_step import run_json_step
 from .llm import make_client
 from ..domain import (
     AdventureChapter,
@@ -25,7 +27,7 @@ from ..domain.models import ExampleBundle
 from ..domain.prep import ThreadDevelopment
 
 
-STRUCTURE_PROMPT_VERSION = "adventure-structure-v6"
+STRUCTURE_PROMPT_VERSION = "adventure-structure-v7"
 STRUCTURE_MAX_TOKENS = 8000
 MAX_CHAPTERS = 24
 MAX_THREADS = 60
@@ -420,6 +422,12 @@ def _assignment_messages(
                 "chapter size. Actionable leads, NPC motives, investigable locations, threats, and "
                 "situation changes must belong to all applicable chapters. Pure setting background, "
                 "general rules commentary, and non-actionable context may remain global_reference. "
+                "Facts that describe the module itself rather than its fiction — design goals, "
+                "revision notes, creator commentary, or instructions for how the GM should prepare "
+                "and run the campaign — are not a playable chapter: assign them global_reference and "
+                "never create a chapter key for preparation guidance alone, even when several such "
+                "facts share a topic. Every chapter must contain material the PCs can encounter in "
+                "play. "
                 "A reusable actionable fact can belong to multiple chapters. "
                 "Item capabilities that unlock clues, change investigative choices, or erase "
                 "knowledge are actionable, not merely general rules. Preserve actual-play examples "
@@ -454,6 +462,75 @@ def _assignment_messages(
     ]
 
 
+class StructureAssignmentClosureError(StructureGenerationError):
+    """A batch came back without covering every fact it was given.
+
+    Carries the assignments that did arrive, so the caller can keep them and ask only
+    for the facts that are missing.
+    """
+
+    def __init__(self, message: str, *, missing: list[str], partial: list[dict[str, Any]]):
+        super().__init__(message)
+        self.missing = missing
+        self.partial = partial
+
+
+def _recover_assignments(
+    job: Any,
+    client: Any,
+    skeleton: dict[str, Any],
+    batch: list[Any],
+    index: int,
+    batch_count: int,
+    error: StructureAssignmentClosureError,
+) -> list[dict[str, Any]]:
+    """Keep what a batch assigned, ask once for what it missed, then defer the rest.
+
+    A cheaper model can leave part of a batch unassigned.  Losing an otherwise complete
+    build over a handful of facts is worse than repairing them, and anything still
+    unassigned is deferred with a stated reason rather than disappearing silently.
+    """
+    by_id = {fact.id: fact for fact in batch}
+    recovered = [item for item in error.partial if item["fact_id"] in by_id]
+    assigned = {item["fact_id"] for item in recovered}
+    missing = [by_id[fid] for fid in error.missing if fid in by_id and fid not in assigned]
+    if missing:
+        payload = project_fact_payload(missing)
+        try:
+            output = run_json_step(
+                job,
+                stage="structure_assign_repair",
+                step_index=index,
+                input_payload={
+                    "version": STRUCTURE_PROMPT_VERSION,
+                    "skeleton": skeleton,
+                    "facts": payload,
+                    "repair": "closure",
+                },
+                input_refs={"fact_ids": [fact.id for fact in missing]},
+                messages=_assignment_messages(payload, skeleton, index, batch_count),
+                client=client,
+                max_tokens=STRUCTURE_MAX_TOKENS,
+                validator=lambda raw, owned=missing: _validate_assignments(raw, owned, skeleton),
+            )
+            recovered.extend(output["assignments"])
+        except Exception:  # noqa: BLE001
+            pass
+    assigned = {item["fact_id"] for item in recovered}
+    for fact in batch:
+        if fact.id not in assigned:
+            recovered.append({
+                "fact_id": fact.id,
+                "kind": "deferred",
+                "chapter_keys": [],
+                "thread_keys": [],
+                "reason": "模型未给出结构归属，已自动暂缓以便复核",
+            })
+    order = {fact.id: position for position, fact in enumerate(batch)}
+    recovered.sort(key=lambda item: order.get(item["fact_id"], 0))
+    return recovered
+
+
 def _validate_assignments(
     raw: Any,
     batch_facts: list[Any],
@@ -465,13 +542,6 @@ def _validate_assignments(
         payload = FactAssignmentPayload.model_validate(raw)
     except ValidationError as error:
         raise StructureGenerationError(f"事实结构归属 JSON 不符合约定: {error}") from error
-    actual = [item.fact_id for item in payload.assignments]
-    if len(actual) != len(set(actual)) or set(actual) != expected:
-        missing = sorted(expected - set(actual))
-        extra = sorted(set(actual) - expected)
-        raise StructureGenerationError(
-            f"事实结构归属不闭合: missing={missing[:20]}, extra={extra[:20]}"
-        )
     chapter_keys = {item["key"] for item in skeleton["chapters"]}
     thread_keys = {item["key"] for item in skeleton["threads"]}
     assignments: list[dict[str, Any]] = []
@@ -494,6 +564,19 @@ def _validate_assignments(
         if data["kind"] == "deferred" and not data["reason"].strip():
             raise StructureGenerationError(f"暂缓事实缺少理由: {item.fact_id}")
         assignments.append(data)
+    # Closure is checked last on purpose.  A weaker model can leave part of a batch out,
+    # and checking first threw away the assignments that did arrive, so a handful of
+    # missing facts cost the whole batch instead of being repaired.
+    returned = [item.fact_id for item in payload.assignments]
+    kept = [item["fact_id"] for item in assignments]
+    missing = sorted(expected - set(kept))
+    extra = sorted(set(returned) - expected)
+    if missing or extra or len(kept) != len(set(kept)):
+        raise StructureAssignmentClosureError(
+            f"事实结构归属不闭合: missing={missing[:20]}, extra={extra[:20]}",
+            missing=missing,
+            partial=assignments,
+        )
     return {"assignments": assignments}
 
 
@@ -624,7 +707,7 @@ def execute_structure_job(job_id: str) -> None:
         ]
         if not facts:
             raise StructureGenerationError("书架没有可整理的已提升事实")
-        batches = artifacts._fact_batches(facts)
+        batches = fact_batches(facts, error_factory=StructureGenerationError)
         client = make_client(model_id=job.model_id, force_fake=job.fake_model)
         job = _save_job(
             job,
@@ -638,8 +721,8 @@ def execute_structure_job(job_id: str) -> None:
         observations: list[dict[str, Any]] = []
         job = _save_job(job, phase="local_observations")
         for index, batch in enumerate(batches, start=1):
-            fact_payload = artifacts._fact_payload_from_facts(batch)
-            output = artifacts._run_json_step(
+            fact_payload = project_fact_payload(batch)
+            output = run_json_step(
                 job,
                 stage="structure_local",
                 step_index=index,
@@ -654,7 +737,7 @@ def execute_structure_job(job_id: str) -> None:
             job = _save_job(_job_from_store(job.id), completed_batches=index)
         allowed_ids = {fact.id for fact in facts}
         job = _save_job(_job_from_store(job.id), phase="consolidating")
-        skeleton = artifacts._run_json_step(
+        skeleton = run_json_step(
             job,
             stage="structure_consolidate",
             step_index=1,
@@ -675,23 +758,29 @@ def execute_structure_job(job_id: str) -> None:
             beat_count=len(skeleton["beats"]),
         )
         for index, batch in enumerate(batches, start=1):
-            fact_payload = artifacts._fact_payload_from_facts(batch)
-            output = artifacts._run_json_step(
-                job,
-                stage="structure_assign",
-                step_index=index,
-                input_payload={
-                    "version": STRUCTURE_PROMPT_VERSION,
-                    "skeleton": skeleton,
-                    "facts": fact_payload,
-                },
-                input_refs={"fact_ids": [fact.id for fact in batch]},
-                messages=_assignment_messages(fact_payload, skeleton, index, len(batches)),
-                client=client,
-                max_tokens=STRUCTURE_MAX_TOKENS,
-                validator=lambda raw, owned=batch: _validate_assignments(raw, owned, skeleton),
-            )
-            assignments.extend(output["assignments"])
+            fact_payload = project_fact_payload(batch)
+            try:
+                output = run_json_step(
+                    job,
+                    stage="structure_assign",
+                    step_index=index,
+                    input_payload={
+                        "version": STRUCTURE_PROMPT_VERSION,
+                        "skeleton": skeleton,
+                        "facts": fact_payload,
+                    },
+                    input_refs={"fact_ids": [fact.id for fact in batch]},
+                    messages=_assignment_messages(fact_payload, skeleton, index, len(batches)),
+                    client=client,
+                    max_tokens=STRUCTURE_MAX_TOKENS,
+                    validator=lambda raw, owned=batch: _validate_assignments(raw, owned, skeleton),
+                )
+                recovered = output["assignments"]
+            except StructureAssignmentClosureError as error:
+                recovered = _recover_assignments(
+                    job, client, skeleton, batch, index, len(batches), error
+                )
+            assignments.extend(recovered)
             job = _save_job(_job_from_store(job.id), completed_batches=index)
         chapters, threads, beats, dispositions = _materialize_structure(
             skeleton, assignments

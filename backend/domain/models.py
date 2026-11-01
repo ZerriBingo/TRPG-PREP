@@ -619,3 +619,7 @@ class ExampleBundle(BaseModel):
     fact_dispositions: list[FactDisposition] = Field(default_factory=list)
     display_materials: list[DisplayMaterial] = Field(default_factory=list)
     plans: list[ScenePlan] = Field(default_factory=list)
+    # Board id -> the cards the GM chose for the coming session. It is a reading
+    # aid, not the run set: plan membership and runtime state never depend on it.
+    # Optional so projects saved before this field existed stay readable.
+    prep_selections: dict[str, list[str]] = Field(default_factory=dict)

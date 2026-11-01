@@ -12,18 +12,24 @@
 
 ## 当前文档
 
-1. [当前产品方向](./REASSESSMENT_2026-08-31.md)：三板块边界、现实恐怖地点卡和运行模式。
+接手维护先读 [2026-10-31 接手审查](./MAINTENANCE_2026-10-31_TAKEOVER_AUDIT.md)：当前可复用能力、数据与验证范围、R1–R7 问题及重构验收；具体实施次序维护在下面的 Backlog。
+
+R1–R7 本轮维护及[双板块验收准备](./WORKFLOW_ACCEPTANCE_REVIEW.md)已独立签收，材料见[验收包](./WORKFLOW_ACCEPTANCE_PACKAGE.md)。[隔离流程预演复审](./WORKFLOW_REHEARSAL_REVIEW.md)已记录真实 UI/Fake 的到达阶段与复现限制；工程检查与验收准备通过不代表新产物质量或真人备团时间目标已通过。
+
+1. [当前产品方向](./REASSESSMENT_2026-08-31.md)：三板块边界、现实恐怖地点卡与运行模式，以及奇幻冒险的章节、剧情线与环境卡方向。
 2. [项目上下文](../CONTEXT.md)：稳定术语、工程规则和已确认的产品判断。
 3. [实施 Backlog](./IMPLEMENTATION_BACKLOG.md)：下一步、验收闸门和停止条件。
 4. [产物契约](./ARTIFACT_CONTRACTS.md)：各板块生成什么，以及不生成什么。
-5. [产品护栏](./PRODUCT_GUARDRAILS.md)：来源追溯、模型权限和人工复核边界。
+5. [产品护栏](./PRODUCT_GUARDRAILS.md)：2026-10-31 确认的使用目标、备团时间目标与规则边界，以及来源追溯、模型权限和人工复核边界。
 6. [LLM 管线](./LLM_PIPELINE.md)：任务、尝试、失败恢复和原子写入。
 7. [模型提供商接入调研](./RESEARCH_2026-09-01_MODEL_PROVIDERS.md)：README 中外部模型接入措辞的官方依据。
 8. [语义分段维护记录](./MAINTENANCE_2026-09-03_SEMANTIC_SEGMENTS.md)：语义段、传输窗口和归并完成条件。
+9. [双板块备团验收包](./WORKFLOW_ACCEPTANCE_PACKAGE.md)：合成样例、GM 查阅问题与卡型/字段映射、演练步骤、评分表与现有自动检查覆盖范围。
 
 ## 权威层级
 
 - `CONTEXT.md` 保存稳定的领域词汇、产品原则和工程原则；它不承担逐步实现清单。
+- `PRODUCT_GUARDRAILS.md` 中 2026-10-31 确认的产品目标与规则边界优先于旧文档中的冲突表述；现有实现是否符合，仍需接手审查和实际使用验证。
 - `REASSESSMENT_2026-08-31.md` 保存当前产品方向；`ARTIFACT_CONTRACTS.md`、
   `PRODUCT_GUARDRAILS.md` 和 `LLM_PIPELINE.md` 保存当前执行契约。
 - `IMPLEMENTATION_BACKLOG.md` 只记录状态、下一步和验收，不单独创造产品规则。

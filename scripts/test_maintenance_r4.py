@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app import artifacts, prep, storage  # noqa: E402
+from backend.app.fact_input import fact_batches  # noqa: E402
 from backend.app.main import app, remove_seed_workspace_instances  # noqa: E402
 from backend.domain import (  # noqa: E402
     ExampleBundle,
@@ -139,7 +140,7 @@ async def main() -> None:
                 visibility="explicit",
             )
             try:
-                artifacts._fact_batches([huge_fact])
+                fact_batches([huge_fact], error_factory=artifacts.ArtifactGenerationError)
             except artifacts.ArtifactGenerationError as error:
                 assert "单条输入" in str(error)
             else:
