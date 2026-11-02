@@ -70,9 +70,9 @@
             <label>Base URL<input id="prep-config-base-url" type="url" required></label>
             <label>模型<input id="prep-config-model" list="prep-model-options" required></label>
             <label>API Key<input id="prep-config-api-key" type="password" autocomplete="off" placeholder="留空保留已保存密钥"></label>
-            <label>推理档位<select id="prep-config-reasoning-effort">
-              <option value="">不发送（默认）</option>
-              <option value="low">low（最省）</option>
+            <label>推理强度提示（可选）<select id="prep-config-reasoning-effort" title="仅发送给支持该参数的 Chat Completions 上游；重试时保持不变">
+              <option value="">不发送（上游默认）</option>
+              <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high">high</option>
             </select></label>
@@ -372,7 +372,7 @@
           <div id="session-log" class="session-log"></div>
         </section>
       </section>
-      <section class="panel">
+      <section class="panel runtime-notes">
         <label>本次运行总备注<textarea id="session-notes" rows="3" placeholder="记录需要回看原文的问题或下一次准备事项；不要写玩家隐私或外部数据"></textarea></label>
       </section>
     </section>

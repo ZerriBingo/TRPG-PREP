@@ -22,6 +22,7 @@ from backend.app.fact_input import (  # noqa: E402
     MAX_FACT_BATCH_CHARS,
     MAX_FACTS_PER_BATCH,
     FactInputError,
+    estimate_tokens,
     fact_batches,
     fact_payload,
 )
@@ -80,6 +81,34 @@ def check_fact_input() -> None:
         "batching must not drop or reorder facts"
     )
     assert all(len(batch) <= MAX_FACTS_PER_BATCH for batch in batches)
+
+    # A response-limited caller can request smaller transport batches without
+    # changing the default batching contract used by structure preparation.
+    small_batches = fact_batches(
+        [fact(f"fact_small_{index}", f"short fact {index}") for index in range(35)],
+        max_facts_per_batch=16,
+        max_batch_tokens=3200,
+    )
+    assert [len(batch) for batch in small_batches] == [16, 16, 3]
+    assert [item.id for batch in small_batches for item in batch] == [
+        f"fact_small_{index}" for index in range(35)
+    ]
+    assert all(len(batch) <= 16 for batch in small_batches)
+
+    size_limited = fact_batches(
+        [fact(f"fact_size_{index}", "x" * 360) for index in range(10)],
+        max_facts_per_batch=16,
+        max_batch_tokens=1000,
+    )
+    assert len(size_limited) > 1
+    assert [item.id for batch in size_limited for item in batch] == [
+        f"fact_size_{index}" for index in range(10)
+    ]
+    assert all(
+        len(batch) == 1
+        or estimate_tokens(fact_payload(batch)) <= 1000
+        for batch in size_limited
+    )
 
     # A single fact larger than one whole request keeps the caller's error type.
     huge = fact("fact_huge", "x" * (MAX_FACT_BATCH_CHARS + 10))

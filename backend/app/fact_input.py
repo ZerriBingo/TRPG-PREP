@@ -64,13 +64,24 @@ def fact_batches(
     facts: Sequence[Any],
     *,
     error_factory: Callable[[str], Exception] = FactInputError,
+    max_facts_per_batch: int | None = None,
+    max_batch_tokens: int | None = None,
 ) -> list[list[Any]]:
     """Pack facts in the given source order using the conservative tokenizer fallback.
 
+    Callers can lower the fact-count and estimated-token packing targets when a
+    downstream stage has a smaller output budget. A single fact may exceed those
+    softer targets, but it must still fit within the shared hard request ceiling.
     `error_factory` lets each caller keep its own generation error type for the one
     case this module cannot express as a batch: a single fact that exceeds a whole
     request by itself.
     """
+    fact_limit = MAX_FACTS_PER_BATCH if max_facts_per_batch is None else int(max_facts_per_batch)
+    if fact_limit < 1:
+        raise ValueError("max_facts_per_batch must be positive")
+    token_limit = MAX_FACT_BATCH_TOKENS if max_batch_tokens is None else int(max_batch_tokens)
+    if token_limit < 1 or token_limit > MAX_FACT_BATCH_TOKENS:
+        raise ValueError(f"max_batch_tokens must be between 1 and {MAX_FACT_BATCH_TOKENS}")
     batches: list[list[Any]] = []
     current: list[Any] = []
     for fact in facts:
@@ -89,8 +100,8 @@ def fact_batches(
         tokens = estimate_tokens(serialized)
         if current and (
             size > MAX_FACT_BATCH_CHARS
-            or tokens > MAX_FACT_BATCH_TOKENS
-            or len(candidate) > MAX_FACTS_PER_BATCH
+            or tokens > token_limit
+            or len(candidate) > fact_limit
         ):
             batches.append(current)
             current = [fact]

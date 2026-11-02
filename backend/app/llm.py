@@ -1,4 +1,4 @@
-"""LLM 网关：OpenAI 兼容接口（流式/JSON），未配置 key 时使用假客户端。
+"""LLM 网关：单一 OpenAI-compatible Chat Completions 适配层。
 
 假客户端（FakeLLM）按提示中的 [TASK:...] 标记返回确定性的示例 JSON，
 用于在无 API key 时跑通全流程验证。
@@ -17,8 +17,6 @@ from pathlib import Path
 import curl_cffi.requests as creq
 
 from . import storage
-
-OPENAI_CHAT_PATH = "/v1/chat/completions"
 
 # 部分中转站（new-api 类）按 User-Agent 拦截脚本/自动化客户端（ua_blocked_script_client），
 # 因此请求需携带浏览器 UA。
@@ -42,6 +40,108 @@ RETRY_STATUSES = {429, 502, 503, 524}
 # wait failed a whole source window instead.
 RETRY_ATTEMPTS = 3
 MAX_RETRY_WAIT = 60.0
+# One bounded policy for empty replies: when the caller explicitly allows it, raise
+# the output budget once while preserving the configured request parameters. A reply
+# that is still empty ends the call instead of trying silent parameter variations.
+EMPTY_RESPONSE_RECOVERIES = 1
+# One generation step may issue at most this many worker requests in total, counting
+# HTTP retries, empty-response recoveries, the plain-empty resend, the JSON correction
+# and the deterministic validation correction.  A step can span more than one logical
+# call, so the number is enforced by a RequestBudget shared by those calls rather than
+# by each call separately.
+MAX_REQUESTS_PER_STEP = 8
+
+
+class ReplyBoundaryError(RuntimeError):
+    """The upstream stopped at its output budget.
+
+    The message already says what the client observed; `reply_state` carries the one
+    fact the caller needs to describe the stop without parsing prose: ``empty`` when no
+    content string came back at all, ``truncated`` when text did arrive but the reply
+    was incomplete at the budget.
+    """
+
+    def __init__(self, message: str, *, reply_state: str) -> None:
+        super().__init__(message)
+        if reply_state not in {"empty", "truncated"}:
+            raise ValueError(f"unknown reply state: {reply_state}")
+        self.reply_state = reply_state
+
+
+class RequestBudget:
+    """One generation step's shared request cap and already-used recoveries.
+
+    A generation step can issue several logical calls: the deterministic validation
+    correction in `persistent_step`, and the plain-empty resend, the JSON correction and
+    the empty-reply recoveries inside one `chat_json`.  The cap and the single budget
+    raise therefore belong to the step; per call they would add up past the declared
+    limit, and a later call would start again from a budget that already failed.
+
+    Pass the same instance to every call of one step.  A new step gets a new instance,
+    and a stored response that is reused never touches the counters.
+    """
+
+    def __init__(self, max_requests: int = MAX_REQUESTS_PER_STEP) -> None:
+        self.max_requests = int(max_requests)
+        self.requests = 0
+        # A raise belongs to one stable prompt/window identity, not to the whole step:
+        # sibling windows and nested leaves must each still start from the ordinary
+        # budget, while the request count they share stays global.
+        self.escalations: dict[str, int] = {}
+        self.floors: dict[str, int] = {}
+        self.escalated_to: int | None = None
+        # Once an identity raised its budget, later calls for that identity start from at
+        # least this value instead of retrying the budget that already failed.
+        self.floor = 0
+        self.recoveries: list[str] = []
+        self.reasoning_fallback_used = False
+        # Durable step ids that issued a request under this budget.  A parent step that
+        # recovered through child windows can name them without pretending their
+        # requests were its own.
+        self.steps: list[str] = []
+
+    def count(self) -> int:
+        if self.requests >= self.max_requests:
+            raise RuntimeError(
+                f"本步骤已发出 {self.max_requests} 次模型请求（含 HTTP 重试、空响应恢复、"
+                "重发、格式纠正与事实纠正），为避免无限重试已停止。"
+                "已成功的步骤仍然保留，可从同一入口重试。"
+            )
+        self.requests += 1
+        return self.requests
+
+    def diagnostics(self) -> dict:
+        """Snapshot the requests actually sent and the shared recovery state."""
+        return {
+            "step_requests": self.requests,
+            "step_request_limit": self.max_requests,
+            "step_recoveries": list(self.recoveries),
+            "step_budget_floor": self.floor,
+            "step_escalations": dict(self.escalations),
+            "step_reasoning_fallback_used": self.reasoning_fallback_used,
+            "step_ids": list(self.steps),
+        }
+
+    def floor_for(self, identity: str | None = None) -> int:
+        """The smallest budget a request for this identity may start from."""
+        return self.floors.get(identity or "", 0)
+
+    def can_escalate(
+        self, ceiling: int | None, budget: int, identity: str | None = None
+    ) -> bool:
+        key = identity or ""
+        return bool(ceiling) and key not in self.escalations and budget < int(ceiling)
+
+    def escalate(self, ceiling: int, budget: int, identity: str | None = None) -> int:
+        key = identity or ""
+        raised = int(ceiling)
+        self.escalations[key] = raised
+        self.floors[key] = max(self.floors.get(key, 0), raised)
+        if not key:
+            self.escalated_to = raised
+            self.floor = self.floors[key]
+        self.recoveries.append(f"把输出预算从 {budget} 提到 {raised}")
+        return raised
 # Seconds one upstream call may take when the caller does not say.  The worker applies the
 # same default, so a change here has to be mirrored in llm_worker.py.
 DEFAULT_READ_TIMEOUT = 240
@@ -113,8 +213,15 @@ def list_models(cfg: dict) -> list[str]:
     return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
-def parse_json(text: str) -> dict:
-    """从模型输出中稳健地解析 JSON：容忍 ```json 围栏、前后缀文字，以及截断（自动修复失败则抛原始错误）。"""
+def parse_json_result(text: str) -> tuple[dict, bool]:
+    """Parse model output as JSON and say whether missing structure had to be closed.
+
+    The second value is True when the object only parses after `_repair_truncated`
+    dropped an incomplete tail and closed its containers.  Such a result is missing
+    whatever the model had not written yet, so a caller that must not treat lost
+    content as complete (an upstream that reported finish_reason=length) needs this
+    signal; `parse_json` keeps the plain `-> dict` contract for everything else.
+    """
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
@@ -123,15 +230,20 @@ def parse_json(text: str) -> dict:
         raise ValueError(f"响应里没有 JSON 对象: {text[:200]!r}")
     candidate = text[start:]
     try:
-        return json.loads(candidate)
+        return json.loads(candidate), False
     except ValueError as first:
         repaired = _repair_truncated(candidate)
         if repaired is not None:
             try:
-                return json.loads(repaired)
+                return json.loads(repaired), True
             except ValueError:
                 pass
         raise first
+
+
+def parse_json(text: str) -> dict:
+    """从模型输出中稳健地解析 JSON：容忍 ```json 围栏、前后缀文字，以及截断（自动修复失败则抛原始错误）。"""
+    return parse_json_result(text)[0]
 
 
 def _repair_truncated(s: str) -> str | None:
@@ -212,6 +324,13 @@ class LLMClient:
         self.reasoning_effort = str(cfg.get("reasoning_effort") or "")
         # Why the last reply could be empty; see chat().
         self.last_finish_reason: str | None = None
+        # Non-sensitive request summaries for the most recent logical step: effective
+        # budget and effort, finish_reason, content length, upstream usage when it
+        # reported one, and duration. Never prompts, keys, headers or endpoint URLs.
+        self.last_request_diagnostics: list[dict] = []
+        self.last_recovery_actions: list[str] = []
+        # The generation step currently in progress, or None for a standalone call.
+        self._budget: RequestBudget | None = None
 
     def _url(self) -> str:
         return chat_url(self.base_url)
@@ -295,62 +414,67 @@ class LLMClient:
         status_label = str(status) if status is not None else "未知"
         return f"API 请求失败 HTTP {status_label}\nURL: {self._url()}\n响应: {detail}"
 
-    def chat(self, messages: list[dict], temperature: float = 0.3,
-             max_tokens: int = 8000,
-             request_timeout: int | float | None = None) -> str:
+    def _count_request(self) -> None:
+        """Count one worker request against the current step budget."""
+        if getattr(self, "_budget", None) is None:
+            # A direct _chat_request call outside chat()/chat_json() still needs a
+            # counter, so give it a throwaway one.
+            self._budget = RequestBudget()
+        self._budget.count()
+
+    def _record_diagnostics(self, out: dict | None, *, budget: int, started: float,
+                            request_timeout: int | float | None, outcome: str) -> None:
+        """Append one non-sensitive summary of a worker request.
+
+        Only what is needed to distinguish a returned empty/truncated response from a
+        transport failure: the effective budget and effort, finish_reason,
+        content/reasoning lengths, tool/refusal presence, the usage the upstream
+        reported (absent when it reported none) and how long it took. Prompts, keys,
+        headers and URLs never enter here.
+        """
+        out = out or {}
+        content = out.get("content")
+        length = out.get("content_length")
+        if not isinstance(length, int):
+            length = len(content) if isinstance(content, str) else None
+        usage = out.get("usage")
+        self.last_request_diagnostics.append({
+            "index": len(self.last_request_diagnostics) + 1,
+            "max_tokens": budget,
+            "reasoning_effort": self.reasoning_effort,
+            "request_timeout": request_timeout,
+            "outcome": outcome,
+            "finish_reason": out.get("finish_reason"),
+            "content_length": length,
+            "reasoning_content_present": bool(out.get("reasoning_content_present")),
+            "reasoning_content_length": out.get("reasoning_content_length"),
+            "refusal_present": bool(out.get("refusal_present")),
+            "tool_call_count": out.get("tool_call_count", 0),
+            "usage": usage if isinstance(usage, dict) else None,
+            "status": out.get("status"),
+            "kind": out.get("kind"),
+            "duration_ms": int(round((time.monotonic() - started) * 1000)),
+        })
+
+    def _chat_request(self, messages: list[dict], temperature: float, budget: int,
+                      request_timeout: int | float | None) -> tuple[str, str | None]:
+        """Issue one content request, keeping the existing HTTP retry behaviour."""
         for attempt in range(RETRY_ATTEMPTS):
+            self._count_request()
+            started = time.monotonic()
             try:
                 out = self._worker_call(
                     messages,
                     temperature,
-                    max_tokens,
+                    budget,
                     stream=False,
                     request_timeout=request_timeout,
                 )
-                if out.get("error"):
-                    status = out.get("status")
-                    if status in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1:
-                        time.sleep(_retry_delay(attempt, status or 0, _retry_after(out)))
-                        continue
-                    raise RuntimeError(self._format_worker_error(out))
-                content = out.get("content")
-                self.last_finish_reason = out.get("finish_reason")
-                if (
-                    self.reasoning_effort
-                    and (content is None or not str(content).strip())
-                    and self.last_finish_reason == "length"
-                ):
-                    # The upstream could not honour the configured reasoning budget, so the
-                    # model spent the whole reply thinking and produced nothing.  Which
-                    # model the user runs is their choice and must never break the run, so
-                    # drop the hint for this client and repeat the call straight away.
-                    # RETRY_ATTEMPTS is 1, so this retry must happen here and not via the
-                    # loop's continue.
-                    print(
-                        "推理档位在该模型上无法满足，已自动忽略该档位并重试本次请求。",
-                        flush=True,
-                    )
-                    self.reasoning_effort = ""
-                    out = self._worker_call(
-                        messages,
-                        temperature,
-                        max_tokens,
-                        stream=False,
-                        request_timeout=request_timeout,
-                    )
-                    if out.get("error"):
-                        raise RuntimeError(self._format_worker_error(out))
-                    content = out.get("content")
-                    self.last_finish_reason = out.get("finish_reason")
-                if content is None:
-                    # Some upstreams answer with a null content field — a reasoning-only
-                    # or tool-call-only message.  Returning None here made chat_json
-                    # crash on `None.strip()`, so the caller saw an AttributeError
-                    # instead of the empty-response message it already knows how to
-                    # report.  Treat it as empty text.
-                    return ""
-                return str(content)
             except subprocess.TimeoutExpired:
+                self._record_diagnostics(
+                    None, budget=budget, started=started,
+                    request_timeout=request_timeout, outcome="timeout",
+                )
                 if attempt < RETRY_ATTEMPTS - 1:
                     time.sleep(_retry_delay(attempt))
                     continue
@@ -360,39 +484,265 @@ class LLMClient:
                 raise RuntimeError(
                     f"API 请求超时（{timeout_label}s）\nURL: {self._url()}"
                 )
+            if out.get("error"):
+                status = out.get("status")
+                retryable = status in RETRY_STATUSES and attempt < RETRY_ATTEMPTS - 1
+                self._record_diagnostics(
+                    out, budget=budget, started=started,
+                    request_timeout=request_timeout,
+                    outcome="http_retry" if retryable else "error",
+                )
+                if retryable:
+                    time.sleep(_retry_delay(attempt, status or 0, _retry_after(out)))
+                    continue
+                raise RuntimeError(self._format_worker_error(out))
+            content = out.get("content")
+            self.last_finish_reason = out.get("finish_reason")
+            # Some upstreams answer with a null content field — a reasoning-only or
+            # tool-call-only message.  Treat it as empty text; returning None made
+            # callers crash on None.strip() instead of reporting an empty reply.
+            text = "" if content is None else str(content)
+            self._record_diagnostics(
+                out, budget=budget, started=started,
+                request_timeout=request_timeout,
+                outcome="content" if text.strip() else "empty",
+            )
+            return text, self.last_finish_reason
         raise RuntimeError("chat: unreachable")
+
+    def chat(self, messages: list[dict], temperature: float = 0.3,
+             max_tokens: int = 8000,
+             request_timeout: int | float | None = None,
+             escalate_max_tokens: int | None = None) -> str:
+        """Send one content request and return its text (empty when the upstream gave none).
+
+        Empty replies are recovered by ONE bounded policy: when the upstream reported
+        finish_reason=length, the client may raise the budget once if the caller
+        explicitly allows it through ``escalate_max_tokens``. It preserves the
+        configured reasoning hint and all other request parameters. There is no global
+        ceiling, silent parameter switching, or endless parameter juggling; a reply
+        that is still empty ends the call.
+
+        The request cap and the single budget raise belong to the current generation
+        step (see RequestBudget): chat_json() supplies that step, while a standalone
+        chat() gets a fresh one.  A call inside a step that already raised the budget
+        starts from the raised value instead of the budget that already failed.
+        """
+        owned = getattr(self, "_budget", None) is None
+        state = RequestBudget() if owned else self._budget
+        if owned:
+            self._budget = state
+            self.last_request_diagnostics = []
+        self.last_recovery_actions = state.recoveries
+        identity = getattr(self, "_budget_identity", None)
+        budget = max(int(max_tokens), state.floor_for(identity))
+        try:
+            for recovery in range(EMPTY_RESPONSE_RECOVERIES + 1):
+                text, finish = self._chat_request(
+                    messages, temperature, budget, request_timeout
+                )
+                if text.strip():
+                    return text
+                if finish != "length" or recovery == EMPTY_RESPONSE_RECOVERIES:
+                    return text
+                if state.can_escalate(escalate_max_tokens, budget, identity):
+                    budget = state.escalate(escalate_max_tokens, budget, identity)
+                    continue
+                return text
+            return ""
+        finally:
+            if owned:
+                self._budget = None
 
     def chat_streamed(self, messages: list[dict], **kw) -> str:
         """用流式接口接收完整文本再返回（规避 524：只要持续有 token，网关不会判超时）。"""
         return "".join(self.stream(messages, **kw))
 
-    def chat_json(self, messages: list[dict], **kw) -> dict:
-        """调用模型（流式）并解析 JSON；空响应/解析失败各重发一次。"""
+    def _reply_facts(self) -> str:
+        """Describe the last request from facts the client actually observed.
+
+        It states what the upstream reported, which budget and request hint that call
+        used, which recoveries already ran and that the client stopped. It reports
+        reasoning-content metadata when the upstream exposed that field, without
+        including the content. Usage is whatever the upstream reported; without a
+        report it stays unknown rather than inferred.
+        """
+        last = self.last_request_diagnostics[-1] if self.last_request_diagnostics else {}
+        parts = []
+        finish = last.get("finish_reason")
+        parts.append(
+            f"finish_reason={finish}" if finish else "上游没有报告 finish_reason"
+        )
+        if last.get("max_tokens") is not None:
+            effort = last.get("reasoning_effort") or "未设置"
+            parts.append(
+                f"本次请求实际发出的 max_tokens={last.get('max_tokens')}、"
+                f"reasoning_effort={effort}"
+            )
+        if last.get("content_length") is not None:
+            parts.append(f"返回正文长度 {last.get('content_length')} 字符")
+        if last.get("reasoning_content_present"):
+            reasoning_length = last.get("reasoning_content_length")
+            if reasoning_length is None:
+                parts.append("上游返回 reasoning_content（长度未知）")
+            else:
+                parts.append(f"上游返回 reasoning_content，长度 {reasoning_length} 字符")
+        if last.get("refusal_present"):
+            parts.append("上游返回了 refusal 字段")
+        if last.get("tool_call_count"):
+            parts.append(f"上游返回工具调用 {last.get('tool_call_count')} 个")
+        usage = last.get("usage")
+        if isinstance(usage, dict):
+            parts.append(
+                "上游报告的用量：" + "、".join(f"{key}={value}" for key, value in usage.items())
+            )
+        else:
+            parts.append("上游没有报告用量（未知）")
+        actions = "、".join(self.last_recovery_actions) or "没有可用的恢复手段"
+        parts.append(f"已经尝试的恢复：{actions}")
+        budget = getattr(self, "_budget", None)
+        issued = budget.requests if budget else len(self.last_request_diagnostics)
+        parts.append(
+            f"本步骤共发出 {issued} 次请求，现已停止，不再继续重试或调整参数"
+        )
+        return "；".join(parts)
+
+    def _empty_reply_message(self) -> str:
+        return (
+            "上游返回了空正文，并报告 " + self._reply_facts()
+            + "。已成功的步骤会保留，可从同一入口重试。"
+        )
+
+    def _truncated_reply_message(self) -> str:
+        return (
+            "上游返回了正文并报告 finish_reason=length，正文在预算处被截断：返回的 JSON 只有"
+            "补齐缺失结构后才能解析，缺失的那部分内容无法确认，因此没有把这次补全结果当作"
+            "完整成功；" + self._reply_facts() + "。已成功的步骤会保留，可从同一入口重试。"
+        )
+
+    def _try_reasoning_effort_fallback(
+        self, fallback: str | None, configured: str
+    ) -> bool:
+        state = getattr(self, "_budget", None)
+        if (
+            not fallback
+            or configured
+            or state is None
+            or state.reasoning_fallback_used
+        ):
+            return False
+        # Some reasoning models consume the default output budget before writing
+        # complete JSON. Only an opted-in caller may switch; explicit user settings
+        # remain authoritative.
+        self.reasoning_effort = fallback
+        state.reasoning_fallback_used = True
+        state.recoveries.append(f"将 reasoning_effort 从未设置调整为 {fallback}")
+        return True
+
+    def chat_json(self, messages: list[dict], step_budget: RequestBudget | None = None,
+                  budget_identity: str | None = None, **kw) -> dict:
+        """调用模型并解析 JSON；空响应/解析失败各重发一次。
+
+        The whole call is one logical step: every request below — HTTP retries, the
+        empty-reply recoveries, the plain-empty resend, the JSON correction and the
+        budget raise — shares one `RequestBudget`.  Callers that continue the same
+        generation step (the deterministic validation correction in `persistent_step`)
+        pass its budget in, so the cap and the single raise span the whole step.
+        """
+        # A few offline callers replace ``chat`` on a deliberately lightweight
+        # instance created with ``__new__``.  Keep that test seam compatible with
+        # the normal constructor while still resetting per-call diagnostics below.
+        if not hasattr(self, "reasoning_effort"):
+            self.reasoning_effort = ""
+        if not hasattr(self, "last_finish_reason"):
+            self.last_finish_reason = None
+        previous = getattr(self, "_budget", None)
+        previous_identity = getattr(self, "_budget_identity", None)
+        state = step_budget if step_budget is not None else RequestBudget()
+        self._budget = state
+        self._budget_identity = budget_identity
+        self.last_finish_reason = None
+        self.last_request_diagnostics = []
+        self.last_recovery_actions = state.recoveries
+        try:
+            return self._chat_json(messages, **kw)
+        finally:
+            self._budget = previous
+            self._budget_identity = previous_identity
+
+    def _chat_json(self, messages: list[dict], **kw) -> dict:
         working_messages = list(messages)
-        for _ in range(2):
-            # 非流式：curl_cffi 流式在 uvicorn 线程里会卡，非流式稳定
-            text = self.chat(working_messages, **kw)
-            if not text.strip():
-                if self.last_finish_reason == "length":
-                    # Retrying cannot help: the budget itself is the cause.  A reasoning
-                    # model spends max_tokens thinking before it writes any content.
-                    raise RuntimeError(
-                        "上游在开始输出正文前用尽了 max_tokens（finish_reason=length）。"
-                        "该模型会先进行推理，请提高 max_tokens，或改用不会推理的模型。"
+        plain_empty_retried = False
+        correction_sent = False
+        truncation_retried = False
+        fallback_reasoning_effort = kw.pop("fallback_reasoning_effort", None)
+        if fallback_reasoning_effort is not None:
+            fallback_reasoning_effort = str(fallback_reasoning_effort).strip()
+            if fallback_reasoning_effort not in {"low", "medium", "high"}:
+                raise ValueError("fallback_reasoning_effort 只支持 low / medium / high")
+        configured_reasoning_effort = self.reasoning_effort
+        # Every branch below either returns, raises, or consumes one of the three
+        # one-shot flags; the request budget bounds the rest.
+        try:
+            while True:
+                # 非流式：curl_cffi 流式在 uvicorn 线程里会卡，非流式稳定
+                text = self.chat(working_messages, **kw)
+                if not text.strip():
+                    if (
+                        self.last_finish_reason == "length"
+                        and self._try_reasoning_effort_fallback(
+                            fallback_reasoning_effort, configured_reasoning_effort
+                        )
+                    ):
+                        continue
+                    if self.last_finish_reason == "length":
+                        # The bounded recovery in chat() already ran (one explicit budget
+                        # raise when allowed), so another resend would repeat the same
+                        # request. Report what was observed instead.
+                        raise ReplyBoundaryError(
+                        self._empty_reply_message(), reply_state="empty"
                     )
-                if _ == 0:
+                    if plain_empty_retried:
+                        budget = getattr(self, "_budget", None)
+                        issued_requests = budget.requests if budget else 0
+                        raise RuntimeError(
+                            "模型连续两次返回空响应（上游没有返回正文，也没有报告 "
+                            "finish_reason=length）。"
+                            f"本步骤共发出 "
+                            f"{issued_requests} 次请求，现已停止。"
+                            "请检查 base_url / 模型名 / 中转站是否可用；已成功的步骤会保留，"
+                            "可从同一入口重试。"
+                        )
+                    plain_empty_retried = True
                     continue
-                raise RuntimeError(
-                    "模型连续两次返回空响应（请检查 base_url / 模型名 / 中转站是否可用）"
-                )
-            try:
-                return parse_json(text)
-            except (json.JSONDecodeError, ValueError) as e:
-                last = "JSONDecodeError" if isinstance(e, json.JSONDecodeError) else "ValueError"
-                tail = text[-300:] if text else "(empty)"
-                reason = "模型未返回 JSON 对象" if "{" not in text else "JSON 语法无效或内容不完整"
-                msg = f"{reason}（{last}: {e}）。\n末尾 {len(tail)} 字符: ...{tail!r}"
-                if _ == 0:
+                try:
+                    parsed, repaired = parse_json_result(text)
+                except (json.JSONDecodeError, ValueError) as e:
+                    last = "JSONDecodeError" if isinstance(e, json.JSONDecodeError) else "ValueError"
+                    tail = text[-300:] if text else "(empty)"
+                    reason = "模型未返回 JSON 对象" if "{" not in text else "JSON 语法无效或内容不完整"
+                    msg = f"{reason}（{last}: {e}）。\n末尾 {len(tail)} 字符: ...{tail!r}"
+                    if self.last_finish_reason == "length":
+                        # Different from an empty reply: the upstream DID send content, but
+                        # reported that it stopped at length, so the tail is probably cut.
+                        budget = (
+                            self.last_request_diagnostics[-1].get("max_tokens")
+                            if self.last_request_diagnostics else "未知"
+                        )
+                        msg += (
+                            "\n上游报告 finish_reason=length，正文可能在预算处被截断。"
+                            f"本次请求实际发出的 max_tokens={budget}。"
+                        )
+                        if self._try_reasoning_effort_fallback(
+                            fallback_reasoning_effort, configured_reasoning_effort
+                        ):
+                            continue
+                    if correction_sent:
+                        if self.last_finish_reason == "length":
+                            raise ReplyBoundaryError(
+                                msg, reply_state="truncated"
+                            ) from e
+                        raise RuntimeError(msg) from e
                     working_messages = [*messages, {
                         "role": "user",
                         "content": (
@@ -404,9 +754,42 @@ class LLMClient:
                     }]
                     msg += "\n将重发一次请求。"
                     print(msg, flush=True)
+                    correction_sent = True
                     continue
-                raise RuntimeError(msg) from e
-        raise RuntimeError("chat_json: unreachable")
+                if repaired and self.last_finish_reason == "length":
+                    # The reply only parses because missing structure was closed up, so the
+                    # model never wrote part of the answer.  Treating that repair as a
+                    # success is how lost content was stored as a completed step.  Retry
+                    # once at the raised budget when the caller allows one, otherwise fail.
+                    budget = (
+                        self.last_request_diagnostics[-1].get("max_tokens")
+                        if self.last_request_diagnostics else None
+                    )
+                    ceiling = kw.get("escalate_max_tokens")
+                    state = getattr(self, "_budget", None)
+                    # The raise belongs to this prompt's identity, exactly as in chat();
+                    # without it the state would land under the empty identity and the
+                    # retry would silently send the original budget again.
+                    identity = getattr(self, "_budget_identity", None)
+                    if self._try_reasoning_effort_fallback(
+                        fallback_reasoning_effort, configured_reasoning_effort
+                    ):
+                        continue
+                    if (
+                        not truncation_retried
+                        and state is not None
+                        and budget is not None
+                        and state.can_escalate(ceiling, budget, identity)
+                    ):
+                        truncation_retried = True
+                        state.escalate(ceiling, budget, identity)
+                        continue
+                    raise ReplyBoundaryError(
+                    self._truncated_reply_message(), reply_state="truncated"
+                )
+                return parsed
+        finally:
+            self.reasoning_effort = configured_reasoning_effort
 
     def stream(self, messages: list[dict], temperature: float = 0.4,
                max_tokens: int = 8000,
@@ -632,6 +1015,78 @@ def _fake_local_digest_output(messages: list[dict]) -> dict:
             }
         )
     return {"units": units, "open_questions": []}
+
+
+def _fake_leaf_plan_output(messages: list[dict]) -> dict:
+    """The fake answer for a leaf window, mirroring the production contract.
+
+    It picks the board's anchoring card type, honours the chapter scope the request
+    supplied (chapter ids and chapter_briefs), returns the package brief an
+    environment-led workspace without chapters needs, and adds the partial overview card
+    the contract asks for.  A fake run therefore cannot satisfy a contract it never
+    produced, and the merged parent validation sees the same shape a real leaf owes.
+    """
+    content = "\n".join(str(message.get("content", "")) for message in messages)
+    units_match = re.search(r"^GLOBAL_UNITS_JSON=(.+)$", content, re.MULTILINE)
+    types_match = re.search(r"^ALLOWED_CARD_TYPES_JSON=(.+)$", content, re.MULTILINE)
+    structure_match = re.search(r"^REVIEWED_STRUCTURE_JSON=(.+)$", content, re.MULTILINE)
+    units = json.loads(units_match.group(1)) if units_match else []
+    types = json.loads(types_match.group(1)) if types_match else ["scene"]
+    try:
+        structure = json.loads(structure_match.group(1)) if structure_match else None
+    except ValueError:
+        structure = None
+    chapters = [
+        chapter.get("id")
+        for chapter in (structure or {}).get("chapters", [])
+        if isinstance(chapter, dict) and chapter.get("id")
+    ]
+    anchor = next(
+        (name for name in ("location", "environment", "scene", "scene_extract")
+         if name in types),
+        next((name for name in types if name != "chapter_overview"), types[0]),
+    )
+    fact_ids = [fact_id for unit in units for fact_id in (unit.get("fact_ids") or [])]
+    cards = [
+        {
+            "type": anchor,
+            "title": unit.get("title") or "规划卡",
+            "purpose": "保留当前窗口可调用的入口。",
+            "fact_ids": list(unit.get("fact_ids") or []),
+            "chapter_ids": list(chapters),
+            "focus": [],
+            "open_questions": [],
+            "runtime_groups": [],
+            "story_beat_ids": [],
+            "situation": "",
+            "case_scope": "current",
+        }
+        for unit in units
+        if unit.get("fact_ids")
+    ]
+    if "chapter_overview" in types and fact_ids:
+        cards.append(
+            {
+                "type": "chapter_overview",
+                "title": "窗口概览",
+                "purpose": "概述本窗口事实在整体情势中的位置。",
+                "fact_ids": fact_ids,
+                "chapter_ids": list(chapters),
+            }
+        )
+    payload: dict = {"cards": cards, "open_questions": []}
+    if chapters:
+        payload["chapter_briefs"] = [
+            {
+                "chapter_id": chapter_id,
+                "brief": {"premise": "前提", "current_situation": "现状"},
+                "reference_fact_ids": fact_ids,
+            }
+            for chapter_id in chapters
+        ]
+    elif "environment" in types:
+        payload["brief"] = {"premise": "前提", "current_situation": "现状"}
+    return payload
 
 
 def _fake_global_plan_output(messages: list[dict]) -> dict:
@@ -957,6 +1412,10 @@ class FakeLLM:
             return json.dumps(_fake_local_digest_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_global_plan":
             return json.dumps(_fake_global_plan_output(messages), ensure_ascii=False, indent=2)
+        if task == "prep:artifact_global_plan_leaf":
+            return json.dumps(
+                _fake_leaf_plan_output(messages), ensure_ascii=False, indent=2
+            )
         if task == "prep:artifact_materialize":
             return json.dumps(_fake_materialize_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:structure_local":

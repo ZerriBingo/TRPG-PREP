@@ -57,3 +57,11 @@ class PlanningTransport:
     def chat_json(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         response = self.client.chat_json(self.messages(messages), **kwargs)
         return self._translate(response, self.decode_ids)
+
+    @property
+    def last_request_diagnostics(self) -> list[dict] | None:
+        return getattr(self.client, "last_request_diagnostics", None)
+
+    @property
+    def last_recovery_actions(self) -> list[str] | None:
+        return getattr(self.client, "last_recovery_actions", None)

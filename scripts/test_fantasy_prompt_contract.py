@@ -28,7 +28,7 @@ facts = [
 fact_payload = [fact.model_dump(mode="json") for fact in facts]
 
 local_system = artifacts._local_digest_messages(
-    profile, fact_payload, batch_index=1, batch_count=1
+    profile, fact_payload
 )[0]["content"]
 assert "traversal" in local_system
 assert "faction" in local_system

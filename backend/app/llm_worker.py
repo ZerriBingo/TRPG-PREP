@@ -1,8 +1,8 @@
-"""LLM worker 子进程：主线程用 curl_cffi 发请求，结果经 stdout JSON 返回。
+"""LLM worker 子进程：主线程用 curl_cffi 发 Chat Completions 请求。
 
 独立进程避开 uvicorn 工作线程与 libcurl 的冲突（挂死/超时不生效问题）。
 stdin 输入 JSON: {"base_url","api_key","model","messages","temperature","max_tokens","stream"}
-stdout 输出 JSON: {"content": ...} 或
+stdout 输出 JSON: {"content": ..., "finish_reason": ..., "usage": ...} 或
 {"error": "...", "kind": "http|network|timeout|response|worker", "status": 429}
 """
 import json
@@ -24,6 +24,50 @@ def _url(base_url: str) -> str:
     if base.rstrip("/").endswith(("/v1", "/v2", "/v3", "/v4")):
         return base + "/chat/completions"
     return base + "/v1/chat/completions"
+
+
+def _usage_summary(data: dict) -> dict | None:
+    """Keep only the numeric usage the upstream reported; never keys, URLs or prompt text."""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    summary = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            summary[key] = value
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+        summary["reasoning_tokens"] = details["reasoning_tokens"]
+    return summary or None
+
+
+def build_frame(data: dict, content) -> dict:
+    """Build the success frame: content plus non-sensitive response metadata.
+
+    Finish reason, content/reasoning lengths, refusal/tool-call presence and usage
+    distinguish an empty or truncated model response from a transport failure. They
+    report only fields the upstream actually supplied; they do not infer how the model
+    spent its token budget. Prompt text, headers and endpoint are never included.
+    """
+    choices = data.get("choices") or [{}]
+    choice = choices[0] if choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else None
+    message = message if isinstance(message, dict) else {}
+    reasoning_content = message.get("reasoning_content")
+    tool_calls = message.get("tool_calls")
+    return {
+        "content": content,
+        "finish_reason": choice.get("finish_reason"),
+        "content_length": len(content) if isinstance(content, str) else None,
+        "reasoning_content_present": "reasoning_content" in message,
+        "reasoning_content_length": (
+            len(reasoning_content) if isinstance(reasoning_content, str) else None
+        ),
+        "refusal_present": bool(message.get("refusal")),
+        "tool_call_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
+        "usage": _usage_summary(data),
+    }
 
 
 def build_payload(cfg: dict) -> dict:
@@ -58,20 +102,23 @@ def main() -> None:
                       headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
-        choice = (data.get("choices") or [{}])[0]
-        if cfg.get("stream"):
-            # 非流式响应直接取 content
-            content = choice["message"]["content"]
-        else:
-            content = choice["message"]["content"]
-        # finish_reason tells a caller why a reply can be empty: a reasoning model that
-        # spends the whole budget thinking returns content=null with finish_reason=length.
+        choices = data.get("choices") or [{}]
+        choice = choices[0] if choices else {}
+        # 非流式响应直接取 content（流式开关不影响这里的取法）。某些代理在
+        # 只有 reasoning/tool-call 时会省略 content 或返回 null；这仍是一个可诊断
+        # 的成功帧，不应先在 worker 里变成 KeyError。
+        message = choice.get("message") if isinstance(choice, dict) else None
+        message = message if isinstance(message, dict) else {}
+        content = message.get("content")
+        # Keep response metadata that distinguishes an empty/truncated response from a
+        # transport failure without inferring token allocation or retaining hidden text.
         # ensure_ascii keeps the frame pure ASCII: this process is started with the console
         # code page (GBK on Windows), so printing Chinese directly raised UnicodeEncodeError
         # for some characters and the call failed for a reason that had nothing to do with
         # the upstream.  JSON escapes survive any encoding and decode back to the same text.
-        print(json.dumps({"content": content,
-                          "finish_reason": choice.get("finish_reason")}, ensure_ascii=True))
+        # The frame contains only response shape, lengths and usage; never response text
+        # outside the user-facing content, prompt text, headers or endpoint.
+        print(json.dumps(build_frame(data, content), ensure_ascii=True))
     except Exception as e:  # noqa: BLE001
         response = getattr(e, "response", None)
         status = getattr(response, "status_code", None)
