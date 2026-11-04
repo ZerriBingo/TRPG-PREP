@@ -1,6 +1,6 @@
 [project]
 name = "trpg-prep"
-version = "0.1.6a0"
+version = "0.1.6a1"
 description = "Offline-first TRPG preparation workspace for game masters."
 readme = "README.md"
 requires-python = ">=3.11"
