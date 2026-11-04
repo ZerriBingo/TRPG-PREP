@@ -1390,6 +1390,25 @@ def _fake_structure_assign_output(messages: list[dict]) -> dict:
     return {"assignments": assignments}
 
 
+def _fake_identity_output(messages: list[dict]) -> dict:
+    """Deterministic identity answer for offline runs.
+
+    Cards of one type with exactly the same title are one card; everything else is its
+    own entity.  The rule knows nothing about any module, reads no fact content, and
+    never merges two different titles because they cite the same fact.
+    """
+    body = json.loads(messages[1]["content"].split("\n", 1)[1])
+    buckets: dict[tuple[str, str], list[str]] = {}
+    for candidate in body.get("candidates") or []:
+        key = (candidate.get("type", ""), candidate.get("title", ""))
+        buckets.setdefault(key, []).append(candidate["plan_id"])
+    clusters = [
+        {"label": title or "未命名", "plan_ids": plan_ids}
+        for (_card_type, title), plan_ids in buckets.items()
+    ]
+    return {"clusters": clusters, "multi_person_plans": []}
+
+
 class FakeLLM:
     """确定性的假 LLM：按 [TASK:...] 返回示例 JSON，用于无 key 验证。"""
 
@@ -1410,6 +1429,8 @@ class FakeLLM:
             return json.dumps(_fake_artifact_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_local_digest":
             return json.dumps(_fake_local_digest_output(messages), ensure_ascii=False, indent=2)
+        if task == "prep:artifact_identity_reconcile":
+            return json.dumps(_fake_identity_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_global_plan":
             return json.dumps(_fake_global_plan_output(messages), ensure_ascii=False, indent=2)
         if task == "prep:artifact_global_plan_leaf":

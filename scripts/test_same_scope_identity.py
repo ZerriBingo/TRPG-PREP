@@ -144,12 +144,19 @@ def _scripted(responder):
     return Client()
 
 
+def _payload(messages):
+    content = messages[1]["content"]
+    if content.startswith("[TASK:"):
+        content = content.split("\n", 1)[1]
+    return json.loads(content)
+
+
 def _candidate_groups(messages):
-    return json.loads(messages[1]["content"])["candidate_groups"]
+    return _payload(messages)["groups"]
 
 
 def _candidate_ids(messages):
-    return {item["plan_id"] for group in _candidate_groups(messages) for item in group}
+    return {item["plan_id"] for item in _payload(messages)["candidates"]}
 
 
 def _cluster(pairs):
@@ -220,7 +227,7 @@ def check_no_chapter_board_reaches_reconciliation():
 
 
 def check_two_people_never_become_one_card():
-    """Jonah and Erica stay two NPCs; the pair card is not merged into either."""
+    """Two people stay two cards; a combined card stops the run instead of landing."""
     with _Harness() as harness:
         plans = [
             _plan("p_erica", "npc", "艾丽卡·卡莱尔", ["fact_erica"]),
@@ -235,27 +242,106 @@ def check_two_people_never_become_one_card():
         components = a._identity_candidate_components(plans, harness.bundle)
         assert components == [["p_erica", "p_jonah", "p_pair"]], components
 
+        # Path 1: the planner produced two proper person cards and one combined card;
+        # the reconcile step must report the combined one and the run must stop.
+        def _report_pair(messages):
+            present = _candidate_ids(messages)
+            # The reported card is covered by the report only: the two lists are
+            # disjoint by contract.
+            clusters = [
+                {"label": f"人物 {plan_id}", "plan_ids": [plan_id]}
+                for plan_id in sorted(present - {"p_pair"})
+            ]
+            return {
+                "clusters": clusters,
+                "multi_person_plans": [
+                    {
+                        "plan_id": "p_pair",
+                        "subjects": ["约拿·肯辛顿", "艾丽卡·卡莱尔"],
+                        "fact_ids": ["fact_jonah", "fact_erica"],
+                    }
+                ],
+            }
+
+        summary = a._OpenQuestionSummary()
+        try:
+            a._assign_plan_identities(
+                harness.job, plans, harness.bundle, summary, _scripted(_report_pair)
+            )
+        except a.MixedPersonCardError as error:
+            assert "约拿" in str(error) and "艾丽卡" in str(error), str(error)
+        else:
+            raise AssertionError("a combined person card must stop the run, not land")
+
+        # Path 2: two people, two cards, no combined card -> both survive as cards.
+        two_people = [
+            _plan("p_erica", "npc", "艾丽卡·卡莱尔", ["fact_erica"]),
+            _plan("p_jonah", "npc", "约拿·肯辛顿", ["fact_jonah"]),
+        ]
         client = _scripted(_cluster([]))
         identified = a._assign_plan_identities(
-            harness.job, plans, harness.bundle, a._OpenQuestionSummary(), client
+            harness.job, two_people, harness.bundle, a._OpenQuestionSummary(), client
         )
         merged = a._merge_chapter_plans([], identified)
-        assert len(merged) == 3, _titles(merged)
-        people = {plan["title"] for plan in merged}
-        assert "艾丽卡·卡莱尔" in people and "约拿·肯辛顿" in people
-        for plan in merged:
-            if plan["title"] in {"艾丽卡·卡莱尔", "约拿·肯辛顿"}:
-                assert len(plan["fact_ids"]) == 1, plan["fact_ids"]
+        assert len(merged) == 2, _titles(merged)
+        assert {plan["title"] for plan in merged} == {"艾丽卡·卡莱尔", "约拿·肯辛顿"}
+
+
+def check_single_combined_npc_is_still_checked():
+    """One isolated NPC plan is judged too, so a lone combined card cannot slip by."""
+    with _Harness() as harness:
+        plans = [_plan("p_solo", "npc", "乔纳与艾丽卡", ["fact_jonah", "fact_erica"])]
+        components = a._identity_candidate_components(plans, harness.bundle)
+        assert components == [["p_solo"]], components
+        client = _scripted(
+            lambda messages: {
+                "clusters": [],
+                "multi_person_plans": [
+                    {
+                        "plan_id": "p_solo",
+                        "subjects": ["乔纳", "艾丽卡"],
+                        "fact_ids": ["fact_jonah", "fact_erica"],
+                    }
+                ],
+            }
+        )
+        try:
+            a._assign_plan_identities(
+                harness.job, plans, harness.bundle, a._OpenQuestionSummary(), client
+            )
+        except a.MixedPersonCardError:
+            pass
+        else:
+            raise AssertionError("an isolated combined NPC must be checked and stopped")
+
+        # A report that cites facts the plan does not own is rejected by validation.
+        bad = {
+            "clusters": [{"label": "单人卡", "plan_ids": ["p_solo"]}],
+            "multi_person_plans": [
+                {
+                    "plan_id": "p_solo",
+                    "subjects": ["乔纳", "艾丽卡"],
+                    "fact_ids": ["fact_cult"],
+                }
+            ],
+        }
+        try:
+            a._validate_identity_clusters(
+                bad, {"p_solo"}, {"p_solo": set(plans[0]["fact_ids"])}
+            )
+        except a.ArtifactGenerationError:
+            pass
+        else:
+            raise AssertionError("a report citing foreign facts must be rejected")
 
 
 def check_identity_vetoes_a_title_match():
-    """Two different entities that happen to share a title stay two cards."""
+    """Two entities that share a title stay two cards, with and without a bridge."""
     with _Harness():
         left = {**_plan("t_a", "location", "书房", ["fact_hotel"]), "identity_key": "identity_a_0"}
         right = {**_plan("t_b", "location", "书房", ["fact_publisher"]), "identity_key": "identity_b_0"}
         assert a._merge_match([left], right) is None
-        merged = a._merge_chapter_plans([], [left, right])
-        assert len(merged) == 2, merged
+        assert len(a._merge_chapter_plans([], [left, right])) == 2
 
         # Without an identity judgement the old title rule is unchanged.
         plain_left = _plan("t_c", "location", "书房", ["fact_hotel"])
@@ -263,9 +349,40 @@ def check_identity_vetoes_a_title_match():
         assert a._merge_match([plain_left], plain_right) is plain_left
         assert len(a._merge_chapter_plans([], [plain_left, plain_right])) == 1
 
+        # An unjudged same-title card must not act as a bridge between two judged
+        # different entities: A absorbs the bridge, then B must still be refused.
+        bridge = _plan("t_bridge", "location", "书房", ["fact_cult"])
+        merged = a._merge_chapter_plans([], [left, bridge, right])
+        assert len(merged) == 2, [plan["id"] for plan in merged]
+        assert "identity_b_0" not in {
+            key for plan in merged for key in a._identity_key_set(plan)
+        } or len(merged) == 2
+
+    # The production path, not a hand-built key: two singleton judgements must survive.
+    with _Harness() as harness:
+        plans = [
+            _plan("p_study_a", "location", "书房", ["fact_hotel"]),
+            _plan("p_study_b", "location", "书房", ["fact_publisher"]),
+        ]
+        client = _scripted(_cluster([["p_study_a"], ["p_study_b"]]))
+        identified = a._assign_plan_identities(
+            harness.job, plans, harness.bundle, a._OpenQuestionSummary(), client
+        )
+        keys = {plan["id"]: plan.get("identity_key") for plan in identified}
+        assert all(keys.values()), keys
+        assert keys["p_study_a"] != keys["p_study_b"], keys
+        assert len(a._merge_chapter_plans([], identified)) == 2
+
+        # The same rules must not report a correct veto as a blocked merge.
+        summary = a._OpenQuestionSummary()
+        a._report_unmerged_identities(
+            a._merge_chapter_plans([], identified), summary
+        )
+        assert summary.count == 0, summary.preview
+
 
 def check_reconciliation_request_is_bounded_and_cached():
-    """Requests stay inside the chunk limits, cover every candidate, and cache."""
+    """Every request fits the hard cap, covers its candidates, and caches."""
     with _Harness() as harness:
         plans = [
             _plan(
@@ -286,18 +403,13 @@ def check_reconciliation_request_is_bounded_and_cached():
         assert client.calls >= 1, client.calls
         covered: set[str] = set()
         for messages in client.requests:
-            groups = _candidate_groups(messages)
-            ids = {item["plan_id"] for group in groups for item in group}
+            ids = _candidate_ids(messages)
             assert len(ids) <= a.IDENTITY_MAX_PLANS_PER_CHUNK, len(ids)
-            # A chunk may exceed the budget by at most the group that opened it, so a
-            # single component can still be judged as a whole; nothing is unbounded.
-            largest = max(
-                (len(json.dumps(group, ensure_ascii=False)) for group in groups), default=0
+            # The bound is on the complete encoded request, prompt and schema included.
+            assert len(json.dumps(messages, ensure_ascii=False)) <= (
+                a.IDENTITY_REQUEST_MAX_CHARS
             )
-            size = len(json.dumps({"candidate_groups": groups}, ensure_ascii=False))
-            assert size <= a.IDENTITY_GROUP_CHAR_BUDGET + largest, (size, largest)
             covered |= ids
-        # Every candidate is judged: a chunk overflow may not silently drop cards.
         expected = {
             plan_id
             for component in a._identity_candidate_components(plans, harness.bundle)
@@ -324,34 +436,76 @@ def check_oversized_component_is_reported_not_sent():
         summary = a._OpenQuestionSummary()
         result = a._assign_plan_identities(harness.job, plans, harness.bundle, summary, client)
         assert client.calls == 0, client.calls
-        assert result == plans
+        assert len(result) == len(plans)
+        assert all(a._is_unjudged(plan) for plan in result)
         assert any("超过" in text for text in summary.preview), summary.preview
 
 
 def check_fact_edit_invalidates_the_judgement():
-    """Editing a fact re-runs the judgement instead of reusing the old answer."""
+    """An edit anywhere in a cited fact re-runs the judgement that read it."""
     with _Harness() as harness:
         plans = _sample_plans()
         client = _scripted(_cluster([["p_hotel_a", "p_hotel_b"]]))
         summary = a._OpenQuestionSummary()
         a._assign_plan_identities(harness.job, plans, harness.bundle, summary, client)
         assert client.calls >= 1, client.calls
-        before = client.calls
+        cold = client.calls
 
-        edited = harness.bundle.model_copy(deep=True)
-        for fact in edited.facts:
-            if fact.id == "fact_hotel":
-                fact.text = fact.text + "（复核后补充：酒店门厅保留旧式前台）"
-        refreshed = _scripted(_cluster([["p_hotel_a", "p_hotel_b"]]))
-        a._assign_plan_identities(harness.job, plans, edited, summary, refreshed)
-        assert refreshed.calls >= 1, "an edited fact must invalidate the cached identity step"
-        # Only the judgement that read the edited fact is redone, and never more work
-        # than a cold run.
-        assert refreshed.calls <= before, (refreshed.calls, before)
-        rejudged = set()
-        for messages in refreshed.requests:
-            rejudged |= _candidate_ids(messages)
-        assert {"p_hotel_a", "p_hotel_b"} <= rejudged, rejudged
+        def _edit(fact_id, mutate):
+            edited = harness.bundle.model_copy(deep=True)
+            for fact in edited.facts:
+                if fact.id == fact_id:
+                    fact.text = mutate(fact.text)
+            fresh = _scripted(_cluster([["p_hotel_a", "p_hotel_b"]]))
+            a._assign_plan_identities(harness.job, plans, edited, summary, fresh)
+            return fresh
+
+        # A change past the old 240-character cut used to change nothing.
+        tail = _edit("fact_hotel", lambda text: text + "。" + "复核补充：" + "旧式前台。" * 80)
+        assert tail.calls >= 1, "an edit past the truncated window must invalidate"
+        assert tail.calls <= cold, (tail.calls, cold)
+
+        # So must a change in the ninth cited fact, which the old slice dropped.
+        ninth = harness.bundle.model_copy(deep=True)
+        long_fact = SourceFact(
+            id="fact_ninth",
+            text="第九条事实：" + "细节。" * 40,
+            kind="clue",
+            visibility="explicit",
+            source_refs=[SourceRef(file="fixture://same-scope", page=2)],
+        )
+        ninth.facts = [*ninth.facts, long_fact]
+        plans_with_ninth = [
+            {
+                **plan,
+                "fact_ids": [
+                    *plan["fact_ids"],
+                    *(
+                        ["fact_ninth"]
+                        if plan["id"] == "p_hotel_a"
+                        else [
+                            f"filler_{index}"
+                            for index in range(9, 9)
+                        ]
+                    ),
+                ],
+            }
+            for plan in plans
+        ]
+        fresh = _scripted(_cluster([["p_hotel_a", "p_hotel_b"]]))
+        a._assign_plan_identities(
+            harness.job, plans_with_ninth, ninth, summary, fresh
+        )
+        assert fresh.calls >= 1
+        edited_ninth = ninth.model_copy(deep=True)
+        for fact in edited_ninth.facts:
+            if fact.id == "fact_ninth":
+                fact.text = fact.text + "（复核后补充）"
+        rejudged = _scripted(_cluster([["p_hotel_a", "p_hotel_b"]]))
+        a._assign_plan_identities(
+            harness.job, plans_with_ninth, edited_ninth, summary, rejudged
+        )
+        assert rejudged.calls >= 1, "editing the ninth fact must invalidate the judgement"
 
 
 def check_failure_stays_bounded():
@@ -365,7 +519,10 @@ def check_failure_stays_bounded():
         client = _scripted(boom)
         summary = a._OpenQuestionSummary()
         result = a._assign_plan_identities(harness.job, plans, harness.bundle, summary, client)
-        assert result == plans
+        # A failed block is "not judged", which must be visible in the final merge.
+        assert len(result) == len(plans)
+        assert all(a._is_unjudged(plan) for plan in result)
+        assert all("identity_key" not in plan for plan in result)
         # One attempt per chunk and no second try for the same chunk.
         attempted = [frozenset(_candidate_ids(messages)) for messages in client.requests]
         assert client.calls == len(attempted), (client.calls, len(attempted))
@@ -422,6 +579,7 @@ def check_prompts_carry_the_person_rule():
 def main():
     check_no_chapter_board_reaches_reconciliation()
     check_two_people_never_become_one_card()
+    check_single_combined_npc_is_still_checked()
     check_identity_vetoes_a_title_match()
     check_reconciliation_request_is_bounded_and_cached()
     check_oversized_component_is_reported_not_sent()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -445,12 +446,18 @@ def check_request_cap_stops_the_split() -> None:
         # Every multi-unit window runs out of budget; every leaf succeeds, so the
         # recursion keeps making progress until the shared cap ends it.
         calls, worker = _length_worker(fail_above=1)
-        try:
-            _scope_call(job, profile, facts, units, sizes, tokens, _client(worker))
-        except Exception as error:  # noqa: BLE001
-            message = str(error)
-        else:  # pragma: no cover - defensive
-            raise AssertionError("an exhausted budget must fail the step")
+        # The shared limit is now derived from the first-level entry count; pin it to the
+        # old fixed value so this check keeps testing "stops exactly at the cap".
+        with mock.patch.object(
+            artifacts, "_global_plan_shared_request_limit",
+            lambda first_level: artifacts.GLOBAL_PLAN_MAX_REQUESTS,
+        ):
+            try:
+                _scope_call(job, profile, facts, units, sizes, tokens, _client(worker))
+            except Exception as error:  # noqa: BLE001
+                message = str(error)
+            else:  # pragma: no cover - defensive
+                raise AssertionError("an exhausted budget must fail the step")
 
         assert len(calls) == artifacts.GLOBAL_PLAN_MAX_REQUESTS, calls
         assert f"已发出 {artifacts.GLOBAL_PLAN_MAX_REQUESTS} 次模型请求" in message, message
@@ -697,7 +704,10 @@ def check_recovery_attempt_does_not_borrow_a_child_request() -> None:
         assert parent["attempts"][-1]["request_source"] == "recovery", parent["attempts"][-1]
         assert diagnostics["requests"] == [], diagnostics["requests"]
         assert diagnostics["step_requests"] == 4, diagnostics
-        assert diagnostics["step_request_limit"] == artifacts.GLOBAL_PLAN_MAX_REQUESTS, diagnostics
+        # The shared limit is derived from the first-level entry count (B=2 here).
+        assert diagnostics["step_request_limit"] == (
+            artifacts._global_plan_shared_request_limit(2)
+        ), diagnostics
         assert any("_global_plan_window_" in step_id for step_id in diagnostics["step_ids"]), (
             diagnostics["step_ids"]
         )
@@ -991,7 +1001,13 @@ def check_two_leaves_each_raise_once() -> None:
         "unit_2": [12000, 16000],
         "unit_3": [12000, 16000],
     }, seen
-    assert all(budget == 12000 for ids, budget in order if len(ids) > 1), order
+    # A multi-unit request starts at the 32k candidate budget and never escalates;
+    # only a single-unit leaf keeps the 12000 -> 16000 pair.
+    assert all(
+        budget == artifacts.GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+        for ids, budget in order if len(ids) > 1
+    ), order
+    assert all(budget in (12000, 16000) for ids, budget in order if len(ids) == 1), order
     assert len(order) <= artifacts.GLOBAL_PLAN_MAX_REQUESTS, len(order)
     covered = {fact_id for card in output["cards"] for fact_id in card.get("fact_ids", [])}
     assert covered == {fact.id for fact in facts}, covered
@@ -1041,7 +1057,16 @@ def check_leaf_window_uses_the_compact_contract() -> None:
     )
     full_chars = len(full[0]["content"]) + len(full[1]["content"])
     leaf_chars = len(leaf[0]["content"]) + len(leaf[1]["content"])
-    assert leaf_chars * 2 < full_chars, (leaf_chars, full_chars)
+    # v24 places the shared semantic contract in every planning message, so the leaf is
+    # no longer the smaller of the two: what distinguishes it is the contract it asks
+    # for, not the byte count (message growth is measured in the packing evidence).
+    assert leaf_chars > 0 and full_chars > 0
+    assert "[TASK:prep:artifact_global_plan_leaf]" in leaf[1]["content"]
+    assert "[TASK:prep:artifact_global_plan_leaf]" not in full[1]["content"]
+    assert "LEAF_RESPONSE_SCHEMA_JSON=" in leaf[1]["content"]
+    assert "LEAF_RESPONSE_SCHEMA_JSON=" not in full[1]["content"]
+    assert "cannot split further" in leaf[0]["content"]
+    assert "Output limits, read from the validator" in leaf[0]["content"]
     leaf_text = leaf[0]["content"] + leaf[1]["content"]
     assert "LEAF_RESPONSE_SCHEMA_JSON=" in leaf_text, leaf_text[:200]
     assert "No chapter scope exists for this window" in leaf[0]["content"], leaf[0]["content"]
@@ -1106,7 +1131,16 @@ def check_leaf_window_uses_the_compact_contract() -> None:
             message = str(error)
         else:  # pragma: no cover - defensive
             raise AssertionError("an invented chapter id must fail the window")
-    assert any("LEAF_RESPONSE_SCHEMA_JSON" not in prompt for prompt in prompts), prompts
+    # Multi-unit windows and leaves now share one compact producer; they are told
+    # apart by the window addendum rather than by the schema block.
+    assert any(
+        "ONE WINDOW made of several supplied index units" not in prompt
+        for prompt in prompts
+    ), prompts
+    assert any(
+        "ONE WINDOW made of several supplied index units" in prompt
+        for prompt in prompts
+    ), prompts
     assert any("LEAF_RESPONSE_SCHEMA_JSON" in prompt for prompt in prompts), (
         "the leaf request must use the compact contract"
     )
@@ -1698,7 +1732,10 @@ def check_only_the_failed_leaf_is_corrected() -> None:
         storage.DB_PATH = Path(directory) / "test.db"
         storage.init_db()
         output = _scope_call(job, profile, facts, units, sizes, tokens, _client(worker))
-    assert per_window[("unit_0", "unit_1")] == [12000], per_window
+    # A multi-unit window starts at the 32k candidate budget; only the leaf keeps 12k.
+    assert per_window[("unit_0", "unit_1")] == [
+        artifacts.GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+    ], per_window
     assert per_window[("unit_0",)] == [12000], per_window
     assert per_window[("unit_1",)] == [12000, 12000], per_window
     covered = {fid for card in output["cards"] for fid in card.get("fact_ids", [])}
@@ -1779,8 +1816,11 @@ def check_location_cards_need_source_supported_use() -> None:
              "open_questions": []}]
     sizes = {facts[0].id: 50}
     tokens = {facts[0].id: 20}
+    # The contract that is really sent for a window is the compact one, so the location
+    # duties are checked where production puts them.
     window = artifacts._global_plan_messages(
-        cthulhu, unit, sizes, tokens, None, partial_window=True, lead_window=False
+        cthulhu, unit, sizes, tokens, None, partial_window=True, lead_window=False,
+        compact_window=True,
     )
     leaf = artifacts._global_plan_messages(
         cthulhu, unit, sizes, tokens, None, partial_window=True, lead_window=False,
@@ -1794,7 +1834,9 @@ def check_location_cards_need_source_supported_use() -> None:
             "historical note",
             "map reference",
             "specifically support",
-            "independent",
+            # Two institutions with the same use stay two entries; the no-duplicate rule
+            # protects one entity or one state, not a second named entity.
+            "two institutions with the same use do not merge",
             "police station",
             "publisher",
             "hotel",
@@ -1802,7 +1844,7 @@ def check_location_cards_need_source_supported_use() -> None:
             assert expected in text, (label, expected, text[:300])
         assert "must receive its own location card" not in text, (
             "a name alone must not demand a card")
-    assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v22"
+    assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v24"
 
 
 def check_single_unit_scope_uses_the_leaf_contract() -> None:
@@ -1925,7 +1967,10 @@ def check_oversize_input_is_split_or_refused_before_sending() -> None:
     with tempfile.TemporaryDirectory(prefix="trpg-oversize-split-") as directory:
         storage.DB_PATH = Path(directory) / "test.db"
         storage.init_db()
-        with _patch.object(artifacts, "MAX_FACT_INPUT_CHARS", 9000):
+        # The v24 shared contract is larger, so the boundary must sit between one
+        # compact leaf (~14.4k) and the two-unit request (~16.2k) to still force
+        # exactly one split.
+        with _patch.object(artifacts, "MAX_FACT_INPUT_CHARS", 15500):
             output = _scope_call(
                 job := SimpleNamespace(id="artifact_job_oversize_split",
                                        model_id="probe", fake_model=False),
@@ -2028,7 +2073,9 @@ def check_oversize_scope_still_faces_parent_validation() -> None:
         with tempfile.TemporaryDirectory(prefix="trpg-oversize-parent-") as directory:
             storage.DB_PATH = Path(directory) / "test.db"
             storage.init_db()
-            with _patch.object(artifacts, "MAX_FACT_INPUT_CHARS", 12000):
+            # Between the two-unit window (~19.9k) and the three-unit window
+            # (~20.5k), so a four-unit root still exceeds the boundary.
+            with _patch.object(artifacts, "MAX_FACT_INPUT_CHARS", 20200):
                 for _ in range(times):
                     try:
                         output = artifacts._run_global_plan_scope(
@@ -2047,20 +2094,26 @@ def check_oversize_scope_still_faces_parent_validation() -> None:
 
     # Missing overview: windows only, no full-range correction, root fails honestly.
     sent, results, root, steps = run_board(with_overview=False, times=1)
-    window_requests = [item for item in sent if item["units"] == 1]
+    # The compact contract fits more units in the same boundary, so a window may now
+    # carry two units where the old contract forced one; what must hold is that every
+    # request is a window and none is the oversize root.
+    window_requests = [item for item in sent if item["units"] < 4]
     assert len(sent) == len(window_requests), sent
     assert all(item["units"] != 4 for item in sent), "an oversize root must not be sent"
-    assert all(item["size"] <= 12000 for item in sent), sent
+    assert all(item["size"] <= 20200 for item in sent), sent
     assert isinstance(results[0], str) and ("总览卡" in results[0] or "overview" in results[0])
     assert root["status"] == "failed" and not root.get("output"), root
     assert any(a["request_source"] == "recovery" for a in root["attempts"]), root["attempts"]
 
     # Entering twice in the same database: the second entry reuses the windows.
+    first_pass, _, _, _ = run_board(with_overview=False, times=1)
     sent, results, root, steps = run_board(with_overview=False, times=2)
     assert len(results) == 2 and all(isinstance(item, str) for item in results), results
-    assert len(sent) == 4, f"no request on re-entry, got {sent}"
+    # The second entry reuses the windows the first one already paid for, whatever the
+    # packing produced: the request count must not grow.
+    assert len(sent) == len(first_pass), (sent, first_pass)
     assert all(item["units"] != 4 for item in sent), sent
-    assert all(item["size"] <= 12000 for item in sent), sent
+    assert all(item["size"] <= 20200 for item in sent), sent
     assert root["status"] == "failed" and not root.get("output"), root
     recovery_attempts = [
         attempt for attempt in root["attempts"]
@@ -2069,9 +2122,12 @@ def check_oversize_scope_still_faces_parent_validation() -> None:
     assert len(recovery_attempts) == 2, root["attempts"]
 
     # A valid oversize scope completes in the same database and is cached.
+    sent3_once, _, _, _ = run_board(with_overview=True, times=1)
     sent3, results3, root3, _ = run_board(with_overview=True, times=2)
     assert not isinstance(results3[0], str), results3[0]
-    assert len(sent3) == 4, f"the second entry must reuse the windows, got {sent3}"
+    assert len(sent3) == len(sent3_once), (
+        f"the second entry must reuse the windows, got {sent3}"
+    )
     assert root3["status"] == "succeeded", root3
 
     # A normal (non-oversize) reply that fails schema still gets its one correction.

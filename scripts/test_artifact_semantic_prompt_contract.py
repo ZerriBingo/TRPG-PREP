@@ -63,7 +63,7 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
             materialized.append(messages)
             assert payload(messages, "ORIGINAL_FACTS_JSON") == facts
             assert payload(messages, "CARD_PLAN_JSON") == plan
-            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v15"
+            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v16"
             system = messages[0]["content"]
             assert "source_statistics, when supported, is a concise string quoting only supplied source information" in system
             assert "Every factual field must cite one or more fact_ids" in system
@@ -86,6 +86,16 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
             assert "usable_features holds two to five named features" in system
             assert "Begin environment_type with one scene rhythm" in system
 
+        # The starting assumption is stated in the fields each stage actually has: a
+        # planned card has no assumed_state, so planning says it in situation/purpose.
+        for messages in [scoped, unscoped]:
+            assert (
+                "state that starting assumption inside the plan card's own situation, "
+                "purpose or focus" in messages[0]["content"]
+            )
+        for messages in [local, direct, *materialized]:
+            assert "state what the material assumes" in messages[0]["content"]
+
         for messages in [local, scoped, unscoped, direct, *materialized]:
             system = messages[0]["content"]
             for requirement in (
@@ -94,7 +104,6 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
                 "without a supported evolving pressure", "factual triggers and consequences require",
                 "Distinguish source play reports and examples from default current state",
                 "Do not promote reported player choices", "Keep example outcomes conditional",
-                "state what the material assumes",
                 "never turn them into review questions", "Preserve reusable actionable capabilities",
                 "triggers, limits, costs, and counterplay", "A fact ID alone is not coverage",
                 "reflect it in appropriate declared", "do not invent or convert statistics",
@@ -123,8 +132,8 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
         assert payload(scoped, "REVIEWED_STRUCTURE_JSON") == structure
         assert "THIS request generates ONLY REVIEWED_STRUCTURE_JSON.chapters" in scoped[0]["content"]
 
-assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v15"
-assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v22"
+assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v16"
+assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v24"
 assert artifacts.LOCAL_DIGEST_PROMPT_VERSION == "prep-artifact-local-digest-v1"
 
 handouts = [fact.model_copy(update={"id": name, "kind": "handout"}) for name in (

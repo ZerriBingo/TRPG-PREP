@@ -29,8 +29,8 @@ from ..domain.models import (
 )
 
 
-PROMPT_VERSION = "prep-artifact-draft-v15"
-GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v22"
+PROMPT_VERSION = "prep-artifact-draft-v16"
+GLOBAL_PLAN_PROMPT_VERSION = "prep-artifact-global-plan-v24"
 LOCAL_DIGEST_PROMPT_VERSION = "prep-artifact-local-digest-v1"
 # Both versions participate in durable step hashes, so retries regenerate steps
 # produced under older semantics instead of reusing their successful outputs.
@@ -86,6 +86,91 @@ SOURCE_SEMANTIC_GUIDANCE = (
     "card fields during materialization. Do not bury it solely in reference facts or background. "
     "Preserve original source statistics and their fact citations where supported and allowed by "
     "the card definition; do not invent or convert statistics to the target rules. "
+)
+# The shared guidance tells every stage to record a starting assumption in assumed_state.
+# A planning card has no such field, so the planning variant states the same thing inside
+# the fields a plan actually has.  Materialization keeps the original wording and its own
+# assumed_state responsibility.
+SOURCE_SEMANTIC_GUIDANCE_PLANNING = SOURCE_SEMANTIC_GUIDANCE.replace(
+    "state what the material assumes in assumed_state rather than asking whether it "
+    "happened",
+    "state that starting assumption inside the plan card's own situation, purpose or "
+    "focus rather than asking whether it happened",
+)
+# Card responsibilities that hold for every board: closure, conditions, branches, reach.
+# These two constants are the shared planning contract, not a leaf-only addendum: the
+# whole-scope request, a multi-unit window and a single-unit leaf all carry them.
+COMPACT_CARD_SEMANTIC_GUIDANCE = (
+    "Every card's closure must support its own title, purpose, situation and focus: cite "
+    "the facts for the people, relations, capabilities and conditions that card actually "
+    "uses, and never borrow support from elsewhere in the scope, from another card, or from "
+    "a window or unit index. A cited fact ID is evidence only for what that fact says, "
+    "never blanket support for the sentence it is attached to, and the overview's own "
+    "assertions follow the same rule. When the source leaves a real gap, keep it in "
+    "open_questions rather than writing an unsupported assertion into purpose; purpose "
+    "states how the card is used at the table and does not soften, filter or reinterpret "
+    "the original facts. Keep each entity and its "
+    "own facts together: one card does not merge two different people, two different "
+    "organizations or two different objects into one composite subject, and a playable "
+    "situation may still involve several places when the source runs them as one scene. "
+    "Keep the source's conditions and knowledge states distinct: knowing something, being "
+    "willing to tell it, being able to tell it, and having actually told the investigators "
+    "are four different states, and a person who knows does not thereby disclose. What "
+    "happens in the world and what an opponent does after noticing or hearing about it are "
+    "separate: being watched, being detected, being threatened, and what follows a failed "
+    "threat are separate responses, never one automatic ladder. A check "
+    "or a moment the source describes that yields information, a trigger and its response, "
+    "and an example, a past event and the current situation are different things; a world "
+    "event does not need the investigators present to have happened, and information that "
+    "needs a successful check must not be rewritten as automatic. What ordinary time spent "
+    "already yields stays apart from what only a successful check yields, with the source's "
+    "own check and numbers, instead of every result sitting behind one success. Keep an "
+    "action's threshold at its stated precision: killing a person is not any violence, and "
+    "being seen escaping is not merely departing. Whether an event happens, "
+    "whether the investigators learn of it, and whether they attend are separate "
+    "conditions, so a newspaper branch never decides whether an event takes place. A "
+    "conditional branch the source really allows stays a condition even when it has not "
+    "happened yet, and conditional_example remains reserved for the source's own play "
+    "reports and examples. A pressure clock may "
+    "organize stages of one evolving pressure, but independent branches such as separate "
+    "communications or a near-death reaction must not be forced into one mandatory ladder; "
+    "leaving a branch in a person, place or threat card is allowed. Clues and capabilities "
+    "need a usable destination: a photo's means of recognition, a visit's condition or a "
+    "person's ability must be reachable from some card's purpose or focus, not only from "
+    "the overview, and a general verification route may hang on the person or place that "
+    "supplies it instead of needing a card of its own. Source assets such as maps, letters, "
+    "photos, newspapers and records are display material first: the asset itself is not a "
+    "card, but the lead, recognition, obtaining or verification its text supports must not "
+    "be dropped into background merely because its source kind is a handout, while pure "
+    "history may still be covered as background alone. "
+)
+# The location rule only makes sense for a board that runs on locations.
+COMPACT_LOCATION_SEMANTIC_GUIDANCE = (
+    "Two different institutions never share one location card, even when one source "
+    "passage mentions both: different institutions keep one card each when they are "
+    "alternatives inside the same fact, serve the same purpose, and cite completely "
+    "identical fact_ids. One card per entity is what the no-duplicate rule protects — it "
+    "forbids a second card about the same entity or the same state under a new title, never "
+    "a card about a different named entity, and one card never mixes two libraries, two "
+    "archives or two offices into a composite place. "
+    "Organize locations by the runnable entity: a named place that can be visited, "
+    "questioned, searched, studied, aided or blocked keeps its own location card even when "
+    "the source omits its layout, while a state variant of the same room (late entry, a "
+    "knocked door, a killer already gone) stays in that room's purpose and focus rather "
+    "than becoming a second location. A name alone, pure geography, a route, a boundary, a "
+    "map label or plain history with nothing runnable in this scope is not a location card; "
+    "that exclusion does not reach a place the source already says can be entered, "
+    "consulted or used, and says what is done there, how it is done, and what it yields — "
+    "such a place keeps its own entry. A resource the source describes only in general "
+    "terms keeps its stated purpose without inventing a building, an address or a keeper "
+    "the source does not name. "
+    "A lead, a verification route, a visitable activity or a person's ability needs a "
+    "checkable destination in the plan: a related location or NPC card's purpose or focus, "
+    "carrying that card's full fact_ids, is enough, so one fact need not become one card "
+    "and no new card type is introduced. Cross-place background may use the overview's "
+    "existing lead duty, but it must state a concrete use or direction; a full reference "
+    "list, a global_reference entry, or the remark that no layout is written is not an "
+    "organized usable resource. "
 )
 CLOCK_SEMANTIC_GUIDANCE = (
     "Each clock must track a single evolving pressure with a coherent starting state, "
@@ -157,6 +242,11 @@ GLOBAL_PLAN_PREVIOUS_PROMPT_VERSION = "prep-artifact-global-plan-v18"
 # windows.  The cap is shared by the parent and all children, so a provider that
 # keeps exhausting the response budget cannot turn one retry into an unbounded run.
 GLOBAL_PLAN_MAX_REQUESTS = 16
+# The shared request budget of one root planning attempt has to cover the first-level
+# windows the production chunker actually produces, plus room to recover.  It is a
+# bounded execution policy, not a claim about how often the model succeeds.
+GLOBAL_PLAN_RECOVERY_REQUESTS = 15
+GLOBAL_PLAN_REQUEST_HARD_CAP = 64
 GLOBAL_PLAN_WINDOW_MAX_CHARS = 36_000
 # A window that can no longer be split gets ONE larger budget instead of failing, but
 # only when the upstream itself reported finish_reason=length.  The value follows the
@@ -166,30 +256,49 @@ GLOBAL_PLAN_WINDOW_MAX_CHARS = 36_000
 # RequestBudget, so it counts against the same request cap and happens at most once per
 # step.  A reply that is still truncated stops the step instead of raising again.
 GLOBAL_PLAN_WINDOW_MAX_TOKENS = 16_000
+# A multi-unit planning request carries a compact contract and gets 32,000 completion
+# tokens from the start, with no outer escalation: three real windows completed at this
+# budget after the same inputs stopped at the 12,000 boundary.  It is the candidate
+# policy this round, not a claim that 32k always suffices.  A single-unit scope or leaf
+# keeps 12,000 with its one recorded raise to GLOBAL_PLAN_WINDOW_MAX_TOKENS.
+GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS = 32_000
 ARTIFACT_REQUEST_TIMEOUT = 300
 ARTIFACT_MAX_TOKENS = 9000
-# Cross-chapter identity reconciliation runs once, after every chapter plan has
-# been collected.  A single request sees all candidates, so it cannot disagree
-# with itself the way per-chapter planning requests inevitably would.
-IDENTITY_RECONCILE_PROMPT_VERSION = "prep-artifact-identity-reconcile-v2"
+# A chapter overview is the one materialization card that states the whole scope at once:
+# the same 9,000-token output ceiling that finishes a location or NPC card ended a real
+# overview request on finish_reason=length (2026-11-04 trial, 9,000/9,000 completion).
+# The general ceiling stays; this single card responsibility gets its own fixed budget.
+ARTIFACT_OVERVIEW_MAX_TOKENS = 16_000
+
+
+def _materialize_max_tokens(card_type: str) -> int:
+    """The fixed output budget of one materialization request, by card responsibility."""
+    return (
+        ARTIFACT_OVERVIEW_MAX_TOKENS if card_type == "chapter_overview" else ARTIFACT_MAX_TOKENS
+    )
+# Identity reconciliation runs once, after every plan has been collected.  A single
+# request sees all candidates of one type in one scope, so it cannot disagree with
+# itself the way per-request planning inevitably would.
+IDENTITY_RECONCILE_PROMPT_VERSION = "prep-artifact-identity-reconcile-v5"
 IDENTITY_RECONCILE_MAX_TOKENS = 8000
-IDENTITY_GROUP_CHAR_BUDGET = 40_000
+# Hard ceiling on the COMPLETE encoded request (system prompt, schema, facts and
+# wrappers), not on one candidate group.  It reuses the fact-input ceiling the rest of
+# the pipeline already respects, so "this request is bounded" means the same thing
+# everywhere: a request that does not fit is refused before it is sent and its
+# candidates are recorded as not judged, never truncated or half-sent.
+IDENTITY_REQUEST_MAX_CHARS = MAX_FACT_INPUT_CHARS
 # Keep a chunk's plan count well below IdentityReconciliationPayload.clusters
 # max_length, because validation requires every candidate to be covered once.
 IDENTITY_MAX_PLANS_PER_CHUNK = 120
-# Same-scope candidates: cards of one type that share at least one fact inside one
-# prep scope can be one entity split under two titles.  Sharing a fact is only a
-# candidate signal; the reconcile prompt makes the decision from the fact text, so
-# this rule may over-group without ever merging on its own.
+# One scope, one type: every location/NPC/threat plan of a preparation scope is a
+# candidate, whatever facts it cites.  Requiring a shared fact used to drop an entity
+# that two different facts introduced separately, so the only within-scope signal left
+# is the card type.  Fantasy environment plans stay out of this round.
 IDENTITY_SAME_SCOPE_TYPES = frozenset({"location", "npc", "threat"})
-# The reconcile step decides from the fact text, so each candidate carries a bounded
-# slice of its fact closure instead of the whole thing.
-IDENTITY_CANDIDATE_MAX_FACTS = 8
-IDENTITY_CANDIDATE_FACT_CHARS = 240
-# A component bigger than one chunk cannot be judged as a whole, so it is
-# reported instead of split.  Real components on the 8-chapter material are 16,
-# 27, 59 and 64 plans: the earlier cap of 40 silently dropped the two largest,
-# including the environment group that carries the mixed-location problem.
+# A component bigger than one chunk cannot be judged as a whole, so it is reported
+# instead of split.  Real components on the 8-chapter material are 16, 27, 59 and 64
+# plans: the earlier cap of 40 silently dropped the two largest, including the
+# environment group that carries the mixed-location problem.
 MAX_IDENTITY_CANDIDATE_PLANS = IDENTITY_MAX_PLANS_PER_CHUNK
 # A merged card must stay materializable, and the binding constraint is the
 # character/token budget on its fact closure, not a fact count: short facts
@@ -370,7 +479,7 @@ def _run_json_step(
         request_timeout=ARTIFACT_REQUEST_TIMEOUT,
         resume_saved_response=_artifact_resume_saved_response(stage, validator),
         recover_validation=recover,
-        fatal_error_types=(PlanCoverageError,),
+        fatal_error_types=(PlanCoverageError, MixedPersonCardError),
         error_factory=ArtifactGenerationError,
         chat_kwargs=chat_kwargs,
         step_budget=step_budget,
@@ -1512,6 +1621,153 @@ def _run_local_digest_window(
     )
 
 
+def _schema_bounds(schema: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the effective limits of one response model, following $ref and anyOf.
+
+    The compact contract has to state the limits the validator will actually apply, so
+    they are read from the response model instead of a hand-copied second validator.
+    """
+    defs = schema.get("$defs") or {}
+    bounds: dict[str, Any] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        # An optional object is an anyOf of the object and null; the null branch says
+        # nothing about the shape, so it must never overwrite what the object says.
+        if node.get("type") == "null":
+            return
+        reference = node.get("$ref")
+        if isinstance(reference, str):
+            walk(defs.get(reference.rsplit("/", 1)[-1], {}), path)
+        for option in node.get("anyOf") or []:
+            walk(option, path)
+        limits = {
+            key: node[key]
+            for key in ("enum", "minLength", "maxLength", "minItems", "maxItems",
+                        "minimum", "maximum", "pattern")
+            if key in node
+        }
+        # The kind of value is part of the contract: a mapping that must be an object,
+        # an array that must be a list.  `type` is kept as the short shape name.
+        if node.get("type") in {"string", "array", "object", "integer", "number", "boolean"}:
+            limits["shape"] = node["type"]
+        if node.get("properties"):
+            limits["keys"] = sorted(node["properties"])
+        if node.get("required"):
+            limits["required"] = list(node["required"])
+        if node.get("additionalProperties") is False:
+            limits["extra"] = "forbidden"
+        if limits:
+            # Several branches of one anyOf describe the same path: merge, never replace.
+            bounds.setdefault(path or "<root>", {}).update(limits)
+        for name, child in (node.get("properties") or {}).items():
+            walk(child, f"{path}.{name}" if path else name)
+        items = node.get("items")
+        if isinstance(items, dict):
+            walk(items, f"{path}[]")
+        if "additionalProperties" in node and isinstance(node["additionalProperties"], dict):
+            walk(node["additionalProperties"], f"{path}{{}}")
+
+    walk(schema, "")
+    return bounds
+
+
+def _compact_response_bounds() -> str:
+    """The same limits as one compact line each: path:key=value pairs.
+
+    JSON would triple the size of an already bounded request, so the contract states the
+    limits in the shortest form that stays unambiguous.  The validator still decides.
+    """
+    lines: list[str] = []
+    for label, schema in (
+        ("plan", GlobalPlanResponsePayload.model_json_schema()),
+        ("card", PlannedCardPayload.model_json_schema()),
+    ):
+        for path, limits in _schema_bounds(schema).items():
+            parts = ",".join(
+                f"{key}={value}" for key, value in limits.items() if key != "type"
+            )
+            if parts:
+                lines.append(f"{label}:{path}={parts}")
+    return " ".join(lines)
+
+
+def _compact_window_messages(
+    profile: RuleProfile,
+    units: list[dict[str, Any]],
+    fact_sizes: dict[str, int],
+    fact_tokens: dict[str, int],
+    structure_context: dict[str, Any] | None,
+    *,
+    leaf_window: bool,
+    lead_window: bool,
+    fact_payload: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    """The compact contract for one window, leaf or multi-unit, built once."""
+    messages = _leaf_plan_messages(
+        profile,
+        units,
+        fact_sizes,
+        fact_tokens,
+        structure_context,
+        lead_window=lead_window,
+        fact_payload=fact_payload,
+    )
+    semantic = COMPACT_CARD_SEMANTIC_GUIDANCE
+    if profile.runtime_navigation_mode == "location":
+        semantic += COMPACT_LOCATION_SEMANTIC_GUIDANCE
+    if leaf_window:
+        addendum = (
+            "This window is one index unit and cannot split further. "
+            + semantic
+            + CLOCK_SEMANTIC_GUIDANCE
+            + "Output limits, read from the validator that will judge this reply: "
+            + _compact_response_bounds()
+        )
+    else:
+        addendum = (
+            "This contract covers ONE WINDOW made of several supplied index units, not a "
+            "single leaf. "
+            + semantic
+            + CLOCK_SEMANTIC_GUIDANCE
+            + "Do not return assumed_state or any field outside the schema. Output limits, "
+            "read from the validator that will judge this reply: "
+            + _compact_response_bounds()
+        )
+    built = [dict(message) for message in messages]
+    built[0]["content"] = built[0]["content"] + " " + addendum
+    if not leaf_window:
+        # A multi-unit window is not a leaf, and the task marker says so: the wire task
+        # decides what the request asks for, so it must not read "leaf".  The window also
+        # carries the board contract, because planning a whole window needs the card
+        # types and their declared fields, not just the allowed type names.
+        built[1]["content"] = built[1]["content"].replace(
+            "[TASK:prep:artifact_global_plan_leaf]",
+            "[TASK:prep:artifact_global_plan]",
+        )
+        # The planner needs the card categories and their declared shape, not the
+        # rule mechanics: the same projection the whole-scope contract uses.
+        planning_profile = _board_prompt_payload(
+            profile,
+            definitions=[
+                {
+                    key: value
+                    for key, value in definition.model_dump(mode="json").items()
+                    if key in {"type", "label", "description", "required_fields",
+                               "optional_fields"}
+                }
+                for definition in profile.card_definitions
+            ],
+        )
+        built[1]["content"] = (
+            built[1]["content"]
+            + "\nBOARD_PROFILE_JSON="
+            + json.dumps(planning_profile, ensure_ascii=False)
+        )
+    return built
+
+
 def _leaf_plan_messages(
     profile: RuleProfile,
     planning_units: list[dict[str, Any]],
@@ -1604,11 +1860,14 @@ def _leaf_plan_messages(
             "there. A police station, publisher, hotel, residence, office, or a minor scene "
             "holding a lead keeps its own card, and several rooms of one building may be "
             "separate when each is usable. A name alone, pure geography (river, boundary, "
-            "district outline), a historical note, a route, a destination, or a map reference "
-            "is not a location card: leave it to the overview, global_reference_fact_ids or "
-            "open_questions. Each card's fact_ids must specifically support its title, "
-            "purpose and situation, and several cards must not reuse one fact set under "
-            "different titles unless their playable situations are independent. "
+            "district outline), a historical note, a route, or a map reference is not a "
+            "location card: leave it to the overview, global_reference_fact_ids or "
+            "open_questions. A place the source says can be entered, consulted or used, and "
+            "says what is done there and what it yields, is not such a reference and keeps "
+            "its own entry. Each card's fact_ids must specifically support its title, "
+            "purpose and situation. Two cards must not be one entity or one state under two "
+            "titles; a different named entity keeps its own card even when it cites the very "
+            "same facts, and two institutions with the same use do not merge. "
         )
     source_rules = (
         "Use only fact IDs from GLOBAL_UNITS_JSON and never invent facts. A later stage "
@@ -1647,7 +1906,7 @@ def _leaf_plan_messages(
         + brief_rule
         + board_rule
         + PERSON_SEMANTIC_GUIDANCE
-        + SOURCE_SEMANTIC_GUIDANCE
+        + SOURCE_SEMANTIC_GUIDANCE_PLANNING
         + "All user-facing text must be Chinese."
     )
     facts_block = ""
@@ -1689,16 +1948,18 @@ def _global_plan_messages(
     partial_window: bool = False,
     lead_window: bool = True,
     leaf_window: bool = False,
+    compact_window: bool = False,
     fact_payload: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     planning_units = _compact_global_units(units)
-    if leaf_window:
-        return _leaf_plan_messages(
+    if leaf_window or compact_window:
+        return _compact_window_messages(
             profile,
             planning_units,
             fact_sizes,
             fact_tokens,
             structure_context,
+            leaf_window=leaf_window,
             lead_window=lead_window,
             fact_payload=fact_payload,
         )
@@ -1799,7 +2060,7 @@ def _global_plan_messages(
         "new source. Each card will later reread the original fact_ids you select. Use only listed "
         "fact_ids, avoid duplicate cards, preserve conflicts as open questions, and keep each card's "
         "estimated original-fact input within the supplied character budget. "
-        + SOURCE_SEMANTIC_GUIDANCE
+        + SOURCE_SEMANTIC_GUIDANCE_PLANNING
         + CLOCK_SEMANTIC_GUIDANCE
         + PERSON_SEMANTIC_GUIDANCE
         + runtime_guidance
@@ -2214,6 +2475,24 @@ def _validate_global_plan(
             raise ArtifactGenerationError(
                 f"运行包摘要引用了不存在的事实: {unknown_brief_facts}"
             )
+    # Ownership closure: a source the brief already declares but forgot to list joins its
+    # fact_ids; an out-of-scope source, a chapter brief reaching into another chapter, or
+    # an over-limit list fails here, per brief.
+    closed_payload = _close_plan_briefs(
+        payload.model_dump(mode="json"),
+        allowed_fact_ids,
+        where="全局规划",
+        chapter_facts=_chapter_fact_sets(bundle),
+        chapter_scope=chapter_scope_ids,
+    )
+    payload.brief = (
+        RuntimeBrief.model_validate(closed_payload["brief"])
+        if closed_payload.get("brief") else None
+    )
+    for item, closed_item in zip(payload.chapter_briefs, closed_payload["chapter_briefs"],
+                                 strict=True):
+        item.brief = RuntimeBrief.model_validate(closed_item["brief"])
+    brief = payload.brief
     chapter_briefs = [item.model_dump(mode="json") for item in payload.chapter_briefs]
     global_reference_fact_ids = list(payload.global_reference_fact_ids)
     for item in chapter_briefs:
@@ -2387,6 +2666,130 @@ def _global_plan_split_candidate(error: Exception, units: list[dict[str, Any]]) 
     return len(units) > 1 and "finish_reason=length" in str(error)
 
 
+# `RuntimeBrief.fact_ids` bounds one brief at 100 ids.  The merge below must respect the
+# same ceiling instead of silently dropping ownership entries.
+RUNTIME_BRIEF_FACT_LIMIT = 100
+
+
+def _brief_closure(
+    brief: dict[str, Any] | None,
+    allowed_fact_ids: set[str],
+    *,
+    where: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Close one brief's ownership list against the facts its scope really allows.
+
+    The brief already declares which facts each field relies on in `field_sources`; this
+    makes that declaration consistent with the brief's own `fact_ids`:
+
+    - a declared fact id or field source outside the scope fails here, naming the brief,
+      the field and the ids — it is never filtered out and never quietly dropped;
+    - an in-scope id that only a field source names joins `fact_ids` (original order
+      first, then the field order the brief declared), because the brief already uses it;
+    - nothing else changes: no source is added, replaced or removed, the prose is
+      untouched, and an empty or missing source stays empty.  Row ownership only.
+
+    Returns ``(closed brief, report)`` and never modifies the input object.
+    """
+    if brief is None:
+        return None, {"where": where, "added": [], "limit": RUNTIME_BRIEF_FACT_LIMIT}
+    fact_ids = [str(fact_id) for fact_id in (brief.get("fact_ids") or [])]
+    unknown = [fact_id for fact_id in fact_ids if fact_id not in allowed_fact_ids]
+    if unknown:
+        raise ArtifactGenerationError(
+            f"{where} 的 fact_ids 引用了本范围之外的事实: {unknown}"
+        )
+    sources = brief.get("field_sources") or {}
+    stray: dict[str, list[str]] = {}
+    for field, ids in sources.items():
+        outside = [str(fact_id) for fact_id in (ids or []) if fact_id not in allowed_fact_ids]
+        if outside:
+            stray[str(field)] = outside
+    if stray:
+        detail = "；".join(f"{field}: {ids}" for field, ids in stray.items())
+        raise ArtifactGenerationError(
+            f"{where} 的字段来源引用了本范围之外的事实（{detail}）；未过滤后继续。"
+        )
+    # Stable de-duplication: the brief's own order first, then the declared source order.
+    merged = list(dict.fromkeys(fact_ids))
+    for ids in sources.values():
+        for fact_id in ids or []:
+            if fact_id not in merged:
+                merged.append(str(fact_id))
+    if len(merged) > RUNTIME_BRIEF_FACT_LIMIT:
+        raise ArtifactGenerationError(
+            f"{where} 闭合后的自有事实清单为 {len(merged)} 项，超过 {RUNTIME_BRIEF_FACT_LIMIT} "
+            "项上限；没有删除引用或正文，也没有再发起汇总请求。"
+        )
+    closed = dict(brief)
+    closed["fact_ids"] = merged
+    return closed, {
+        "where": where,
+        "added": merged[len(fact_ids):],
+        "limit": RUNTIME_BRIEF_FACT_LIMIT,
+    }
+
+
+def _chapter_fact_sets(bundle: Any) -> dict[str, set[str]] | None:
+    """Which confirmed chapter owns which fact, from the bundle itself."""
+    chapters = getattr(bundle, "adventure_chapters", None) or []
+    if not chapters:
+        return None
+    return {chapter.id: set(chapter.fact_ids) for chapter in chapters}
+
+
+def _close_plan_briefs(
+    output: dict[str, Any],
+    allowed_fact_ids: set[str],
+    *,
+    where: str,
+    chapter_facts: dict[str, set[str]] | None = None,
+    chapter_scope: set[str] | None = None,
+) -> dict[str, Any]:
+    """Return one planning output whose package and chapter briefs are ownership-closed.
+
+    A chapter brief is checked against **its own chapter's** confirmed facts, intersected
+    with what this request allowed: sharing the scope's fact list is not enough, or a
+    brief for one chapter could adopt a fact that belongs only to another.  The package
+    brief stays scoped to the whole request.  This is the consumption boundary: it also
+    runs for a cached step output, because `persistent_step` returns a successful record
+    before any validator sees it.
+    """
+    closed = dict(output)
+    closed["brief"], _ = _brief_closure(
+        output.get("brief"), allowed_fact_ids, where=f"{where} 的运行包摘要")
+    chapter_briefs = []
+    for item in output.get("chapter_briefs") or []:
+        entry = dict(item)
+        chapter_id = entry.get("chapter_id")
+        chapter_where = f"{where} 的章节摘要 {chapter_id}"
+        if not chapter_id:
+            raise ArtifactGenerationError(f"{where} 的章节摘要缺少 chapter_id")
+        if chapter_scope and chapter_id not in chapter_scope:
+            raise ArtifactGenerationError(
+                f"{chapter_where} 的章节不在本次审查范围内（{sorted(chapter_scope)}）"
+            )
+        if chapter_facts is not None:
+            if chapter_id not in chapter_facts:
+                raise ArtifactGenerationError(f"{chapter_where} 的章节未在已确认章节中")
+            # Intersect: the chapter's own ownership and what this request carried.
+            allowed = chapter_facts[chapter_id] & allowed_fact_ids
+        else:
+            allowed = allowed_fact_ids
+        entry["brief"], _ = _brief_closure(entry.get("brief"), allowed, where=chapter_where)
+        stray_references = [
+            fact_id for fact_id in (entry.get("reference_fact_ids") or [])
+            if fact_id not in allowed
+        ]
+        if stray_references:
+            raise ArtifactGenerationError(
+                f"{chapter_where} 的 reference_fact_ids 不属于该章节: {stray_references}"
+            )
+        chapter_briefs.append(entry)
+    closed["chapter_briefs"] = chapter_briefs
+    return closed
+
+
 def _merge_runtime_brief_dicts(
     current: dict[str, Any] | None, incoming: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -2405,11 +2808,16 @@ def _merge_runtime_brief_dicts(
         "fact_ids",
         "open_questions",
     ):
-        limit = 100 if key == "fact_ids" else 50 if key == "open_questions" else 30
+        limit = 50 if key == "open_questions" else 30
         merged[key] = list(dict.fromkeys([
             *(merged.get(key) or []),
             *(incoming.get(key) or []),
-        ]))[:limit]
+        ]))
+        # The ownership list is never truncated here: dropping entries while keeping their
+        # field sources would leave the merged brief citing ids it no longer owns.  The
+        # ceiling is enforced once, by `_brief_closure`, which fails loudly on overflow.
+        if key != "fact_ids":
+            merged[key] = merged[key][:limit]
     sources = dict(merged.get("field_sources") or {})
     for field, refs in (incoming.get("field_sources") or {}).items():
         sources[field] = list(dict.fromkeys([
@@ -2501,36 +2909,48 @@ def _global_plan_window_chunks(
     fact_tokens: dict[str, int],
     structure_context: dict[str, Any] | None,
     plan_client: Any,
+    facts: list[Any] | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Pack planning units by the encoded request size, preserving unit ownership."""
+    """Pack planning units by the size of the request each window will really send.
+
+    The measured message is the compact window contract carrying that window's own facts:
+    measuring anything else (a longer contract, or adding fact sizes by hand) sizes windows
+    for a request production never sends.
+    """
     encode_messages = getattr(plan_client, "messages", None)
 
     def encoded(messages: list[dict[str, str]]) -> list[dict[str, str]]:
         return encode_messages(messages) if callable(encode_messages) else messages
 
-    def facts_chars(units: list[dict[str, Any]]) -> int:
+    def window_chars(units: list[dict[str, Any]], lead: bool) -> int:
         ids = {fid for unit in units for fid in unit.get("fact_ids", [])}
-        return sum(fact_sizes.get(fid, 0) for fid in ids)
+        # The send builds its fact list in the scope's own order, so the measurement must
+        # do the same; sorting by id would produce a byte-different message.
+        owned = [fact for fact in (facts or []) if fact.id in ids]
+        messages = _global_plan_messages(
+            profile,
+            units,
+            {key: value for key, value in fact_sizes.items() if key in ids},
+            {key: value for key, value in fact_tokens.items() if key in ids},
+            structure_context,
+            partial_window=True,
+            lead_window=lead,
+            leaf_window=len(units) == 1,
+            compact_window=len(units) > 1,
+            fact_payload=_fact_payload_from_facts(owned),
+        )
+        return len(json.dumps(encoded(messages), ensure_ascii=False))
 
     if len(units) <= 1:
         return [list(units)]
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
+    # A window may never be packed beyond the input boundary the request must respect.
+    pack_limit = min(GLOBAL_PLAN_WINDOW_MAX_CHARS, MAX_FACT_INPUT_CHARS)
     for unit in units:
         candidate = [*current, unit]
-        messages = _global_plan_messages(
-            profile,
-            candidate,
-            fact_sizes,
-            fact_tokens,
-            structure_context,
-            partial_window=True,
-            lead_window=not chunks,
-        )
-        encoded_chars = len(json.dumps(
-            encoded(messages), ensure_ascii=False
-        )) + facts_chars(candidate)
-        if current and encoded_chars > GLOBAL_PLAN_WINDOW_MAX_CHARS:
+        encoded_chars = window_chars(candidate, not chunks)
+        if current and encoded_chars > pack_limit:
             chunks.append(current)
             current = [unit]
         else:
@@ -2579,6 +2999,7 @@ def _recover_global_plan_windows(
         plan_fact_tokens,
         plan_context,
         plan_client,
+        facts=plan_facts,
     )
     if len(chunks) == 1:
         step_budget.recoveries.append(f"窗口 {path or plan_index} 已无法拆分")
@@ -2623,6 +3044,7 @@ def _recover_global_plan_windows(
             # Every window, leaf or not, carries the facts it must cite; the index
             # summary is navigation only.
             leaf_window=leaf_window,
+            compact_window=not leaf_window,
             fact_payload=window_fact_payload,
         )
         encode = getattr(plan_client, "messages", None)
@@ -2690,7 +3112,7 @@ def _recover_global_plan_windows(
                 lead_window=child_lead,
             )
 
-        outputs.append(_run_json_step(
+        window_output = _run_json_step(
             job,
             stage=window_stage,
             step_index=1,
@@ -2700,6 +3122,7 @@ def _recover_global_plan_windows(
                 # The leaf contract is part of the step identity, so a window produced by
                 # the older, larger contract is never reused for it.
                 "leaf_contract": "compact-v1" if leaf_window else "window",
+                "window_contract": "compact-leaf-v3" if leaf_window else "compact-window-v3",
                 "profile": profile.model_dump(mode="json"),
                 "units": _compact_global_units(window_units),
                 "fact_sizes": window_sizes,
@@ -2715,8 +3138,14 @@ def _recover_global_plan_windows(
             },
             messages=window_messages,
             client=plan_client,
-            max_tokens=GLOBAL_PLAN_MAX_TOKENS,
-            max_budget=GLOBAL_PLAN_WINDOW_MAX_TOKENS,
+            max_tokens=(
+                GLOBAL_PLAN_MAX_TOKENS if leaf_window
+                else GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+            ),
+            max_budget=(
+                GLOBAL_PLAN_WINDOW_MAX_TOKENS if leaf_window
+                else GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+            ),
             validator=lambda raw, owned_units=window_units, owned_facts=window_facts: (
                 _validate_global_plan_window(
                     raw,
@@ -2744,8 +3173,54 @@ def _recover_global_plan_windows(
             ),
             step_budget=step_budget,
             budget_identity=f"global_plan:{plan_index}:{window_path}",
+        )
+        # Consumption boundary: this also covers a cached window output, which no
+        # validator would see again.
+        outputs.append(_close_plan_briefs(
+            window_output, set(window_ids),
+            where=f"全局规划窗口 {window_path}",
+            chapter_facts=_chapter_fact_sets(bundle), chapter_scope=chapter_scope,
         ))
     return _merge_global_plan_outputs(outputs)
+
+
+def _global_plan_window_budget_failure(step_record: Any) -> RuntimeError | None:
+    """The current input identity failed because its window recovery ran out of requests.
+
+    This is a different situation from a length reply: the full-scope request never got a
+    chance, because the recovery spent the step's shared request budget on child windows.
+    Only that exact record may resume the windows directly; a plain failure, an old prompt
+    version, or any error without the step-budget diagnostics stays on the ordinary path.
+    """
+    if not step_record or step_record.get("status") != "failed":
+        return None
+    for attempt in reversed(step_record.get("attempts") or []):
+        error_text = str(attempt.get("error") or "")
+        if "次模型请求" not in error_text:
+            continue
+        if attempt.get("request_source") != "recovery":
+            continue
+        diagnostics = attempt.get("diagnostics") or {}
+        limit = diagnostics.get("step_request_limit")
+        used = diagnostics.get("step_requests")
+        step_ids = list(diagnostics.get("step_ids") or [])
+        # A recorded window step is the structural proof that the split actually ran;
+        # the root's own id, or a plain model attempt, is not.
+        window_ids = [item for item in step_ids if "global_plan_window_" in str(item)]
+        if limit and used is not None and used >= limit and window_ids:
+            return RuntimeError(error_text)
+    return None
+
+
+def _global_plan_shared_request_limit(first_level: int) -> int:
+    """How many upstream requests one root planning attempt may spend.
+
+    B is the number of first-level entries the chunker produces for this exact scope
+    (1 for a single-unit scope).  R is the recovery allowance, and the hard cap is the
+    absolute execution ceiling for one run; it cannot be raised while the run is going.
+    """
+    work = max(1, first_level)
+    return min(GLOBAL_PLAN_REQUEST_HARD_CAP, max(GLOBAL_PLAN_MAX_REQUESTS, work + GLOBAL_PLAN_RECOVERY_REQUESTS))
 
 
 def _run_global_plan_scope(
@@ -2763,7 +3238,18 @@ def _run_global_plan_scope(
     plan_client: Any,
 ) -> dict[str, Any]:
     """Run one full global plan, recovering length exhaustion through windows."""
-    step_budget = RequestBudget(max_requests=GLOBAL_PLAN_MAX_REQUESTS)
+    if len(plan_units) <= 1:
+        first_level = 1
+    else:
+        first_level = len(
+            _global_plan_window_chunks(
+                plan_units, profile, plan_fact_sizes, plan_fact_tokens, plan_context,
+                plan_client, facts=plan_facts,
+            )
+        )
+    scale_refusal = first_level > GLOBAL_PLAN_REQUEST_HARD_CAP
+    shared_limit = _global_plan_shared_request_limit(first_level)
+    step_budget = RequestBudget(max_requests=shared_limit)
     scope_is_leaf = len(plan_units) == 1
     scope_facts = _fact_payload_from_facts(plan_facts)
     messages = _global_plan_messages(
@@ -2776,6 +3262,7 @@ def _run_global_plan_scope(
         # scope, however, now carries the original facts it must cite, so a multi-unit
         # request that succeeds directly cannot plan without per-ID evidence.
         leaf_window=scope_is_leaf,
+        compact_window=not scope_is_leaf,
         fact_payload=scope_facts,
     )
     oversize_scope = False
@@ -2811,6 +3298,19 @@ def _run_global_plan_scope(
         "unit_ids": [unit["id"] for unit in plan_units],
         "fact_ids": [fact.id for fact in plan_facts],
     }
+
+    if scale_refusal:
+        # An exact succeeded root is a cache hit, not new work: it must return before any
+        # scale refusal.  Only a scope with no stored plan is refused before sending.
+        stored_hash = _stable_hash(
+            {**input_payload, "_model_id": job.model_id, "_fake_model": job.fake_model}
+        )
+        stored = storage.load_artifact_job_step(job.id, "global_plan", plan_index, stored_hash)
+        if not (stored and stored.get("status") == "succeeded" and stored.get("output")):
+            raise ArtifactGenerationError(
+                f"当前范围需要 {first_level} 个一级规划窗口，超过单次执行上界 "
+                f"{GLOBAL_PLAN_REQUEST_HARD_CAP}；未发送任何请求，缓存与输入保持不变。"
+            )
 
     def recover(raw: Any, error: Exception) -> Any:
         if not _global_plan_split_candidate(error, plan_units):
@@ -2863,8 +3363,17 @@ def _run_global_plan_scope(
                 return attempt.get("response"), RuntimeError(error_text)
         return None
 
+    window_budget_failure = _global_plan_window_budget_failure(current_step)
     seed = _stored_length_failure(current_step)
-    if seed is None and (current_step is None or current_step.get("status") != "succeeded"):
+    # A failure recorded under the previous contract may still split THIS scope, but the
+    # current contract has its own size: when the whole scope now fits, its own request is
+    # sent first and the old record must not short-circuit it into windows.
+    previous_failure_is_relevant = encoded_size > MAX_FACT_INPUT_CHARS
+    if (
+        seed is None
+        and previous_failure_is_relevant
+        and (current_step is None or current_step.get("status") != "succeeded")
+    ):
         # An upgrade recovery (or a plain recovery) that failed leaves the current step
         # failed with the child window's error, not with a length reply.  The stored
         # failure of the prior version can still seed the same recovery, so a retry
@@ -2902,7 +3411,27 @@ def _run_global_plan_scope(
     # Resuming recovery without a request is only right while the scope can still be
     # reduced; a single-unit scope must ask the provider again, and the caller's
     # recovery checks the same predicate.
-    if not oversize_scope and seed is not None and _global_plan_split_candidate(
+    if not oversize_scope and seed is None and window_budget_failure is not None:
+        # The same input identity already split into windows and spent its shared budget
+        # there.  Re-entering the windows reuses every successful current-version window
+        # and only asks for the ones still missing, instead of paying for the whole-scope
+        # request again.
+        def startup_recovery() -> Any:  # noqa: F811 - narrower than the length path
+            return _recover_global_plan_windows(
+                job,
+                plan_index=plan_index,
+                profile=profile,
+                bundle=bundle,
+                plan_units=plan_units,
+                plan_facts=plan_facts,
+                plan_fact_sizes=plan_fact_sizes,
+                plan_fact_tokens=plan_fact_tokens,
+                plan_context=plan_context,
+                chapter_scope=chapter_scope,
+                plan_client=plan_client,
+                step_budget=step_budget,
+            )
+    elif not oversize_scope and seed is not None and _global_plan_split_candidate(
         seed[1], plan_units
     ):
         # A prompt-only version change (or an earlier failed recovery) must not make the
@@ -2914,7 +3443,7 @@ def _run_global_plan_scope(
         def startup_recovery() -> Any:
             return recover(seed_response, seed_error)
 
-    return _run_json_step(
+    root_output = _run_json_step(
         job,
         stage="global_plan",
         step_index=plan_index,
@@ -2922,7 +3451,9 @@ def _run_global_plan_scope(
         input_refs=input_refs,
         messages=messages,
         client=plan_client,
-        max_tokens=GLOBAL_PLAN_MAX_TOKENS,
+        max_tokens=(
+            GLOBAL_PLAN_MAX_TOKENS if scope_is_leaf else GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+        ),
         validator=lambda raw: _validate_global_plan(
             raw,
             plan_units,
@@ -2937,13 +3468,17 @@ def _run_global_plan_scope(
         recover_existing_failure=(
             lambda raw, error: _global_plan_split_candidate(error, plan_units)
         ),
-        # A single-unit scope is already a leaf: its one raise belongs in this step.
+        # Only a single-unit scope is a leaf: its one raise belongs in this step.  A
+        # multi-unit scope starts at its own budget and never escalates outside it.
         chat_kwargs=(
             {"escalate_max_tokens": GLOBAL_PLAN_WINDOW_MAX_TOKENS}
-            if len(plan_units) == 1
+            if scope_is_leaf
             else None
         ),
-        max_budget=GLOBAL_PLAN_WINDOW_MAX_TOKENS,
+        max_budget=(
+            GLOBAL_PLAN_WINDOW_MAX_TOKENS if scope_is_leaf
+            else GLOBAL_PLAN_MULTI_UNIT_MAX_TOKENS
+        ),
         # A root that had to start from windows never sent its own request, so its
         # correction must not become that oversize request.
         allow_correction=not oversize_scope,
@@ -2951,6 +3486,13 @@ def _run_global_plan_scope(
         budget_identity=f"global_plan:{plan_index}:root",
         startup_recovery=startup_recovery,
     )
+    # Consumption boundary for the whole scope, cached root replies included. The window
+    # path already closed each window against its own facts, so the merged result only
+    # has to satisfy this scope's ownership ceiling.
+    return _close_plan_briefs(
+        root_output, {fact.id for fact in plan_facts},
+        where=f"全局规划范围 {plan_index}",
+        chapter_facts=_chapter_fact_sets(bundle), chapter_scope=chapter_scope)
 
 
 def _compact_global_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2975,7 +3517,13 @@ def _prompt_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in plan.items()
-        if key not in {"identity_key", "situation", "case_scope"}
+        if key not in {
+            "identity_key",
+            IDENTITY_KEYS_FIELD,
+            IDENTITY_UNJUDGED_FIELD,
+            "situation",
+            "case_scope",
+        }
     }
 
 
@@ -3012,7 +3560,11 @@ def _materialization_messages(
             else ", leaving the field's uncertainty in open_questions. "
         )
         + MATERIALIZATION_FIDELITY_GUIDANCE
-        + "Before returning, check the fields object key by key against REQUIRED_FIELD_SHAPES_JSON; "
+        + "In field_sources, give every field that states source content the fact ids that "
+        "support it, and give a field that only reports a gap in the source an explicit "
+        "empty list; never leave a populated field without a field_sources entry, and "
+        "never attach a fact id to text that fact does not support. "
+        "Before returning, check the fields object key by key against REQUIRED_FIELD_SHAPES_JSON; "
         "array-shaped fields must be JSON arrays, never scalar strings. "
         "source_statistics, when supported, is a concise string quoting only supplied source information, "
         "never a stat-block object or generated rules. current_stage must be a string if included; "
@@ -3070,6 +3622,10 @@ def _materialization_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+# "The source does not say" is a statement about the source, not a fact-derived claim.
+# Such a field must not carry field_sources, or the card reads as if the source supported
+# the gap itself.  The pattern is deliberately narrow: one clause that opens with the
+# source being silent, with no second clause that could hold real content.
 def _validate_materialized_card(
     raw: Any,
     bundle: ExampleBundle,
@@ -3194,18 +3750,58 @@ def _generate_direct_step(
     )
 
 
+# Identity keys a surviving plan stands for.  A survivor may have absorbed several
+# plans, so one key is not enough to tell whether a newcomer may join it.  The field is
+# private: it never reaches a prompt and never becomes part of a card.
+IDENTITY_KEYS_FIELD = "_identity_keys"
+# A plan the identity step did not judge (oversized request, failed block) carries this
+# marker.  It is not "different entity" and not "same entity": it is "no decision", and
+# the merge must not read a shared title as permission to combine it.
+IDENTITY_UNJUDGED_FIELD = "_identity_unjudged"
+
+
+def _identity_key_set(plan: dict[str, Any]) -> frozenset[str]:
+    keys = plan.get(IDENTITY_KEYS_FIELD)
+    if keys:
+        return frozenset(str(item) for item in keys)
+    single = plan.get("identity_key")
+    return frozenset({single}) if isinstance(single, str) and single else frozenset()
+
+
+def _is_unjudged(plan: dict[str, Any]) -> bool:
+    return bool(plan.get(IDENTITY_UNJUDGED_FIELD))
+
+
 def _identities_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """Whether two plans may still be one card given what identity already decided.
 
-    An absent key is unknown, not a conflict: the pre-identity title rule keeps
-    working for every plan the identity step did not judge.  Two different keys are a
-    decision that these are different entities, so a title match must not override it.
+    An absent key set is unknown, not a conflict: the pre-identity title rule keeps
+    working for plans the identity step never judged.  Two disjoint key sets are a
+    decision that these are different entities, and a title match must not override it.
+
+    Comparing the whole set, not one key, is what stops an unjudged card from acting as
+    a bridge: if A and B were judged different, A cannot merge with the unjudged bridge
+    and then absorb B through the survivor's title.
     """
-    left_key = left.get("identity_key")
-    right_key = right.get("identity_key")
-    if not left_key or not right_key:
+    if _is_unjudged(left) or _is_unjudged(right):
+        # No judgement is not a licence to merge: the title rule only ever applied to
+        # cards nobody had looked at, and these were looked at and left undecided.
+        return False
+    left_keys = _identity_key_set(left)
+    right_keys = _identity_key_set(right)
+    if not left_keys or not right_keys:
         return True
-    return left_key == right_key
+    return bool(left_keys & right_keys)
+
+
+def _carry_identity_keys(
+    survivor: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    combined = sorted(_identity_key_set(survivor) | _identity_key_set(incoming))
+    if not combined:
+        return
+    survivor[IDENTITY_KEYS_FIELD] = combined
+    survivor["identity_key"] = combined[0]
 
 
 def _merge_match(
@@ -3238,7 +3834,9 @@ def _merge_match(
         (
             item
             for item in merged
-            if item["type"] == incoming["type"] and item.get("identity_key") == identity
+            if item["type"] == incoming["type"]
+            and item.get("identity_key") == identity
+            and _identities_compatible(item, incoming)
         ),
         None,
     )
@@ -3261,10 +3859,36 @@ class IdentityClusterPayload(BaseModel):
         return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
 
+class MultiPersonSubjectPayload(BaseModel):
+    """A plan that combines several separately playable people."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(min_length=1, max_length=80)
+    subjects: list[str] = Field(min_length=2, max_length=8)
+    fact_ids: list[str] = Field(min_length=1, max_length=40)
+
+    @field_validator("subjects")
+    @classmethod
+    def normalize_subjects(cls, value: list[str]) -> list[str]:
+        return [" ".join(item.split()) for item in value if item.strip()]
+
+    @field_validator("fact_ids")
+    @classmethod
+    def unique_fact_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
 class IdentityReconciliationPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    clusters: list[IdentityClusterPayload] = Field(min_length=1, max_length=200)
+    # A plan is covered by exactly one of the two lists, so clusters may be empty when
+    # every candidate is reported as a combined person card.  ``model_validator``
+    # enforces the coverage rule in ``_validate_identity_clusters``.
+    clusters: list[IdentityClusterPayload] = Field(default_factory=list, max_length=200)
+    multi_person_plans: list[MultiPersonSubjectPayload] = Field(
+        default_factory=list, max_length=50
+    )
 
 
 def _plan_thread_ids(
@@ -3287,22 +3911,25 @@ def _plan_scope_key(plan: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(plan.get("chapter_ids") or []))
 
 
+def _slug_id(value: str) -> str:
+    return re.sub(r"[\W_]+", "_", value, flags=re.UNICODE).strip("_")[:40]
+
+
 def _identity_candidate_components(
     plans: list[dict[str, Any]], bundle: ExampleBundle
 ) -> list[list[str]]:
-    """Cards that may describe one entity, grouped for reconciliation.
+    """Cards that can be one entity, grouped for reconciliation.
 
-    Two signals nominate a group.  The original one is a shared storyline or runtime
-    group joined across chapters.  The added one is same-type cards inside a single
-    preparation scope that cite a shared fact under different titles: a board with no
-    chapters never reached this step at all, so an entity split under two titles could
-    never be reconciled, no matter what the merge rule said.
+    Two signals nominate a group.  One is a shared storyline or runtime group joined
+    across chapters.  The other is one card type inside one preparation scope: that is
+    the only signal that finds an entity two *different* facts introduced separately, so
+    it deliberately does not require a shared fact.  Fact ids travel with each candidate
+    as evidence for the judgement, never as the nomination.
 
-    A shared fact is only a nomination.  Nothing merges on this signal alone; the
-    reconcile step reads the fact text and decides, and a cluster of one means no
-    merge.
+    A group of one is kept for NPC cards, because a single plan that combines two
+    people can only be reported if it is looked at.
     """
-    if len(plans) < 2:
+    if not plans:
         return []
     threads_by_plan = _plan_thread_ids(plans, bundle)
     by_id = {plan["id"]: plan for plan in plans}
@@ -3330,21 +3957,16 @@ def _identity_candidate_components(
         for other in members[1:]:
             union(members[0], other)
 
-    # Same-type, same-scope fact sharing.  A card in another chapter is left to the
-    # cross-chapter signal above, so this can never widen a cross-chapter judgement.
-    same_scope_members: set[str] = set()
-    fact_index: dict[tuple[str, tuple[str, ...], str], list[str]] = {}
+    scope_members: set[str] = set()
+    scope_buckets: dict[tuple[str, tuple[str, ...]], list[str]] = {}
     for plan in plans:
         if plan["type"] not in IDENTITY_SAME_SCOPE_TYPES:
             continue
-        scope = _plan_scope_key(plan)
-        for fact_id in plan.get("fact_ids") or []:
-            index_key = (plan["type"], scope, fact_id)
-            fact_index.setdefault(index_key, []).append(plan["id"])
-    for members in fact_index.values():
-        if len(members) < 2:
-            continue
-        same_scope_members.update(members)
+        scope_buckets.setdefault((plan["type"], _plan_scope_key(plan)), []).append(
+            plan["id"]
+        )
+    for members in scope_buckets.values():
+        scope_members.update(members)
         for other in members[1:]:
             union(members[0], other)
 
@@ -3353,9 +3975,17 @@ def _identity_candidate_components(
         components.setdefault(find(plan["id"]), []).append(plan["id"])
     candidates: list[list[str]] = []
     for members in components.values():
+        members = sorted(members)
+        judged_in_scope = any(member in scope_members for member in members)
         if len(members) < 2:
+            if (
+                members
+                and members[0] in scope_members
+                and by_id[members[0]]["type"] == "npc"
+            ):
+                candidates.append(members)
             continue
-        if not any(member in same_scope_members for member in members):
+        if not judged_in_scope:
             chapters = {
                 chapter_id
                 for plan_id in members
@@ -3363,105 +3993,244 @@ def _identity_candidate_components(
             }
             if len(chapters) < 2:
                 continue
-        candidates.append(sorted(members))
+        candidates.append(members)
     return sorted(candidates, key=lambda item: item[0])
 
 
-def _identity_candidate_payload(
-    component: list[str],
+def _identity_request_payload(
+    components: list[list[str]],
     by_id: dict[str, dict[str, Any]],
     facts_by_id: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = []
-    for plan_id in component:
-        plan = by_id[plan_id]
-        facts: list[dict[str, str]] = []
-        for fact_id in list(plan.get("fact_ids") or [])[:IDENTITY_CANDIDATE_MAX_FACTS]:
-            fact = facts_by_id.get(fact_id)
-            if fact is None:
-                continue
-            text = " ".join(str(fact.get("text") or "").split())
-            facts.append({"id": fact_id, "text": text[:IDENTITY_CANDIDATE_FACT_CHARS]})
-        payload.append(
-            {
-                "plan_id": plan_id,
-                "type": plan["type"],
-                "title": plan["title"],
-                "purpose": plan.get("purpose"),
-                "focus": list(plan.get("focus") or [])[:8],
-                "chapter_ids": list(plan.get("chapter_ids") or []),
-                "facts": facts,
-            }
-        )
-    return payload
+) -> dict[str, Any]:
+    """The evidence one judgement needs: the shared projection, whole and deduplicated.
+
+    Facts keep every field the shared fact-input contract allows -- evidence status,
+    source references, tags, notes included -- because the judgement has to see whether
+    something is a reviewed source fact or an inference.  Trimming them made a change of
+    evidence status invisible to the judgement and to the cached step.  Facts are sent
+    once each, sorted by id, and each candidate cites them by id.
+    """
+    candidates: list[dict[str, Any]] = []
+    cited: list[str] = []
+    for component in components:
+        for plan_id in component:
+            plan = by_id[plan_id]
+            fact_ids = list(plan.get("fact_ids") or [])
+            cited.extend(fact_ids)
+            candidates.append(
+                {
+                    "plan_id": plan_id,
+                    "type": plan["type"],
+                    "title": plan["title"],
+                    "purpose": plan.get("purpose"),
+                    "focus": list(plan.get("focus") or [])[:8],
+                    "chapter_ids": list(plan.get("chapter_ids") or []),
+                    "fact_ids": fact_ids,
+                }
+            )
+    facts = [
+        facts_by_id[fact_id]
+        for fact_id in sorted(dict.fromkeys(cited))
+        if fact_id in facts_by_id
+    ]
+    return {
+        "facts": facts,
+        "candidates": candidates,
+        "groups": [list(component) for component in components],
+    }
 
 
-def _identity_reconcile_messages(
-    groups: list[list[dict[str, Any]]],
-) -> list[dict[str, str]]:
+def _identity_reconcile_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
     system = (
-        "You reconcile card identity inside one TRPG preparation. Each candidate group "
-        "lists planned cards that may describe the same thing: they share a storyline, "
-        "a runtime group, or at least one source fact. Sharing a fact is only a hint, so "
-        "read the supplied fact text before deciding. Split every group into clusters "
-        "that describe the SAME single playable person, the SAME single place, or the "
-        "SAME single named threat. Two cards about one entity under different titles "
-        "belong in one cluster. Two different people, two different places, or two "
-        "different threats stay in separate clusters even when they cite the same fact, "
-        "appear in one scene, or were introduced by one another; a relation named in "
-        "one card is never evidence that two people are one person. Never place two "
-        "separate playable people in one cluster. A cluster of one card is a valid "
-        "answer and means no merge. Return only one JSON object with key clusters, each "
-        "item having label and plan_ids. label is a short Chinese name of the shared "
-        "person, place or threat. Every candidate plan_id must appear in exactly one "
-        "cluster. Use only supplied plan_ids and only what the supplied fact text "
+        "You reconcile card identity inside one TRPG preparation. Each group lists "
+        "planned cards of one type inside one preparation scope; the group is only a "
+        "hint, so read the supplied fact text before deciding. Split every group into "
+        "clusters that describe the SAME single playable person, the SAME single place, "
+        "or the SAME single named threat. Two cards about one entity under different "
+        "titles belong in one cluster. Two different people, two different places, or "
+        "two different threats stay in separate clusters even when they cite the same "
+        "fact, appear in one scene, or were introduced by one another; a relation named "
+        "in one card is never evidence that two people are one person. A cluster of one "
+        "card is a valid answer and means no merge. "
+        "If one candidate plan describes two or more separately playable people, do not "
+        "split it and do not cluster it: report it in multi_person_plans with the names "
+        "it introduces and the fact ids that introduce them, because a combined person "
+        "card is not an accepted result. "
+        "Return only one JSON object with keys clusters and multi_person_plans; each "
+        "cluster has label and plan_ids, and label is a short Chinese name of the shared "
+        "person, place or threat. A plan is covered by exactly one of the two lists: an "
+        "ordinary plan appears in one cluster, a reported plan appears only in "
+        "multi_person_plans. The two lists are disjoint and together cover every "
+        "supplied plan_id exactly once, so clusters may be empty when every candidate is "
+        "reported. Use only supplied plan_ids and only what the supplied fact text "
         "states; never invent an id, a person or a fact. "
         + SOURCE_SEMANTIC_GUIDANCE + CLOCK_SEMANTIC_GUIDANCE
         + "All user-facing text must be Chinese."
     )
-    user = json.dumps(
-        {
-            "schema": IdentityReconciliationPayload.model_json_schema(),
-            "candidate_groups": groups,
-        },
-        ensure_ascii=False,
+    user = (
+        "[TASK:prep:artifact_identity_reconcile]\n"
+        + json.dumps(
+            {"schema": IdentityReconciliationPayload.model_json_schema(), **payload},
+            ensure_ascii=False,
+        )
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _validate_identity_clusters(raw: Any, allowed_ids: set[str]) -> dict[str, Any]:
+def _mixed_report_error(
+    reports: list[dict[str, Any]], titles_by_plan: dict[str, str] | None = None
+) -> "MixedPersonCardError":
+    listed = "；".join(
+        f"{(titles_by_plan or {}).get(item['plan_id'], item['plan_id'])}"
+        f"（{'、'.join(item['subjects'])}）"
+        for item in reports
+    )
+    return MixedPersonCardError(
+        "识别到一张计划卡同时承载多位可分别扮演的人物，已停止，以免把多个人物落成一张卡："
+        f"{listed}。现有统一重试会复用原计划，不会自动拆分或改写它；"
+        "当前版本没有自动拆分入口，需要先修正计划（重新规划该范围）才能继续。"
+    )
+
+
+def _mixed_reports(
+    raw: Any, allowed_ids: set[str], facts_by_plan: dict[str, set[str]] | None
+) -> list[dict[str, Any]]:
+    """Any structurally usable mixed-person report inside a response.
+
+    Read leniently on purpose: a response can be invalid for another reason (coverage,
+    a stray cluster) and still say plainly that one plan holds two people.  Letting that
+    plan through because the response failed validation elsewhere would be exactly the
+    silent combination this step is supposed to stop.
+    """
+    reports: list[dict[str, Any]] = []
+    if not isinstance(raw, dict):
+        return reports
+    for item in raw.get("multi_person_plans") or []:
+        if not isinstance(item, dict):
+            continue
+        plan_id = item.get("plan_id")
+        subjects = item.get("subjects")
+        fact_ids = item.get("fact_ids")
+        if plan_id not in allowed_ids:
+            continue
+        if not isinstance(subjects, list) or len([x for x in subjects if str(x).strip()]) < 2:
+            continue
+        if not isinstance(fact_ids, list) or not fact_ids:
+            continue
+        supported = set((facts_by_plan or {}).get(plan_id, set()))
+        if any(str(fact) not in supported for fact in fact_ids):
+            continue
+        reports.append(
+            {
+                "plan_id": plan_id,
+                "subjects": [str(x).strip() for x in subjects if str(x).strip()],
+                "fact_ids": [str(fact) for fact in fact_ids],
+            }
+        )
+    return reports
+
+
+def _identity_clusters_payload(
+    raw: Any,
+    allowed_ids: set[str],
+    facts_by_plan: dict[str, set[str]] | None,
+) -> dict[str, Any]:
+    """Schema and coverage checks, with every complaint an ordinary error."""
     try:
         payload = IdentityReconciliationPayload.model_validate(raw)
     except ValidationError as error:
-        raise ArtifactGenerationError(f"跨章节身份重整 JSON 不符合约定: {error}") from error
-    seen: list[str] = []
+        raise ArtifactGenerationError(f"身份重整 JSON 不符合约定: {error}") from error
+    covered: list[str] = []
     for cluster in payload.clusters:
         unknown = [item for item in cluster.plan_ids if item not in allowed_ids]
         if unknown:
             raise ArtifactGenerationError(f"身份重整返回了候选之外的卡片: {unknown}")
-        seen.extend(cluster.plan_ids)
-    if len(seen) != len(set(seen)):
-        raise ArtifactGenerationError("身份重整把同一张候选卡放进了多个簇")
-    missing = sorted(allowed_ids - set(seen))
+        covered.extend(cluster.plan_ids)
+    for report in payload.multi_person_plans:
+        if report.plan_id not in allowed_ids:
+            raise ArtifactGenerationError(
+                f"多人报告引用了候选之外的卡片: {report.plan_id}"
+            )
+        supported = set((facts_by_plan or {}).get(report.plan_id, set()))
+        unsupported = [item for item in report.fact_ids if item not in supported]
+        if unsupported:
+            raise ArtifactGenerationError(
+                f"多人报告引用了该计划之外的事实: {report.plan_id} {unsupported}"
+            )
+        covered.append(report.plan_id)
+    if len(covered) != len(set(covered)):
+        raise ArtifactGenerationError("身份重整把同一张候选卡覆盖了两次")
+    missing = sorted(allowed_ids - set(covered))
     if missing:
         raise ArtifactGenerationError(f"身份重整未覆盖候选卡: {missing}")
     return payload.model_dump(mode="json")
 
 
+def _validate_identity_clusters(
+    raw: Any,
+    allowed_ids: set[str],
+    facts_by_plan: dict[str, set[str]] | None = None,
+    titles_by_plan: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """One error classification for the whole response, not one branch at a time.
+
+    A trustworthy mixed-person report is a source-backed statement that one planned card
+    holds several people.  Whatever else is wrong with the response -- an unknown id, a
+    double coverage, a missing card, a schema error, a second report out of range -- the
+    artifact job must not go on to materialize that card.  So every validation complaint
+    is routed through this single wrapper: with a trustworthy report present, the error
+    becomes ``MixedPersonCardError`` (stop, do not "correct and continue"); without one,
+    the ordinary bounded-error behaviour is unchanged and an invented or out-of-range
+    report is never upgraded into a fact.
+    """
+    mixed = _mixed_reports(raw, allowed_ids, facts_by_plan)
+    try:
+        return _identity_clusters_payload(raw, allowed_ids, facts_by_plan)
+    except MixedPersonCardError:
+        raise
+    except ArtifactGenerationError as error:
+        if mixed:
+            raise _mixed_report_error(mixed, titles_by_plan) from error
+        raise
+
+
 def _identity_keys_from_clusters(output: dict[str, Any]) -> dict[str, str]:
+    """One stable key per judged plan, singletons included.
+
+    A singleton cluster is a decision ("this card is its own entity"), so it must reach
+    the merge as a key.  Leaving it unkeyed used to let the title rule merge it back into
+    a same-titled card that had been judged different.
+    """
     keys: dict[str, str] = {}
     for cluster in output.get("clusters") or []:
         members = list(dict.fromkeys(cluster.get("plan_ids") or []))
-        if len(members) < 2:
-            continue
         label = " ".join(str(cluster.get("label") or "").split()).casefold()
         # \W is Unicode-aware, so a Chinese label keeps its characters instead of
         # collapsing to the "shared" fallback an ASCII-only class produced.
-        slug = re.sub(r"[\W_]+", "_", label, flags=re.UNICODE).strip("_")[:40] or "shared"
-        digest = hashlib.sha256("|".join(sorted(members)).encode("utf-8")).hexdigest()[:10]
+        slug = _slug_id(label) or "shared"
+        digest = hashlib.sha256(
+            "|".join(sorted(members)).encode("utf-8")
+        ).hexdigest()[:10]
+        if len(members) < 2:
+            for plan_id in members:
+                keys[plan_id] = f"identity_solo_{_slug_id(plan_id) or digest}"
+            continue
         for plan_id in members:
             keys[plan_id] = f"identity_{slug}_{digest}"
     return keys
+
+
+class MixedPersonCardError(ArtifactGenerationError):
+    """A planned NPC card stands for several people, so the run stops instead."""
+
+
+def _identity_request_chars(payload: dict[str, Any]) -> int:
+    """Measure the complete encoded request, prompt and schema included."""
+    return len(
+        json.dumps(
+            _identity_reconcile_messages(payload), ensure_ascii=False
+        )
+    )
 
 
 def _assign_plan_identities(
@@ -3471,32 +4240,41 @@ def _assign_plan_identities(
     question_summary: Any,
     client: Any,
 ) -> list[dict[str, Any]]:
-    """Give cross-chapter cards one identity before the merge decides card count."""
+    """Give judged cards one identity, singletons included, before the merge runs."""
     components = _identity_candidate_components(plans, bundle)
     if not components:
         return plans
     by_id = {plan["id"]: plan for plan in plans}
     facts_by_id = {item["id"]: item for item in _fact_payload_from_facts(bundle.facts)}
+    facts_by_plan = {
+        plan_id: set(plan.get("fact_ids") or []) for plan_id, plan in by_id.items()
+    }
     oversized = [item for item in components if len(item) > MAX_IDENTITY_CANDIDATE_PLANS]
     components = [item for item in components if len(item) <= MAX_IDENTITY_CANDIDATE_PLANS]
+    identity_by_plan: dict[str, str] = {}
+    unjudged: list[str] = [plan_id for item in oversized for plan_id in item]
+    unjudged_refused = len(unjudged)
+    unjudged_failed: list[str] = []
+    titles_by_plan = {plan_id: plan.get("title", plan_id) for plan_id, plan in by_id.items()}
     if oversized:
         question_summary.add([
-            f"有 {len(oversized)} 组跨章节候选超过 {MAX_IDENTITY_CANDIDATE_PLANS} 张卡，"
-            "本轮未做身份重整，这些卡片保持各自独立。"
+            f"有 {len(oversized)} 组同范围候选超过 {MAX_IDENTITY_CANDIDATE_PLANS} 张卡，"
+            "本轮未做身份重整，这些卡片保持各自独立；未判定不等于确认它们可以合并。"
         ])
-    identity_by_plan: dict[str, str] = {}
-    chunk: list[list[dict[str, Any]]] = []
-    chunk_ids: list[str] = []
+    chunk: list[list[str]] = []
     chunk_type: str | None = None
-    chunk_chars = 0
     step_index = 0
 
+    def chunk_payload(groups: list[list[str]]) -> dict[str, Any]:
+        return _identity_request_payload(groups, by_id, facts_by_id)
+
     def flush() -> None:
-        nonlocal chunk, chunk_ids, chunk_type, chunk_chars, step_index
+        nonlocal chunk, chunk_type, step_index
         if not chunk:
             return
         step_index += 1
-        allowed = set(chunk_ids)
+        allowed = {plan_id for component in chunk for plan_id in component}
+        payload = chunk_payload(chunk)
         try:
             output = _run_json_step(
                 job,
@@ -3504,66 +4282,93 @@ def _assign_plan_identities(
                 step_index=step_index,
                 input_payload={
                     "prompt_version": IDENTITY_RECONCILE_PROMPT_VERSION,
-                    "candidate_groups": chunk,
+                    # The full fact text is part of the cached input: an edit anywhere
+                    # in a cited fact changes this step identity, not only an edit
+                    # inside a truncated window.
+                    "evidence": payload,
                 },
                 input_refs={
                     "plan_ids": sorted(allowed),
-                    # The fact text is part of the request and of its cached input, so
-                    # an edited fact invalidates the identity judgement that used it.
-                    "fact_ids": sorted(
-                        {
-                            fact_id
-                            for plan_id in allowed
-                            for fact_id in by_id[plan_id].get("fact_ids") or []
-                        }
-                    ),
+                    "fact_ids": [item["id"] for item in payload["facts"]],
                 },
-                messages=_identity_reconcile_messages(chunk),
+                messages=_identity_reconcile_messages(payload),
                 client=client,
                 max_tokens=IDENTITY_RECONCILE_MAX_TOKENS,
-                validator=lambda raw, expected=allowed: _validate_identity_clusters(
-                    raw, expected
+                validator=lambda raw, expected=allowed, per_plan=facts_by_plan: (
+                    _validate_identity_clusters(raw, expected, per_plan)
                 ),
             )
+        except MixedPersonCardError:
+            raise
         except Exception as error:  # noqa: BLE001
+            unjudged.extend(sorted(allowed))
+            unjudged_failed.extend(sorted(allowed))
             question_summary.add([
-                f"第 {step_index} 组跨章节身份重整失败：{error}；该组卡片保持各自独立。"
+                f"第 {step_index} 组身份重整失败：{error}；该组卡片未被判定，"
+                "不会因为标题相同被合并。"
             ])
         else:
+            mixed = output.get("multi_person_plans") or []
+            if mixed:
+                # The identification step succeeded and its output is cached; the
+                # artifact job still has to stop, and a re-entry stops again with no
+                # further request because the saved report is replayed.
+                raise _mixed_report_error(mixed, titles_by_plan)
             identity_by_plan.update(_identity_keys_from_clusters(output))
         chunk = []
-        chunk_ids = []
         chunk_type = None
-        chunk_chars = 0
 
     for component in components:
-        group = _identity_candidate_payload(component, by_id, facts_by_id)
-        size = len(json.dumps(group, ensure_ascii=False))
-        # Components are single-type, and a chunk stays single-type with them:
-        # a mixed prompt let the model cluster across types, and _merge_match is
-        # type-scoped in both passes, so those keys could never merge anything.
         component_type = by_id[component[0]]["type"]
-        if chunk and (
-            component_type != chunk_type
-            or chunk_chars + size > IDENTITY_GROUP_CHAR_BUDGET
-            or len(chunk_ids) + len(component) > IDENTITY_MAX_PLANS_PER_CHUNK
-        ):
-            flush()
-        chunk.append(group)
-        chunk_ids.extend(component)
-        chunk_type = component_type
-        chunk_chars += size
-    flush()
-    if not identity_by_plan:
-        return plans
-    return [
-        (
-            {**plan, "identity_key": identity_by_plan[plan["id"]]}
-            if plan["id"] in identity_by_plan
-            else plan
+        candidate_chunk = [*chunk, component]
+        # A chunk stays single-type: a mixed prompt let the model cluster across types,
+        # and the merge is type-scoped in both passes, so such keys could never merge.
+        too_many = (
+            len({plan_id for item in candidate_chunk for plan_id in item})
+            > IDENTITY_MAX_PLANS_PER_CHUNK
         )
-        for plan in plans
-    ]
+        over_size = (
+            _identity_request_chars(chunk_payload(candidate_chunk))
+            > IDENTITY_REQUEST_MAX_CHARS
+        )
+        if chunk and (component_type != chunk_type or too_many or over_size):
+            flush()
+            candidate_chunk = [component]
+            over_size = (
+                _identity_request_chars(chunk_payload(candidate_chunk))
+                > IDENTITY_REQUEST_MAX_CHARS
+            )
+            too_many = len(component) > IDENTITY_MAX_PLANS_PER_CHUNK
+        if over_size or too_many:
+            # Refuse instead of sending an oversized request or trimming the evidence;
+            # the candidates stay in the plan and are reported as not judged.
+            unjudged.extend(component)
+            continue
+        chunk = candidate_chunk
+        chunk_type = component_type
+    flush()
+    if unjudged_refused:
+        question_summary.add([
+            f"有 {unjudged_refused} 张候选卡组成的请求超过 {IDENTITY_REQUEST_MAX_CHARS} 字符"
+            "的完整请求上限，未发送、未判定；它们保持各自独立，不能当作已确认可合并。"
+        ])
+    if unjudged_failed:
+        question_summary.add([
+            f"有 {len(unjudged_failed)} 张候选卡的身份判定请求已发送但失败，未判定；"
+            "它们保持各自独立，不能当作已确认可合并。"
+        ])
+    unjudged_set = set(unjudged)
+    if not identity_by_plan and not unjudged_set:
+        return plans
+    judged: list[dict[str, Any]] = []
+    for plan in plans:
+        if plan["id"] in identity_by_plan:
+            judged.append({**plan, "identity_key": identity_by_plan[plan["id"]]})
+        elif plan["id"] in unjudged_set:
+            judged.append({**plan, IDENTITY_UNJUDGED_FIELD: True})
+        else:
+            judged.append(plan)
+    return judged
 
 
 def _plan_merge_keys(plan: dict[str, Any]) -> list[tuple[str, str]]:
@@ -3591,6 +4396,10 @@ def _report_unmerged_identities(
     for index, plan in enumerate(plans):
         for key in _plan_merge_keys(plan):
             first = seen_keys.setdefault(key, index)
+            if first != index and not _identities_compatible(plans[first], plans[index]):
+                # Kept apart because identity said so, not because a budget blocked a
+                # merge; reporting it as a budget outcome would be a false statement.
+                continue
             left, right = find(first), find(index)
             if left != right:
                 parent[right] = left
@@ -3667,9 +4476,9 @@ def _merge_chapter_plans(
                     [*match.get(field_name, []), *incoming.get(field_name, [])]
                 )
             )
-        # The survivor now stands for both plans, so it must carry the identity
-        # too; otherwise a later member of the same cluster stays apart unseen.
-        match["identity_key"] = match.get("identity_key") or incoming.get("identity_key")
+        # The survivor now stands for both plans, so it must carry every identity it
+        # absorbed; otherwise a later member of the same cluster stays apart unseen.
+        _carry_identity_keys(match, incoming)
     return merged
 
 
@@ -4110,7 +4919,13 @@ def _generate_hierarchical_artifacts(
     chapter_briefs = []
     uncovered = []
     collected_plans: list[dict[str, Any]] = []
+    scope_fact_ids = {fact.id for fact in facts_by_id.values()}
     for output in plan_outputs:
+        # Last consumption point before the bundle is written: a plan scope may carry a
+        # merged brief whose ownership list outgrew the ceiling while merging.
+        output = _close_plan_briefs(
+            output, scope_fact_ids, where="规划结果汇总",
+            chapter_facts=_chapter_fact_sets(bundle))
         output = _normalize_runtime_group_anchors(output, profile)
         runtime_brief = runtime_brief or output.get("brief")
         chapter_briefs.extend(output.get("chapter_briefs") or [])
@@ -4145,6 +4960,7 @@ def _generate_hierarchical_artifacts(
             return generated_cards, question_summary, current, runtime_brief, chapter_briefs
         selected_facts = [facts_by_id[fact_id] for fact_id in plan["fact_ids"]]
         fact_payload = _fact_payload_from_facts(selected_facts)
+        materialize_budget = _materialize_max_tokens(plan["type"])
         subset_bundle = bundle.model_copy(
             update={"facts": selected_facts, "cards": [], "plans": []}
         )
@@ -4165,7 +4981,11 @@ def _generate_hierarchical_artifacts(
                 },
                 messages=_materialization_messages(profile, _prompt_plan(plan), fact_payload),
                 client=client,
-                max_tokens=ARTIFACT_MAX_TOKENS,
+                # The budget follows the card responsibility, and the step's own ceiling is
+                # that same value: a recorded larger budget from another card can never
+                # raise this step above it.
+                max_tokens=materialize_budget,
+                max_budget=materialize_budget,
                 validator=lambda raw, selected_bundle=subset_bundle, card_plan=plan: (
                     _validate_materialized_card(
                         raw,
@@ -4408,7 +5228,15 @@ def _validate_and_build(
                 # They must never silently claim source provenance.
                 field_sources[field_name] = []
                 continue
-            refs = list(dict.fromkeys(draft.field_sources.get(field_name) or list(draft.fact_ids)))
+            declared = draft.field_sources.get(field_name)
+            if declared is None:
+                # No declaration at all: repair to the card's closure, as before.
+                refs = list(dict.fromkeys(draft.fact_ids))
+            else:
+                # An explicit (possibly empty) list is the model's statement about this
+                # field.  A gap note declares no source and must not be backfilled with
+                # the whole closure; a sourced field keeps exactly what it cited.
+                refs = list(dict.fromkeys(declared))
             unknown_refs = [item for item in refs if item not in allowed_facts]
             if unknown_refs:
                 raise ArtifactGenerationError(

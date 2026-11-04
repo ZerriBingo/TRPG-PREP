@@ -529,5 +529,5 @@ messages = _materialization_messages(
 prompt = "\n".join(message["content"] for message in messages)
 for required_field in location_definition.required_fields:
     assert required_field in prompt
-assert "MUST be present and non-empty" in prompt
+assert "must be present and non-empty" in prompt
 print("PASS: scalar list-shaped card fields normalize deterministically")
