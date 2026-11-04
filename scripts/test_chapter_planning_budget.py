@@ -32,6 +32,20 @@ def main():
     batches = a._artifact_batches(bundle, facts)
     assert [{fact.id for fact in batch} for batch in batches] == [set(ids[:16]), set(ids[15:31])]
     assert all(ids[-1] not in {fact.id for fact in batch} for batch in batches)
+
+    plain_bundle = ExampleBundle.model_validate({
+        "id": "plain_local_digest_budget", "name": "Plain", "profile_ids": ["cthulhu-dark-2e"],
+        "facts": [fact.model_dump(mode="json") for fact in facts], "cards": [], "plans": [],
+    })
+    location_profile = load_profiles(ROOT / "backend/domain/profiles")["cthulhu-dark-2e"]
+    runtime_batches = a._artifact_batches(plain_bundle, facts, profile=location_profile)
+    assert [len(batch) for batch in runtime_batches] == [16, 16]
+    assert [item.id for batch in runtime_batches for item in batch] == ids
+    assert all(
+        a._estimate_tokens(json.dumps(a._fact_payload_from_facts(batch), ensure_ascii=False))
+        <= a.LOCAL_DIGEST_MAX_FACT_TOKENS
+        for batch in runtime_batches
+    )
     units = [{"id": f"unit_{index}", "kind": "scene", "title": f"Scene {index}",
               "summary": "Detailed narrative context. " * 45, "fact_ids": [fact.id],
               "entity_keys": [], "relationship_hints": [], "open_questions": []}

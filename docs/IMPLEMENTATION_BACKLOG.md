@@ -1,6 +1,6 @@
 # Implementation Backlog
 
-Status: R1/R2, R3/R5, R4, both R6 slices, R7 shared interfaces, the two-board acceptance preparation, and the isolated synthetic rehearsal review are independently signed off in the current working directory, uncommitted. Real generation and human timing remain unverified.
+Status (2026-11-02): R1–R7 shipped as PR #1 / 0.1.6a0. The closeout round settled the remaining generation blockers: bounded empty/truncated recovery, split windows and durable retry stay as signed off; identity reconciliation now also reaches same-scope cards that cite a shared fact, so one entity split under two titles merges on a no-chapter board, while two different entities keep separate cards; one NPC card carries one person; materialization may name a source gap in a required field instead of inventing a working assumption. Offline counterexamples are green on a clean candidate cut from `origin/main`, and one isolated browser pass proved the run-wide note panel, the approval branch (an unapproved duplicate never enters the run) and prep-selection persistence with zero model calls. Artifact quality on the whole chapter and real GM timing remain unverified. Record: `PR_CLOSEOUT_2026-11-02_RECEIPT.md`.
 
 The owner-confirmed goals and ruleset boundaries are in `PRODUCT_GUARDRAILS.md` (2026-10-31), with board direction in `REASSESSMENT_2026-08-31.md`. The current implementation audit, evidence, limitations, and R1–R7 acceptance criteria are in `MAINTENANCE_2026-10-31_TAKEOVER_AUDIT.md`. Historical projects and artifacts inform diagnosis; compatibility or migration requires an explicit user-facing rationale.
 
@@ -104,7 +104,14 @@ The owner-confirmed goals and ruleset boundaries are in `PRODUCT_GUARDRAILS.md` 
 
 ## Next Work
 
-1. **Parameterize a reproducible rehearsal runner.** Preserve the existing product behavior while
+1. **Validate the artifact pipeline on a whole chapter.** Generation recovery, split windows,
+   durable retry, same-scope identity and source fidelity are implemented and covered by offline
+   counterexamples, and one isolated browser pass proved the page branch with zero model calls.
+   What is still open is quality, not plumbing: a full-chapter board that the GM would accept at
+   the table, and the human preparation time it takes to get there. Do not treat bounded probes
+   or mocks as that acceptance. Record: `PR_CLOSEOUT_2026-11-02_RECEIPT.md`.
+
+2. **Parameterize a reproducible rehearsal runner.** Preserve the existing product behavior while
    making the no-dot temporary root, code-copy manifest, forced Fake override, cleanup, and source
    PDF hashes runnable from one command. Add no production import or persistence path. Then review
    the cross-task single-candidate acceptance route with a task-ownership regression before any

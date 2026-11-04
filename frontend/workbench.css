@@ -735,7 +735,10 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px v
 .runtime-action-button { height: 38px; white-space: nowrap; cursor: pointer; }
 .runtime-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .runtime-head label[for="runtime-profile"], .runtime-columns > .panel:nth-child(2) { display: none; }
-.runtime-action-grid, #export-session-review-markdown, #export-session-review-json, .runtime-columns + .panel { display: none; }
+/* The old console stays offline, but the run-wide note panel is a shipped feature:
+   name it explicitly instead of hiding whatever happens to follow .runtime-columns. */
+.runtime-action-grid, #export-session-review-markdown, #export-session-review-json { display: none; }
+.runtime-notes { display: block; }
 .runtime-list { display: grid; gap: 10px; }
 .runtime-clock { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: rgba(18, 21, 26, .55); }
 .runtime-clock-track { display: flex; gap: 5px; margin: 10px 0; }

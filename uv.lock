@@ -544,7 +544,7 @@ wheels = [
 
 [[package]]
 name = "trpg-prep"
-version = "0.1.6a0"
+version = "0.1.6a1"
 source = { virtual = "." }
 dependencies = [
     { name = "curl-cffi" },

@@ -208,7 +208,15 @@ async def main() -> None:
                 }
                 assert all(item["review_state"] == "approved" for item in workbench["bundle"]["adventure_chapters"])
                 assert all(item["overview"] for item in workbench["bundle"]["adventure_chapters"])
-                assert all(set(card["chapter_ids"]) == chapter_ids for card in cards)
+                # Cards cite the board's chapters and nothing outside it; every chapter
+                # must have at least one product, so a subset is allowed but a hole is not.
+                assert all(set(card["chapter_ids"]) <= chapter_ids for card in cards)
+                assert all(card["chapter_ids"] for card in cards), [
+                    card["title"] for card in cards if not card["chapter_ids"]
+                ]
+                assert {chapter for card in cards for chapter in card["chapter_ids"]} == chapter_ids
+                for chapter_id in chapter_ids:
+                    assert any(chapter_id in card["chapter_ids"] for card in cards), chapter_id
                 plan_steps = [
                     item
                     for item in storage.list_artifact_job_steps(artifact_job["id"])
@@ -241,7 +249,11 @@ async def main() -> None:
                 assert planned.status_code == 200, planned.text
                 plan = planned.json()["plan"]
                 assert plan["navigation_mode"] == "environment"
-                assert plan["environment_card_ids"] == [environment["id"]]
+                # Every environment card on the board is navigable; an undecided
+                # identity block is no longer collapsed into one card by title.
+                assert set(plan["environment_card_ids"]) == {
+                    card["id"] for card in cards if card["type"] == "environment"
+                }
                 assert plan["location_card_ids"] == []
                 assert plan["beats"] == []
         finally:

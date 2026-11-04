@@ -54,9 +54,8 @@ def main() -> None:
         assert plain.chat([{"role": "user", "content": "hi"}]) == "ok"
     assert captured.get("reasoning_effort") == "", captured
 
-    # An upstream that cannot honour the hint makes a reasoning model spend the whole
-    # reply thinking.  That must not fail the run: the client drops the hint and repeats
-    # the call, and later calls stop sending it.
+    # Empty length responses may trigger one caller-approved budget raise, but the
+    # configured hint stays the same across that retry and later logical calls.
     calls: list[dict] = []
 
     def budget_exhausted(command, input=None, **kwargs):  # noqa: A002
@@ -69,7 +68,7 @@ def main() -> None:
 
             @property
             def stdout(self) -> str:
-                if payload.get("reasoning_effort"):
+                if len(calls) == 1:
                     return json.dumps({"content": None, "finish_reason": "length"})
                 return json.dumps({"content": "recovered", "finish_reason": "stop"})
 
@@ -77,12 +76,15 @@ def main() -> None:
 
     recovering = llm.LLMClient({**BASE, "reasoning_effort": "high"})
     with patch.object(llm.subprocess, "run", budget_exhausted):
+        assert recovering.chat(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=7000,
+            escalate_max_tokens=12000,
+        ) == "recovered"
+        assert recovering.reasoning_effort == "high", "a retry must preserve the configured hint"
         assert recovering.chat([{"role": "user", "content": "hi"}]) == "recovered"
-        assert recovering.reasoning_effort == "", "the unusable hint must be dropped"
-        assert recovering.chat([{"role": "user", "content": "hi"}]) == "recovered"
-    assert calls[0]["reasoning_effort"] == "high", calls[0]
-    assert calls[1]["reasoning_effort"] == "", calls[1]
-    assert calls[2]["reasoning_effort"] == "", calls[2]
+    assert [call["reasoning_effort"] for call in calls] == ["high", "high", "high"], calls
+    assert [call["max_tokens"] for call in calls] == [7000, 12000, 8000], calls
 
     print("PASS: reasoning_effort is forwarded only when configured, and never blocks a run")
 

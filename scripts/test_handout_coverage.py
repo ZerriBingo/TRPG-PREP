@@ -16,6 +16,7 @@ from backend.app import artifacts, storage  # noqa: E402
 from backend.app.main import app  # noqa: E402
 from backend.domain import (  # noqa: E402
     DerivedCard,
+    FactDisposition,
     DisplayMaterial,
     ExampleBundle,
     SourceFact,
@@ -94,10 +95,12 @@ async def main() -> None:
             storage.save_domain_bundle(bundle.id, bundle.model_dump(mode="json"))
             profiles = load_profiles(ROOT / "backend" / "domain" / "profiles")
 
-            # A handout fact is not a location and is excluded from artifact input.
-            assert [fact.id for fact in artifacts._facts_for_workspace(bundle, bundle.id)] == [
-                "fact_lighthouse_location"
-            ]
+            # A handout is a source format, not a disposition: until the GM classifies
+            # it as display-only, the map's fact still participates in planning.  The
+            # classification below is what removes it, not its kind.
+            assert [
+                fact.id for fact in artifacts._facts_for_workspace(bundle, bundle.id)
+            ] == ["fact_map_source", "fact_lighthouse_location"]
 
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -119,6 +122,21 @@ async def main() -> None:
                 assert "player_content" not in material
 
             bundle.display_materials = [DisplayMaterial.model_validate(material)]
+            # Confirming the map as a display material says the GM may show it.  That is
+            # a different role from preparing with it, so both facts keep flowing into
+            # artifact input; only an explicit display-only disposition removes one.
+            assert [
+                fact.id for fact in artifacts._facts_for_workspace(bundle, bundle.id)
+            ] == ["fact_map_source", "fact_lighthouse_location"]
+            assert artifacts.display_material_fact_ids(bundle) == set()
+            display_only = bundle.model_copy(update={
+                "fact_dispositions": [
+                    FactDisposition(fact_id="fact_map_source", kind="display_material")
+                ]
+            })
+            assert [
+                fact.id for fact in artifacts._facts_for_workspace(display_only, bundle.id)
+            ] == ["fact_lighthouse_location"]
             bundle.cards = [location_card()]
             plan = draft_scene_plan(
                 bundle,

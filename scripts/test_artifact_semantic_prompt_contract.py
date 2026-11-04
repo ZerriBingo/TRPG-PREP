@@ -50,7 +50,7 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
         profile = profiles[profile_id]
         bundle = ExampleBundle(id="semantic_contract", name="Semantic contract",
                                profile_ids=[profile.id], facts=[fact], cards=[], plans=[])
-        local = artifacts._local_digest_messages(profile, facts, batch_index=1, batch_count=1)
+        local = artifacts._local_digest_messages(profile, facts)
         scoped = artifacts._global_plan_messages(
             profile, units, {fact.id: len(fact.text)}, {fact.id: 80}, structure)
         unscoped = artifacts._global_plan_messages(
@@ -63,16 +63,38 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
             materialized.append(messages)
             assert payload(messages, "ORIGINAL_FACTS_JSON") == facts
             assert payload(messages, "CARD_PLAN_JSON") == plan
-            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v13"
+            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v16"
             system = messages[0]["content"]
             assert "source_statistics, when supported, is a concise string quoting only supplied source information" in system
             assert "Every factual field must cite one or more fact_ids" in system
-            assert "Every required field listed below MUST be present and non-empty" in system
+            assert "Every required field listed below must be present and non-empty" in system
+            # A required field may name the gap the source leaves, and an assumption
+            # may only cover the starting state -- never a motive, condition or rule.
+            assert "Required and source-backed are different things" in system
+            assert "never add a motive, a reason to cooperate" in system
+            assert "keep the hedge in the field" in system
+            assert "One NPC card is one playable person" in system
             assert "Never use that exception for factual claims" in system
-            assert "assumed_state is one concise declarative sentence" in system
-            assert "table_questions holds two to four short prompts" in system
+            fields = set([*definition.required_fields, *definition.optional_fields])
+            # A card type is only asked for the fields it declares.
+            assert ("assumed_state is one concise declarative sentence" in system) == (
+                "assumed_state" in fields
+            ), (definition.type, "assumed_state")
+            assert ("table_questions holds two to four short prompts" in system) == (
+                "table_questions" in fields
+            ), (definition.type, "table_questions")
             assert "usable_features holds two to five named features" in system
             assert "Begin environment_type with one scene rhythm" in system
+
+        # The starting assumption is stated in the fields each stage actually has: a
+        # planned card has no assumed_state, so planning says it in situation/purpose.
+        for messages in [scoped, unscoped]:
+            assert (
+                "state that starting assumption inside the plan card's own situation, "
+                "purpose or focus" in messages[0]["content"]
+            )
+        for messages in [local, direct, *materialized]:
+            assert "state what the material assumes" in messages[0]["content"]
 
         for messages in [local, scoped, unscoped, direct, *materialized]:
             system = messages[0]["content"]
@@ -82,7 +104,6 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
                 "without a supported evolving pressure", "factual triggers and consequences require",
                 "Distinguish source play reports and examples from default current state",
                 "Do not promote reported player choices", "Keep example outcomes conditional",
-                "state what the material assumes in assumed_state",
                 "never turn them into review questions", "Preserve reusable actionable capabilities",
                 "triggers, limits, costs, and counterplay", "A fact ID alone is not coverage",
                 "reflect it in appropriate declared", "do not invent or convert statistics",
@@ -91,9 +112,11 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
                 assert requirement in system, (profile_id, messages[1]["content"].splitlines()[0], requirement)
         assert payload(local, "LOCAL_FACTS_JSON") == facts
         assert payload(direct, "REVIEWED_FACTS_JSON") == facts
-        assert payload(local, "PROMPT_VERSION_JSON") == "prep-artifact-draft-v13"
+        assert payload(local, "PROMPT_VERSION_JSON") == artifacts.LOCAL_DIGEST_PROMPT_VERSION
+        assert "BATCH_INDEX_JSON" not in local[1]["content"]
+        assert "BATCH_COUNT_JSON" not in local[1]["content"]
         for messages in (scoped, unscoped):
-            assert payload(messages, "PROMPT_VERSION_JSON") == "prep-artifact-global-plan-v18"
+            assert payload(messages, "PROMPT_VERSION_JSON") == artifacts.GLOBAL_PLAN_PROMPT_VERSION
         # Problems 2 and 4: the planner must declare one situation per
         # environment card and mark how the material relates to the opening.
         assert "situation, and case_scope" in scoped[0]["content"]
@@ -109,8 +132,9 @@ with patch.object(artifacts, "make_client", side_effect=AssertionError("upstream
         assert payload(scoped, "REVIEWED_STRUCTURE_JSON") == structure
         assert "THIS request generates ONLY REVIEWED_STRUCTURE_JSON.chapters" in scoped[0]["content"]
 
-assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v13"
-assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v18"
+assert artifacts.PROMPT_VERSION == "prep-artifact-draft-v16"
+assert artifacts.GLOBAL_PLAN_PROMPT_VERSION == "prep-artifact-global-plan-v24"
+assert artifacts.LOCAL_DIGEST_PROMPT_VERSION == "prep-artifact-local-digest-v1"
 
 handouts = [fact.model_copy(update={"id": name, "kind": "handout"}) for name in (
     "letter", "asset", "unassigned", "reference", "candidate", "outside_scope",
@@ -130,15 +154,26 @@ bundle = ExampleBundle(
          FactDisposition(fact_id="reference", kind="global_reference")],
 )
 with patch.object(artifacts.prep, "find_prep_job_by_workspace", return_value=None):
+    # A handout is a source format, not a disposition.  Every reviewed handout reaches
+    # planning unless it was explicitly classified display-only: "asset" carries a
+    # display_material disposition, "candidate" is still a model candidate.
     assert {item.id for item in artifacts._facts_for_workspace(bundle, bundle.id)} == {
-        fact.id, "letter", "outside_scope",
+        fact.id, "letter", "unassigned", "reference", "outside_scope",
     }
-    assert [item.id for item in artifacts._facts_for_workspace(
-        bundle.model_copy(update={"fact_dispositions": []}), bundle.id)] == [fact.id]
+    assert artifacts.display_material_fact_ids(bundle) == {"asset"}
+    # Without any disposition nothing is classified display-only, so the same handouts
+    # still participate instead of being excluded by their kind.
+    assert {item.id for item in artifacts._facts_for_workspace(
+        bundle.model_copy(update={"fact_dispositions": []}), bundle.id)} == {
+        fact.id, "letter", "asset", "unassigned", "reference", "outside_scope",
+    }
 scope = SimpleNamespace(source_file="fixture://artifact-semantics", page_spans=[PageSpan(start=3, end=3)])
 with patch.object(artifacts.prep, "find_prep_job_by_workspace",
                   return_value=SimpleNamespace(scope=scope)):
-    assert {item.id for item in artifacts._facts_for_workspace(bundle, bundle.id)} == {fact.id, "letter"}
+    # The selected page range still excludes material from pages outside it.
+    assert {item.id for item in artifacts._facts_for_workspace(bundle, bundle.id)} == {
+        fact.id, "letter", "unassigned", "reference",
+    }
 assert "its handout kind does not make that content display-only" in scoped[0]["content"]
 print("PASS: artifact prompts preserve pressure clocks, source modality, capabilities, and citations")
-print("PASS: chapter handouts survive filtering while default exclusion and scope remain intact")
+print("PASS: handouts enter planning by explicit use, with display-only and scope still enforced")

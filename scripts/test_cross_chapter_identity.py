@@ -112,8 +112,11 @@ def _scripted(responder):
 
 
 def _candidate_ids(messages):
-    body = json.loads(messages[1]["content"])
-    return {item["plan_id"] for group in body["candidate_groups"] for item in group}
+    content = messages[1]["content"]
+    if content.startswith("[TASK:"):
+        content = content.split("\n", 1)[1]
+    body = json.loads(content)
+    return {item["plan_id"] for item in body["candidates"]}
 
 
 class _Harness:
@@ -167,8 +170,11 @@ def main():
             ]
         }
     )
-    assert set(keys) == {"a", "b"}
+    # Every judged plan carries a key, singletons included: "this card is its own
+    # entity" is a decision the merge must honour, not a missing answer.
+    assert set(keys) == {"a", "b", "c"}, keys
     assert keys["a"] == keys["b"] and keys["a"].startswith("identity_")
+    assert keys["c"].startswith("identity_solo_")
 
     # The reconciliation key is internal and must never reach a prompt.
     assert a._prompt_plan(
@@ -273,8 +279,10 @@ def main():
         by_id = {plan["id"]: plan.get("identity_key") for plan in identified}
         assert by_id["planned_card_1"] == by_id["planned_card_2"]
         assert by_id["planned_card_1"].startswith("identity_")
-        assert by_id["planned_card_3"] is None
-        assert by_id["planned_card_4"] is None and by_id["planned_card_5"] is None
+        # A singleton judgement is recorded, and it must be its own identity.
+        assert by_id["planned_card_3"] and by_id["planned_card_3"].startswith("identity_solo_")
+        assert by_id["planned_card_4"] != by_id["planned_card_5"]
+        assert by_id["planned_card_4"].startswith("identity_solo_")
 
         merged = a._merge_chapter_plans([], identified)
         assert [plan["title"] for plan in merged] == [
@@ -306,7 +314,11 @@ def main():
         )
         # One request per card type: merges are type-scoped in both passes.
         assert lazy.calls >= 1, lazy.calls
-        assert all("identity_key" not in plan for plan in lazy_identified)
+        # Every judged singleton keeps a key so the title rule cannot merge it back.
+        assert all(
+            plan.get("identity_key", "").startswith("identity_solo_")
+            for plan in lazy_identified
+        )
         assert len(a._merge_chapter_plans([], lazy_identified)) == 5
 
     with _Harness() as harness:
@@ -331,18 +343,19 @@ def main():
             harness.job, plans, harness.bundle, summary, failing
         )
         assert failing.calls >= 1, failing.calls
-        assert degraded == plans
+        assert len(degraded) == len(plans)
+        assert all(a._is_unjudged(plan) for plan in degraded)
         # One request per card type, so a failing upstream can report more than once.
         assert summary.count >= 1, summary.preview
         assert "身份重整失败" in summary.preview[0]
 
     with _Harness() as harness:
         plans = _plans(harness.ids)
-        with patch.object(a, "IDENTITY_GROUP_CHAR_BUDGET", 1):
-            client = _scripted(_merge_pair)
-            identified = a._assign_plan_identities(
-                harness.job, plans, harness.bundle, a._OpenQuestionSummary(), client
-            )
+        # Two card types mean two requests; step indices must stay sequential.
+        client = _scripted(_merge_pair)
+        identified = a._assign_plan_identities(
+            harness.job, plans, harness.bundle, a._OpenQuestionSummary(), client
+        )
         assert client.calls >= 2, client.calls
         steps = [
             step
@@ -355,7 +368,7 @@ def main():
         by_id = {plan["id"]: plan.get("identity_key") for plan in identified}
         assert by_id["planned_card_1"] == by_id["planned_card_2"]
         assert by_id["planned_card_1"].startswith("identity_")
-        assert by_id["planned_card_3"] is None
+        assert by_id["planned_card_3"].startswith("identity_solo_")
 
     with _Harness() as harness:
         # A component wider than the old 40-plan cap must still be judged: on the

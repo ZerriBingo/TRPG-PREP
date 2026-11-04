@@ -87,7 +87,7 @@ def assert_boundary(messages: list[dict], label: str) -> str:
 def check_digest() -> str:
     profile = PROFILES["cthulhu-dark-2e"]
     messages = artifacts._local_digest_messages(
-        profile, [COC_FACT, DND_FACT, SCENE_FACT], batch_index=0, batch_count=1
+        profile, [COC_FACT, DND_FACT, SCENE_FACT]
     )
     text = assert_boundary(messages, "local digest")
     # Source rules text stays available to the model instead of being rewritten.
@@ -260,7 +260,7 @@ def check_corrections_and_cache() -> None:
 
             digest = corrected(
                 "local_digest", artifacts._local_digest_messages(
-                    profile, payload, batch_index=1, batch_count=1
+                    profile, payload
                 ),
                 lambda raw: artifacts._validate_local_digest(raw, facts, batch_index=1),
             )
